@@ -210,6 +210,32 @@ defmodule GenDurable.EngineTest do
     assert Jason.decode!(row.result) == %{"slept" => 900}
   end
 
+  test "prefetched (buffered) rows are heartbeated and never spuriously reaped" do
+    # concurrency 1 + prefetch 5 ⇒ the picker claims all rows up front and holds
+    # the tail in the in-memory buffer. Each step sleeps 200ms, so a buffered row
+    # waits well past the 300ms lease before it runs. If the buffer weren't
+    # heartbeated, the reaper would expire those leases and bump `attempt`.
+    start_engine(
+      queues: [default: 1],
+      prefetch: 5,
+      lease_ttl: 300,
+      heartbeat_interval: 100,
+      reap_interval: 100,
+      poll_interval: 25
+    )
+
+    ids =
+      for _ <- 1..4 do
+        {:ok, id} = GenDurable.insert(GenDurable.Test.Sleeper, state: %{"ms" => 200})
+        id
+      end
+
+    rows = for id <- ids, do: wait_status(id, "done")
+
+    assert Enum.all?(rows, &(&1.attempt == 0))
+    assert Enum.all?(rows, &(Jason.decode!(&1.result) == %{"slept" => 200}))
+  end
+
   test "different partition_keys run in parallel (overlapping steps)" do
     start_supervised!(agent_spec(GenDurable.Test.OverlapAgent, fn -> %{} end))
     start_engine(queues: [default: 4])

@@ -223,11 +223,25 @@ Given a picked row map, run the step to a committed outcome:
 A worker process crash before step 5 means *no outcome row* → reaper path. We do **not** trap and
 convert crashes into `handle/2`; crash ≠ caught exception (spec §4 distinguishes the three sources).
 
-### 5.3 Scheduler (`scheduler.ex`)
-Per queue. Tracks free slots = `pool_size − in_flight`. On tick (interval, default ~`lease_ttl/10`,
-**CONFIRM**) and when slots free up: run `pick(queues, free_slots)`, spawn one `Task` per returned row
-under the queue's `Task.Supervisor`, decrement slots; on Task completion (any reason) increment slots.
-Demand-driven so we never pick more than we can run.
+### 5.3 Scheduler (`scheduler.ex`) — feeder + executor with backpressure
+Per queue. A finished Task refills immediately, so throughput is bounded by
+`concurrency / step_time`, **not** by `poll_interval` (the poll timer only governs idle discovery
+latency). Backpressure-driven with four aggressiveness knobs (see F5 below and the module doc):
+- `concurrency` — executor width (max Tasks at once).
+- `prefetch` — extra rows claimed into an in-memory buffer **beyond** the running slots (`0` ⇒ today's
+  pick-exactly-free-slots). Buffered rows are `executing`+leased and are **heartbeated** (the
+  heartbeat set is `buffer ++ in_flight`), so buffer depth is decoupled from `lease_ttl` — they never
+  go stale. Cost of depth: cross-node fairness (claimed rows are invisible to other nodes) and
+  priority freshness; crash blip is bounded by the (short) TTL, not by depth.
+- `min_demand` — batch gate: don't pick unless ≥ this many slots are free (fat picks), bypassed when
+  fully idle to avoid starvation.
+- `poll_interval` / `max_poll_interval` — idle backoff: an empty pick on a fully idle queue doubles
+  the interval up to the ceiling; any fetched or in-flight work snaps back to the base. The lever that
+  cuts idle DB load (NOTIFY is banned → poll adaptively, not constantly).
+
+Loop: `refill` (pick up to `demand = concurrency + prefetch − claimed` into the buffer when the gate
+allows) → `drain` (spawn buffered jobs, highest-priority first, into free slots). Demand-driven, so
+we never claim more than `concurrency + prefetch`.
 
 ### 5.4 Heartbeat (`heartbeat.ex`)
 Extends `lease_expires_at` for in-flight rows on an interval `< lease_ttl` (e.g. `lease_ttl/3`).
@@ -305,6 +319,20 @@ enum value `awaiting_children`, columns `parent_id` / `children_pending`, index 
   heartbeat keeps a long lease (no spurious reap), cross-key partition parallelism. (`engine_test`)
 - **F3 / scheduling sugar — added.** `insert/2` accepts `:schedule_in` (ms from now) / `:schedule_at`
   (`DateTime`); precedence `:eligible_at` > `:schedule_at` > `:schedule_in`.
+
+### F5 — Feeder / backpressure + tunable aggressiveness ✅ DONE
+The per-queue `Scheduler` is now a feeder: it claims work into a small in-memory buffer and drains it
+into `concurrency` Tasks, with four knobs (`prefetch`, `min_demand`, `poll_interval` /
+`max_poll_interval`) exposed via `GenDurable.Supervisor` opts. Defaults (`prefetch: 0`, `min_demand:
+1`, `max_poll_interval: 5_000`) reproduce the prior behaviour plus idle backoff. **Buffered rows are
+heartbeated** (`heartbeat` set = `buffer ++ in_flight`), so over-fetch never risks a spurious reap —
+buffer depth is decoupled from `lease_ttl`. Test: `prefetch: 5` + `concurrency: 1` holds the tail
+buffered past a 300ms lease and still completes with `attempt == 0`. 43 tests green.
+- Knob trade-offs (cross-node fairness, priority freshness, crash blip) are documented in the module
+  doc; defaults are conservative (fair on a cluster), aggression is opt-in per deployment.
+- **Follow-up (deferred):** dedup `partition_key` within a batch so deep prefetch doesn't heartbeat
+  rows that are blocked on the advisory lock; per-queue (vs engine-wide) knobs; graceful drain that
+  resets the buffer on shutdown instead of waiting out the lease.
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 — Always-load `signals` + `childs`:** every step does two `target/parent` SELECTs. Cheap, but
