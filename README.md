@@ -85,12 +85,16 @@ Start the engine in your supervision tree and use it:
 ```elixir
 children = [
   MyApp.Repo,
-  {GenDurable, repo: MyApp.Repo, fsms: [Checkout], queues: [default: 10, checkout: 5]}
+  {GenDurable, repo: MyApp.Repo, queues: [default: 10, checkout: 5]}
 ]
 
 {:ok, id} = GenDurable.insert(Checkout, state: %{order: 42}, partition_key: "order:42")
 :ok = GenDurable.signal(id, "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
 ```
+
+You don't list your FSM modules: they're resolved from the row (the `fsm` column
+defaults to the module name). Pass `:fsms` only to register a machine with a
+custom `:name`, or to keep an old `:version` running alongside a new one (spec §8).
 
 ## Configuration
 
@@ -100,7 +104,7 @@ The engine is started as `{GenDurable, opts}`. Full reference lives in the
 | Option | Default | Meaning |
 |---|---|---|
 | `:repo` | — (required) | the host's `Ecto.Repo` |
-| `:fsms` | `[]` | FSM modules to register |
+| `:fsms` | `[]` | FSM modules to register — only for custom `:name` or versioning; otherwise resolved from the row |
 | `:queues` | `[default: 10]` | `queue_name => concurrency` (max Tasks running at once) |
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows (`buffer ++ in_flight`) |

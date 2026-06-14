@@ -165,6 +165,14 @@ defmodule GenDurable.Test.Overlap do
   end
 end
 
+defmodule GenDurable.Test.Auto do
+  @moduledoc "No custom `name:` — resolves dynamically from its module name, never registered."
+  use GenDurable.FSM, initial: "go"
+
+  @impl true
+  def step("go", _ctx), do: {:done, %{"auto" => true}}
+end
+
 defmodule GenDurable.Test.FSMs do
   def all do
     [

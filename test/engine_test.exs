@@ -262,6 +262,15 @@ defmodule GenDurable.EngineTest do
     assert m[{b, :start}] < m[{a, :stop}]
   end
 
+  test "an FSM not listed in :fsms resolves dynamically from its module name" do
+    # FSMs.all() does NOT include Auto — it must resolve via its default name.
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Auto)
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"auto" => true}
+  end
+
   test "graceful shutdown releases buffered work and drains in-flight (no lease wait)" do
     # Insert before the engine starts so the first poll claims all four at once.
     ids =

@@ -6,7 +6,9 @@ defmodule GenDurable.Supervisor do
   ## Options
 
     * `:repo` — the host's `Ecto.Repo` (required).
-    * `:fsms` — FSM modules to register (default `[]`).
+    * `:fsms` — FSM modules to register explicitly (default `[]`). Only needed for a
+      custom `:name` or to keep an old `:version` running; otherwise a machine is
+      resolved from the `fsm` column (its module name). See `GenDurable.Registry`.
     * `:queues` — keyword list of `queue_name => concurrency`
       (default `[default: 10]`).
     * `:lease_ttl`, `:heartbeat_interval`, `:poll_interval`, `:reap_interval` —

@@ -404,6 +404,16 @@ by default, prints the old-vs-new wall-clock — consistently faster). 53 tests 
   `step.stop` / `partition.contended` / `reaper.reaped`) in the `GenDurable` moduledoc. Test asserts
   pick + saturation fire. 55 tests green (1 bench excluded).
 
+### F11 — `:fsms` is now optional (dynamic FSM resolution) ✅ DONE
+Listing every FSM module to start the engine was needless boilerplate for the common case: the `fsm`
+column already defaults to `inspect(module)`, so the module is recoverable from the row. `Registry.fetch!`
+now falls back, on an ETS miss, to resolving `name` as a module — accepting it only if it is a
+`GenDurable.FSM` whose own `__gd_name__` **and** `__gd_version__` match the row (so we never run an
+arbitrary or wrong-version module). `:fsms` is now needed only for a custom `:name` (the `fsm` column
+isn't a module name) or to keep an old `:version` running (spec §8). README/Supervisor/Registry docs
+updated; `GenDurable.Test.Auto` (no custom name, unregistered) proves end-to-end + unit resolution. 57
+tests green.
+
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
   SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes
