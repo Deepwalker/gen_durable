@@ -1,7 +1,7 @@
 # gen_durable — dev shortcuts. Everything runs inside the devcontainer.
 DC := docker compose -p gen_durable -f .devcontainer/docker-compose.yml
 
-.PHONY: up test docs
+.PHONY: up test docs publish
 
 # Build the image and start the app + Postgres containers.
 up:
@@ -14,3 +14,9 @@ test:
 # Generate HTML docs into ./doc.
 docs:
 	$(DC) exec -T app sh -lc "mix deps.get && mix docs"
+
+# Publish package + docs to Hex. Needs HEX_API_KEY in your environment
+# (generate one at https://hex.pm/dashboard/keys).
+publish:
+	@test -n "$$HEX_API_KEY" || { echo "HEX_API_KEY is not set — https://hex.pm/dashboard/keys"; exit 1; }
+	$(DC) exec -T -e HEX_API_KEY="$$HEX_API_KEY" app sh -lc "mix deps.get && mix hex.publish --yes"
