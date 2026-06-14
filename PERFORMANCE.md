@@ -76,41 +76,52 @@ Execution Time: 0.725 ms
 
 **~850× faster, and O(batch) instead of O(runnable backlog).** Same data, one operator.
 
-### 2.2 Full plan of the current picker (`batch = 50`)
+### 2.2 Full plan of the picker (`batch = 50`)
+
+The picker is the canonical Postgres claim — one `SELECT … FOR UPDATE SKIP LOCKED LIMIT`,
+then one `UPDATE` — with the partition dedup folded in as a window function over the
+locked set, so there is **exactly one nested loop** (the `UPDATE` join):
 
 ```
-Update on gen_durable g (actual time=0.279..0.682 rows=50 loops=1)
-  Buffers: shared hit=1155 dirtied=1 written=1
-  CTE picked
-    ->  LockRows (rows=50)
-          ->  Sort  Sort Key: g_1.priority, g_1.eligible_at         (50 rows, quicksort 28kB)
-                ->  Nested Loop (rows=50)
-                      ->  Subquery Scan on d (rows=50)
-                            ->  Unique (rows=50)                      ← DISTINCT ON (dedup)
-                                  ->  Sort  Sort Key: COALESCE(partition_key, id::text), …  (27kB)
-                                        ->  Limit (rows=50)
-                                              ->  Index Scan using gen_durable_pick (rows=50)
-                                                    Index Cond: ((queue = 'default') AND (eligible_at <= now()))
-                                                    Filter: ((partition_key IS NULL) OR (NOT (… hashed SubPlan 2)))
-                                                    SubPlan 2
-                                                      ->  Index Only Scan using gen_durable_partition_active (never executed)
-                      ->  Index Scan using gen_durable_pkey on gen_durable g_1 (rows=1 loops=50)
-Planning Time: 0.369 ms
-Execution Time: 0.725 ms
+Update on gen_durable g (actual time=0.400..0.983 rows=50 loops=1)
+  Buffers: shared hit=868
+  CTE locked
+    ->  WindowAgg (rows=50)                                     ← dedup: row_number() per key
+          ->  Sort  Sort Key: COALESCE(partition_key, id::text), priority, eligible_at  (27kB)
+                ->  Limit (rows=50)
+                      ->  LockRows (rows=50)                    ← FOR UPDATE SKIP LOCKED, in-scan
+                            ->  Index Scan using gen_durable_pick (rows=50)
+                                  Index Cond: ((queue = 'default') AND (eligible_at <= now()))
+                                  Filter: ((partition_key IS NULL) OR (NOT (… hashed SubPlan 2)))
+                                  SubPlan 2
+                                    ->  Index Scan using gen_durable_lease (never executed)
+  ->  Nested Loop (rows=50)                                     ← the one, optimal join
+        ->  CTE Scan on locked l (rows=50)  Filter: (rn = 1)
+        ->  Index Scan using gen_durable_pkey on gen_durable g (rows=1 loops=50)
+Planning Time: 0.582 ms
+Execution Time: 1.122 ms
 ```
 
 What to read here:
 
 - **`gen_durable_pick` index scan stops at the `LIMIT`** — the scan touches ~`batch`
   rows, not the 295k runnable rows. This is the whole game.
+- **The lock happens in that one scan** (`LockRows`), and `row_number()` dedups the
+  *already-locked* set — so there is no separate re-lock pass. The earlier design
+  (`DISTINCT ON` → re-lock → update) had a second nested loop that scaled per-row with
+  the batch; folding the dedup into a window function removed it (measured −19% at
+  batch 5000, §2.4).
 - **`SubPlan 2` (the partition `NOT EXISTS`) was `never executed`** here because the top
   50 rows were non-partitioned (`partition_key IS NULL` short-circuits the guard). A
-  non-partitioned queue pays **nothing** for the partition machinery.
-- When partitioned rows *are* in the window, the guard is an **Index Only Scan on
-  `gen_durable_partition_active`** (a partial index over only the ~5k executing rows,
-  `Heap Fetches: 0`) — a cheap probe, not a join against the big table.
-- The two small `Sort`s are over `≤ batch` rows (50): ~27 kB, microseconds. The DISTINCT
-  ON dedup is bounded to the batch window, never the backlog.
+  non-partitioned queue pays **nothing** for the partition machinery. When partitioned
+  rows *are* in the window, the guard probes `gen_durable_partition_active` — a partial
+  index over only the executing rows with a **non-null** `partition_key`, so a
+  non-partitioned claim never even writes to it.
+- **The single `Nested Loop` is the `UPDATE` join, and it is optimal** — outer = `batch`
+  rows, inner = one primary-key point lookup each (`loops=50, rows=1`). That is O(batch)
+  point updates, the textbook-best way to update N rows by id; see §2.5 for the proof
+  that forcing it off is ~10× slower. The per-key losers (`rn > 1`) were locked but not
+  updated, so they stay `runnable` and their lock releases at commit — no advisory bounce.
 
 ### 2.3 The bounded-window trade-off
 
@@ -118,6 +129,79 @@ The scan is `LIMIT $2` (the batch size). A cluster of same-key rows filling that
 dedups down to one, so a single pick can return fewer than `batch` — completion-driven
 refill closes the gap on the next pick. This keeps the hot path index-cheap at the cost
 of a little fill latency under heavy single-key load. See §6 for the degenerate case.
+
+### 2.4 Large batches and the per-row floor
+
+Crank `prefetch` and the pick claims a big batch in one statement. The cost is **linear
+in the batch** — every component (index scan, dedup sort, lock, the `UPDATE`) is per-row:
+
+| batch | pick (median of 5, warm) | per row |
+|---|---|---|
+| 50 | ~1.1 ms | ~22 µs |
+| 100 | ~1.9 ms | ~19 µs |
+| 1000 | ~16 ms | ~16 µs |
+| 5000 | ~57 ms | ~11 µs |
+
+The fixed cost (planning + the `NOT EXISTS` hash build over the executing set) amortizes
+away with bigger batches; the **~11–16 µs/row marginal cost does not**. That floor is the
+actual work of *claiming*: flipping each row `runnable → executing` is a heap write plus
+moving the row out of the `runnable` partial index and into the two `executing` partial
+indexes (`lease`, `partition_active`) — plus WAL for all of it. **You cannot claim a row
+without writing it**, so ~11–16 µs/row is close to the floor for this schema.
+
+Two consequences worth designing around:
+
+- A pick of 5000 is a **70 ms synchronous statement** in the scheduler GenServer and holds
+  `FOR UPDATE` over 5000 rows. Past ~a few hundred, batch size buys no amortization (the
+  fixed cost is already gone) and only adds blocking. If you push `prefetch` very high,
+  prefer many medium picks over one giant one.
+- Per-row cost is **aggregate DB CPU**: at 10k steps/s that floor is ~0.15 s/s of CPU on
+  picking alone. The way to cut it is fewer, larger logical steps — not a faster pick.
+
+### 2.5 The one nested loop is optimal (proof)
+
+The `UPDATE` join is a `Nested Loop` and that is exactly right. "Update these N rows by id"
+wants N primary-key point lookups — a nested loop with the PK index on the inner side,
+O(batch). It only looks scary when the inner side is *unindexed* (then it is O(N·M)); here
+it is `loops=batch, rows=1` against `gen_durable_pkey`. Forcing the planner off it
+(`SET enable_nestloop = off`) makes it fall back to a hash join that **Seq Scans the whole
+million-row table** to find the batch:
+
+```
+->  Hash Join  (Hash Cond: g.id = l.id)
+      ->  Seq Scan on gen_durable g  (rows=1000000)     ← scans everything to find `batch` rows
+```
+
+| batch | nested loop (default) | forced off → hash join + seq scan |
+|---|---|---|
+| 1000 | 17 ms | 160 ms |
+| 5000 | 56 ms | 195 ms |
+
+~10× slower. The nested loop is the canonical Postgres-queue claim, and it is the floor:
+`UPDATE` cannot `LIMIT`, so the claim must be `SELECT … FOR UPDATE … LIMIT` then `UPDATE`
+joined by id; and updating N rows means writing N rows regardless of how they are reached.
+
+### 2.6 What did *not* help (measured, rejected)
+
+Restructurings prototyped against the seeded dataset and **rejected by measurement** —
+recorded so they are not re-attempted blind:
+
+- **Single-scan dedup** (correlated `NOT EXISTS` "I am the most-urgent runnable of my key"
+  + `FOR UPDATE` in the scan, backed by a new `(partition_key, priority, eligible_at)`
+  partial index). A wash on wall-clock and **worse at batch 5000** — the new partial index
+  adds write amplification to every claim *and* every return-to-`runnable`. The window
+  function over the locked set (the shipped picker) gets the same dedup with no new index.
+- **`ctid`-join instead of `id`-join** for the `UPDATE` re-touch (TID scan instead of a PK
+  descent). Cut **logical buffer hits ~28%** but **warm-cache wall-clock did not move**
+  (17.0 vs 17.0 ms at 1000) and was **slower at 5000** (79 vs 70). Those buffers are
+  nanosecond cache hits; time is dominated by heap writes + WAL, which `ctid` does not
+  touch — consistent with §2.5 (the cost is the write, not the lookup).
+
+**Lesson:** on a warm queue the picker is at its floor; fewer logical page touches do not
+translate to time when they are all cache hits. The real lever is **round-trips per step**
+(§7), not the pick query. Beware benchmarking on a bloated table — rolled-back
+`EXPLAIN ANALYZE` runs accumulate dead tuples and inflate timings by ~20%; `VACUUM` and
+take the median of several runs before believing a delta.
 
 ---
 
@@ -197,7 +281,7 @@ bulk (700k `done`/`failed`) sits in none of the partial indexes.
 | Query | Index | Kind |
 |---|---|---|
 | `pick` scan | `gen_durable_pick (queue, priority, eligible_at) WHERE status='runnable'` | partial, ordered |
-| `pick` partition guard | `gen_durable_partition_active (partition_key) WHERE status='executing'` | partial, index-only probe |
+| `pick` partition guard | `gen_durable_partition_active (partition_key) WHERE status='executing' AND partition_key IS NOT NULL` | partial, index-only probe |
 | `pick` lock / outcomes / signal | `gen_durable_pkey (id)` | primary key |
 | `reap` | `gen_durable_lease (lease_expires_at) WHERE status='executing'` | partial |
 | `insert` dedup | `gen_durable_unique (unique_guard) WHERE unique_guard IS NOT NULL` | partial unique |

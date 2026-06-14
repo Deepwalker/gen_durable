@@ -12,55 +12,57 @@ defmodule GenDurable.Queries do
   # --- picker ----------------------------------------------------------------
 
   # partition_key dedup (spec §6): never claim more than one row per partition_key
-  # in a batch, and never claim a key that is already being processed. This keeps
-  # the advisory-lock as the correctness guard while sparing the wasted
-  # claim→try_lock→reset churn that prefetch would otherwise amplify on hot keys.
+  # in a batch, and never claim a key that is already being processed — without the
+  # wasted claim→try_lock→reset churn that prefetch would amplify on hot keys.
   #
-  # The work is bounded to one batch window so the hot path stays index-cheap:
+  # Shape: the canonical Postgres claim (one `SELECT … FOR UPDATE SKIP LOCKED
+  # LIMIT`, then one `UPDATE`) plus an in-batch dedup that needs no extra pass.
   #
-  #   scan    — the top `$2` runnable rows by (priority, eligible_at) via the
-  #             `gen_durable_pick` index. The single-queue equality (`queue = $1`,
-  #             not `ANY`) is what lets the index supply that order so the LIMIT
-  #             stops early instead of scanning + sorting the whole runnable set
-  #             (see PERFORMANCE.md). EXCLUDING any whose key is already
-  #             `executing` (NOT EXISTS). NULL keys never serialize, so they
-  #             short-circuit the guard (no subquery) and are never excluded —
-  #             a non-partitioned queue pays the original index scan + LIMIT.
-  #   deduped — one id per key within the window (the most urgent), via
-  #             DISTINCT ON over ≤ `$2` rows. NULL keys fall back to id, so each
-  #             is its own group and is never collapsed.
-  #   picked  — lock exactly those ids (FOR UPDATE SKIP LOCKED) and flip them.
+  #   locked — the top `$2` runnable rows by (priority, eligible_at) via the
+  #            `gen_durable_pick` index, locked in that one scan. Single-queue
+  #            equality (`queue = $1`, not `ANY`) is what lets the index supply
+  #            the order so the LIMIT stops early instead of scanning + sorting
+  #            the whole runnable set (see PERFORMANCE.md). Rows whose key is
+  #            already `executing` are excluded (NOT EXISTS); NULL keys never
+  #            serialize, so they short-circuit the guard and a non-partitioned
+  #            queue pays nothing for it. `row_number()` over the *locked* set
+  #            marks the most-urgent row per key (NULL keys fall back to id, so
+  #            each is its own group and is never collapsed).
+  #   UPDATE — flip only the per-key winners (`rn = 1`). The losers (`rn > 1`)
+  #            were locked but not touched, so they stay `runnable` and their
+  #            lock is released at commit — no advisory-lock bounce. The next
+  #            pick skips them via the NOT EXISTS guard once the winner executes.
+  #
+  # Dedup is a window function *after* locking, so there is no separate re-lock
+  # pass: exactly ONE nested loop — the `UPDATE` join by id, which is the optimal
+  # and unavoidable way to update N rows by primary key (forcing the planner off
+  # it falls back to a full-table Seq Scan, ~10× slower; see PERFORMANCE.md).
   #
   # A same-key cluster filling the window can underfill the batch; completion-
-  # driven refill closes the gap on the next pick (see PERFORMANCE.md).
+  # driven refill closes the gap on the next pick.
   @pick_sql """
-  WITH scan AS (
-    SELECT id, partition_key, priority, eligible_at
-    FROM gen_durable g
-    WHERE status = 'runnable' AND eligible_at <= now() AND queue = $1
-      AND (partition_key IS NULL OR NOT EXISTS (
-        SELECT 1 FROM gen_durable e
-        WHERE e.partition_key = g.partition_key AND e.status = 'executing'
-      ))
-    ORDER BY priority, eligible_at
-    LIMIT $2
-  ),
-  deduped AS (
-    SELECT DISTINCT ON (coalesce(partition_key, id::text)) id
-    FROM scan
-    ORDER BY coalesce(partition_key, id::text), priority, eligible_at
-  ),
-  picked AS (
-    SELECT g.id FROM gen_durable g
-    JOIN deduped d ON d.id = g.id
-    WHERE g.status = 'runnable'
-    ORDER BY g.priority, g.eligible_at
-    FOR UPDATE SKIP LOCKED
+  WITH locked AS (
+    SELECT id,
+           row_number() OVER (PARTITION BY coalesce(partition_key, id::text)
+                              ORDER BY priority, eligible_at) AS rn
+    FROM (
+      SELECT id, partition_key, priority, eligible_at
+      FROM gen_durable g
+      WHERE g.status = 'runnable' AND g.eligible_at <= now() AND g.queue = $1
+        AND (g.partition_key IS NULL OR NOT EXISTS (
+          SELECT 1 FROM gen_durable e
+          WHERE e.partition_key = g.partition_key AND e.status = 'executing'
+        ))
+      ORDER BY g.priority, g.eligible_at
+      FOR UPDATE SKIP LOCKED
+      LIMIT $2
+    ) s
   )
   UPDATE gen_durable g
   SET status = 'executing', locked_by = $3,
       lease_expires_at = now() + $4::int * interval '1 millisecond', updated_at = now()
-  FROM picked WHERE g.id = picked.id
+  FROM locked l
+  WHERE g.id = l.id AND l.rn = 1
   RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.partition_key
   """
 

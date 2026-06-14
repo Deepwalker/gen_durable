@@ -340,8 +340,9 @@ The picker (`Queries.pick`) no longer claims work it can't run, killing the clai
   isn't claimed only to bounce off the advisory lock). `partition_key IS NULL` short-circuits the
   guard, so non-partitioned work pays nothing. Backed by a new partial index
   `gen_durable_partition_active (partition_key) WHERE status='executing'` (folded into v1).
-- **`DISTINCT ON (coalesce(partition_key, id::text))`** — at most one row per key per batch (the most
-  urgent); NULL keys fall back to `id` so each is its own group and is never collapsed.
+- **intra-batch dedup** — at most one row per key per batch (the most urgent); NULL keys fall back to
+  `id` so each is its own group and is never collapsed. (Final form in F8 — a window function over the
+  locked set; the original `DISTINCT ON` needed a second re-lock pass.)
 The advisory lock stays the correctness guard (cross-node / unlock-gap races still possible); dedup is
 the optimization that makes contention rare. New telemetry `[:gen_durable, :partition, :contended]`
 fires on the residual bounce. Deterministic picker tests in `queries_test`; 46 tests green.
@@ -360,6 +361,22 @@ Two fixes, measured in `PERFORMANCE.md` (real EXPLAIN on 1M rows, Postgres 17):
   deferred fix (noted in PERFORMANCE.md §6).
 All hot-path statements are PK/partial-index driven and sub-ms; see `PERFORMANCE.md` for plans, the
 round-trip throughput model, and the F4 round-trip-reduction backlog. 46 tests green.
+
+### F8 — Picker: one nested loop (window dedup over the locked set) ✅ DONE
+The picker is now the canonical Postgres claim — one `SELECT … FOR UPDATE SKIP LOCKED LIMIT`, then one
+`UPDATE` — with the partition dedup folded in as `row_number() OVER (PARTITION BY coalesce(key, id))`
+over the **locked** set, so there is **exactly one nested loop** (the `UPDATE` join). The previous
+`DISTINCT ON` form dedup'd *before* locking and so needed a second re-lock pass (a second nested loop
+that scaled per-row with the batch). Per-key losers (`rn > 1`) are locked-but-not-updated → stay
+`runnable`, lock released at commit, no advisory bounce. Measured (median of 5, VACUUM'd, 1M rows):
+batch 5000 **70 ms → 57 ms (−19%)**, batch 1000 17.3 → 16.1; no new index. Also folded in: the
+`gen_durable_partition_active` index scoped to `partition_key IS NOT NULL` (the guard never probes
+null keys, so non-partitioned claims skip that index write).
+- **Rejected by measurement** (in PERFORMANCE.md §2.5–2.6): forcing the nested loop off → full-table
+  Seq Scan, ~10× slower (the join *is* optimal); a `ctid`-join cut buffer hits ~28% but not wall-clock;
+  a correlated-subquery single-scan dedup needed a new index that taxed writes. The cost floor is the
+  per-row *claim write* (~11–16 µs/row: heap + partial-index moves + WAL), not the query shape.
+- 46 tests green (partition serialization, dedup units, cross-key parallelism all hold under M).
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 — Always-load `signals` + `childs`:** every step does two `target/parent` SELECTs. Cheap, but
