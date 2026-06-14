@@ -1,6 +1,6 @@
 # gen_durable — durable FSM engine: specification and schema
 
-Status: normative draft v1. Postgres-backed engine for long-running FSMs on top of GenServer.
+Status: normative draft v1, plus §11 `schedule_childs` (schema version 2). Postgres-backed engine for long-running FSMs on top of GenServer.
 
 ## 1. Guarantee
 
@@ -10,12 +10,13 @@ The engine guarantees exactly-once of nothing: not delivery, not effects. `:repl
 
 The unit of re-execution is the **whole step**. Everything inside a step re-runs as one bundle on re-execution; the user makes the entire step idempotent, not individual effects. Hence the practice: keep steps small.
 
-## 2. Two primitives
+## 2. Three primitives
 
 - **durable step** — user step code that returns an outcome on completion (see §3).
 - **durable await** — a step parks the instance until a named signal arrives; the wake-up only changes state, with no side effects, so re-running it is harmless.
+- **durable childs** — a step spawns a batch of child instances and parks until **all** of them reach a terminal status; the engine owns the fan-in barrier (see §11). The wake-up only reads child results — no side effects, so re-running it is harmless.
 
-Everything else (fanning work out, waiting on a group of tasks) is expressed with these two primitives in user code. The engine knows nothing about trees / parent-child — "children" are ordinary independent instances.
+These compose into larger shapes in user code. The spawn-and-join shape is first-class: the engine tracks the `parent_id` link and the join barrier. A child is otherwise an ordinary independent instance — cancel and cascade are **not** implied (see §8, §11).
 
 ## 3. Step outcomes
 
@@ -26,6 +27,7 @@ A step, and the error handler `handle/2`, return one of:
 | `{:next, step, state}` | transition to `step`, `runnable` | `:= 0` | `now()` |
 | `{:replay, state, delay_ms}` | same step again, `runnable` | `+1` | `now() + delay_ms` |
 | `{:await, signal_name, state}` | park, `awaiting_signal`, `awaits := signal_name` | — | — |
+| `{:schedule_childs, step, children, state}` | spawn `children`, park `awaiting_children`; on barrier release advance to `step`, `runnable` (see §11) | `:= 0` | `now()` on release |
 | `{:done, result}` | terminal, `done`, `result` recorded | — | — |
 | `{:stop, reason}` | terminal, `failed`, `last_error := reason` | — | — |
 
@@ -69,7 +71,7 @@ Uniqueness = **key** (user function, stored verbatim, no transformation) + **sco
 
 ## 8. Non-goals (v1)
 
-- **no trees** — parent/child, fan-in barrier, cascade. "Children" = ordinary instances; the user coordinates via `await` + signal;
+- **limited trees** — `schedule_childs` (§11) provides spawn + an all-children fan-in barrier, and the engine tracks the `parent_id` link. Still out: **cancel/cascade** (failing or terminating a parent does not touch its children, nor the reverse), quorum/`k`-of-`n` barriers, and arbitrary DAG joins beyond "all my children";
 - **no cancel**;
 - **no transition history / event sourcing** — current-state snapshot only;
 - **the engine does not cap retries** — no `max_attempts`, only an `attempt` counter; `handle/2` decides when to stop by reading it;
@@ -83,7 +85,7 @@ Uniqueness = **key** (user function, stored verbatim, no transformation) + **sco
 
 ```sql
 create type durable_status as enum
-  ('runnable', 'executing', 'awaiting_signal', 'done', 'failed');
+  ('runnable', 'executing', 'awaiting_signal', 'awaiting_children', 'done', 'failed');
 
 create table gen_durable (
   id            bigint generated always as identity primary key,
@@ -106,6 +108,10 @@ create table gen_durable (
   -- lease
   locked_by        text,
   lease_expires_at timestamptz,
+
+  -- children (schedule_childs / fan-in barrier, §11)
+  parent_id        bigint references gen_durable(id) on delete set null,
+  children_pending int not null default 0,           -- non-terminal children left to join on
 
   -- uniqueness
   unique_key    bytea,                              -- user function result, verbatim
@@ -132,6 +138,10 @@ create index gen_durable_lease on gen_durable (lease_expires_at)
 -- uniqueness among "occupied" statuses, per-job scope
 create unique index gen_durable_unique on gen_durable (unique_guard)
   where unique_guard is not null;
+
+-- fan-in barrier: a parent's children, and the join decrement (§11)
+create index gen_durable_parent on gen_durable (parent_id)
+  where parent_id is not null;
 
 create table signals (
   id          bigint generated always as identity primary key,
@@ -207,6 +217,25 @@ set state = $state, status = 'awaiting_signal', awaits = $signal_name,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
+-- :schedule_childs  (one transaction; spawn the batch, then park on the join barrier)
+with ins as (
+  insert into gen_durable
+    (fsm, step, state, queue, priority, partition_key,
+     unique_key, unique_scope, eligible_at, parent_id)
+  values
+    (...), (...)                                      -- one row per child, parent_id = $id
+  on conflict (unique_guard) where unique_guard is not null do nothing
+  returning 1
+)
+update gen_durable
+set step = $step, state = $state,
+    children_pending = (select count(*) from ins),
+    -- zero children actually inserted ⇒ barrier already satisfied ⇒ run next_step now
+    status = case when (select count(*) from ins) = 0 then 'runnable' else 'awaiting_children' end,
+    eligible_at = now(), attempt = 0,
+    locked_by = null, lease_expires_at = null, updated_at = now()
+where id = $id;
+
 -- :done
 update gen_durable
 set state = $state, result = $result, status = 'done',
@@ -218,6 +247,20 @@ update gen_durable
 set status = 'failed', last_error = $reason,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
+
+-- child → parent join: appended to :done and :stop, in the SAME transaction.
+-- No-op when parent_id is null (the join yields no parent row). The decrement
+-- that drives children_pending to zero releases the barrier. Concurrent siblings
+-- serialize on the parent row lock.
+update gen_durable p
+set children_pending = p.children_pending - 1,
+    status      = case when p.children_pending - 1 <= 0 and p.status = 'awaiting_children'
+                       then 'runnable' else p.status end,
+    eligible_at = case when p.children_pending - 1 <= 0 and p.status = 'awaiting_children'
+                       then now() else p.eligible_at end,
+    updated_at = now()
+from gen_durable c
+where c.id = $id and c.parent_id = p.id;
 ```
 
 ### Signal delivery (sender side, one transaction)
@@ -244,3 +287,21 @@ returning id;
 ```
 
 One index catches duplicates both against existing rows and within the batch itself. Concurrent inserts are handled by the constraint.
+
+---
+
+## 11. Children: `schedule_childs` (fan-out + fan-in)
+
+`schedule_childs` is one outcome that does two things atomically: it spawns a batch of child instances and parks the parent on a **join barrier** that releases only when every child has reached a terminal status (`done` **or** `failed`). It is the engine's answer to "fan work out, then wait for all of it." Schema version 2 (`awaiting_children`, `parent_id`, `children_pending`, `gen_durable_parent`) backs it.
+
+**Shape.** `{:schedule_childs, next_step, children, state}`. `children` is a list of child specs, each an ordinary insert: `fsm`, `version`, `step`, `state`, `queue`, `priority`, `partition_key`, `unique_key`, `unique_scope`, `eligible_at`. The engine stamps every child's `parent_id` with the parent's id. It is shaped like `:next` — the parent advances to `next_step` — but the transition is gated behind the barrier, so the parent re-runs at `next_step` (never at the spawning step), and there is no "re-run re-spawns" ambiguity.
+
+**Atomic spawn + park.** The whole thing is the parent's step-completion transaction (§10): the children are inserted **and** the parent flips to `awaiting_children` in one commit. Children become visible (`runnable`) only once that commits — a child can never finish and try to release a barrier that does not yet exist. `children_pending` is set to the number of children **actually inserted** (per-child uniqueness may drop some); if zero are inserted the barrier is pre-satisfied and the parent goes straight to `next_step`, `runnable`.
+
+**The join.** When a child reaches a terminal status, its own outcome transaction — the same one that writes `done`/`failed` — decrements the parent's `children_pending` (§10). Because the decrement rides the child's terminal commit, it happens **exactly once per child** even under at-least-once re-execution: a child that crashes before committing simply re-runs and never decremented. The decrement that drives `children_pending` to zero, while the parent is still `awaiting_children`, flips the parent to `runnable` at `next_step`. Concurrent siblings serialize on the parent's row lock.
+
+**Wake-up.** The parent re-runs `next_step` with its children available as `ctx.childs` — `[%{id, fsm, status, state, result, last_error}]`, one entry per child of this parent. The parent aggregates and returns a normal outcome. Children are **not** deleted on read (unlike consumed signals); they stay as terminal rows, GC'd externally like any other terminal row (§8). Re-execution of `next_step` (a crash) reads the same children and is idempotent if the aggregation is.
+
+**Failures.** The barrier waits for *termination*, not success: a child that ends `failed` still releases its slot. The parent sees `status: "failed"` + `last_error` in `ctx.childs` and decides (proceed, `:stop`, compensate). The engine does not auto-propagate child failure.
+
+**Not covered.** No cancel/cascade — terminating or failing a parent does not touch its children, and vice-versa. No quorum / `k`-of-`n` barrier — the join is all-or-nothing; quorum is the user's to build with `await` + per-child signals. No barrier deadline — a child that hangs forever hangs the parent; bound it inside the child (e.g. `:replay` with a timeout). Nesting is free: a child may itself `schedule_childs`, each level an independent barrier.
