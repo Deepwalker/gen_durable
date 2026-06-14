@@ -64,7 +64,7 @@ defmodule GenDurable.Migration do
   defp change(1, :up, p) do
     execute("""
     CREATE TYPE #{p}.durable_status AS ENUM
-      ('runnable', 'executing', 'awaiting_signal', 'done', 'failed')
+      ('runnable', 'executing', 'awaiting_signal', 'awaiting_children', 'done', 'failed')
     """)
 
     execute("""
@@ -87,6 +87,9 @@ defmodule GenDurable.Migration do
 
       locked_by        text,
       lease_expires_at timestamptz,
+
+      parent_id        bigint references #{p}.gen_durable(id) on delete set null,
+      children_pending int not null default 0,
 
       unique_key    bytea,
       unique_scope  #{p}.durable_status[] not null default '{}',
@@ -113,6 +116,11 @@ defmodule GenDurable.Migration do
     execute("""
     CREATE UNIQUE INDEX gen_durable_unique ON #{p}.gen_durable (unique_guard)
       WHERE unique_guard IS NOT NULL
+    """)
+
+    execute("""
+    CREATE INDEX gen_durable_parent ON #{p}.gen_durable (parent_id)
+      WHERE parent_id IS NOT NULL
     """)
 
     execute("""

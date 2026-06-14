@@ -27,6 +27,7 @@ defmodule GenDurable.Executor do
 
     state = State.from_db(state_module, job.state)
     signals = Queries.load_signals(repo, job.id)
+    childs = Queries.load_childs(repo, job.id)
 
     ctx = %Context{
       id: job.id,
@@ -35,7 +36,8 @@ defmodule GenDurable.Executor do
       step: job.step,
       attempt: job.attempt,
       state: state,
-      signals: signals
+      signals: signals,
+      childs: childs
     }
 
     started = System.monotonic_time()
@@ -56,7 +58,7 @@ defmodule GenDurable.Executor do
     Outcome.validate!(module.step(ctx.step, ctx))
   rescue
     reason ->
-      handle_ctx = %{ctx | signals: []}
+      handle_ctx = %{ctx | signals: [], childs: []}
 
       try do
         Outcome.validate!(module.handle(reason, handle_ctx))
@@ -79,6 +81,18 @@ defmodule GenDurable.Executor do
         # Stay parked: keep the inbox, delete nothing.
         Queries.complete_await(repo, id, State.to_db(state_module, state), name, [])
 
+      {:schedule_childs, next_step, children, state} ->
+        child_params = Enum.map(children, &child_to_params/1)
+
+        Queries.complete_schedule_childs(
+          repo,
+          id,
+          next_step,
+          State.to_db(state_module, state),
+          child_params,
+          consumed
+        )
+
       {:done, result} ->
         Queries.complete_done(repo, id, Jason.encode!(result), consumed)
 
@@ -90,4 +104,8 @@ defmodule GenDurable.Executor do
   defp format_reason(reason) when is_binary(reason), do: reason
   defp format_reason(%{__exception__: true} = e), do: Exception.message(e)
   defp format_reason(reason), do: inspect(reason)
+
+  # A child spec is `{FsmModule, insert_opts}` or a bare `FsmModule`.
+  defp child_to_params({module, opts}), do: GenDurable.build_params(module, opts)
+  defp child_to_params(module) when is_atom(module), do: GenDurable.build_params(module, [])
 end

@@ -130,6 +130,8 @@ defmodule GenDurable.Queries do
         """,
         [id, result_json]
       )
+
+      notify_parent(repo, id)
     end)
   end
 
@@ -144,7 +146,81 @@ defmodule GenDurable.Queries do
         """,
         [id, reason_text]
       )
+
+      notify_parent(repo, id)
     end)
+  end
+
+  # :schedule_childs (spec §11) — spawn the batch and park the parent on the
+  # join barrier, in one transaction. children_pending is set to the number of
+  # children actually inserted; zero inserted ⇒ barrier pre-satisfied ⇒ runnable.
+  def complete_schedule_childs(repo, parent_id, next_step, state_json, [], consumed) do
+    tx(repo, consumed, fn ->
+      repo.query!(
+        """
+        UPDATE gen_durable
+        SET step = $2, state = $3::jsonb, children_pending = 0, status = 'runnable',
+            eligible_at = now(), attempt = 0, locked_by = null, lease_expires_at = null,
+            updated_at = now()
+        WHERE id = $1
+        """,
+        [parent_id, next_step, state_json]
+      )
+    end)
+  end
+
+  def complete_schedule_childs(repo, parent_id, next_step, state_json, children, consumed) do
+    placeholders =
+      children
+      |> Enum.with_index()
+      |> Enum.map(fn {_p, i} -> child_row_placeholders(3 + i * 10) end)
+
+    sql =
+      "WITH ins AS (INSERT INTO gen_durable " <>
+        "(fsm, fsm_version, step, state, queue, priority, partition_key, " <>
+        "unique_key, unique_scope, eligible_at, parent_id) VALUES " <>
+        Enum.join(placeholders, ", ") <>
+        " ON CONFLICT (unique_guard) WHERE unique_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
+        "cnt AS (SELECT count(*) AS n FROM ins) " <>
+        "UPDATE gen_durable SET step = $2, state = $3::jsonb, " <>
+        "children_pending = (SELECT n FROM cnt), " <>
+        "status = (CASE WHEN (SELECT n FROM cnt) = 0 THEN 'runnable' " <>
+        "ELSE 'awaiting_children' END)::durable_status, " <>
+        "eligible_at = now(), attempt = 0, locked_by = null, lease_expires_at = null, " <>
+        "updated_at = now() WHERE id = $1"
+
+    args = [parent_id, next_step, state_json] ++ Enum.flat_map(children, &row_args/1)
+
+    tx(repo, consumed, fn -> repo.query!(sql, args) end)
+  end
+
+  # Child placeholders share $1 (the parent id) as the parent_id column.
+  defp child_row_placeholders(base) do
+    "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}::jsonb, $#{base + 5}, " <>
+      "$#{base + 6}, $#{base + 7}, $#{base + 8}, $#{base + 9}::text[]::durable_status[], " <>
+      "COALESCE($#{base + 10}::timestamptz, now()), $1)"
+  end
+
+  # Appended to a child's :done/:stop transaction. No-op when parent_id is null
+  # (the join yields no parent row). The decrement that hits zero releases the
+  # barrier; concurrent siblings serialize on the parent row lock.
+  defp notify_parent(repo, child_id) do
+    repo.query!(
+      """
+      UPDATE gen_durable p
+      SET children_pending = p.children_pending - 1,
+          status = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
+                        THEN 'runnable' ELSE p.status END,
+          eligible_at = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
+                             THEN now() ELSE p.eligible_at END,
+          updated_at = now()
+      FROM gen_durable c
+      WHERE c.id = $1 AND c.parent_id = p.id
+      """,
+      [child_id]
+    )
+
+    :ok
   end
 
   defp tx(repo, consumed, update_fun) do
@@ -174,6 +250,29 @@ defmodule GenDurable.Queries do
 
     Enum.map(rows, fn [id, name, payload] ->
       %{id: id, name: name, payload: decode_json(payload)}
+    end)
+  end
+
+  # A parent's children (spec §11), for ctx.childs on wake-up.
+  def load_childs(repo, parent_id) do
+    %{rows: rows} =
+      repo.query!(
+        """
+        SELECT id, fsm, status::text, state, result, last_error
+        FROM gen_durable WHERE parent_id = $1 ORDER BY id
+        """,
+        [parent_id]
+      )
+
+    Enum.map(rows, fn [id, fsm, status, state, result, last_error] ->
+      %{
+        id: id,
+        fsm: fsm,
+        status: status,
+        state: decode_json(state),
+        result: decode_json_or_nil(result),
+        last_error: last_error
+      }
     end)
   end
 
@@ -279,4 +378,8 @@ defmodule GenDurable.Queries do
   defp decode_json(value) when is_binary(value), do: Jason.decode!(value)
   defp decode_json(value) when is_map(value), do: value
   defp decode_json(nil), do: %{}
+
+  defp decode_json_or_nil(nil), do: nil
+  defp decode_json_or_nil(value) when is_binary(value), do: Jason.decode!(value)
+  defp decode_json_or_nil(value) when is_map(value), do: value
 end

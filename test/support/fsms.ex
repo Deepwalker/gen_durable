@@ -97,6 +97,38 @@ defmodule GenDurable.Test.Plain do
   def step("done", _ctx), do: {:done, %{}}
 end
 
+defmodule GenDurable.Test.Child do
+  @moduledoc "A child instance: succeeds, or fails when its state says so."
+  use GenDurable.FSM, name: "child", version: 1, initial: "go"
+
+  @impl true
+  def step("go", %{state: s}) do
+    if Map.get(s, "fail"),
+      do: {:stop, "child boom"},
+      else: {:done, %{"x" => Map.get(s, "x")}}
+  end
+end
+
+defmodule GenDurable.Test.Parent do
+  @moduledoc "Fans out children from `state[\"kids\"]`, joins on all of them (spec §11)."
+  use GenDurable.FSM, name: "parent", version: 1, initial: "fan"
+
+  @impl true
+  def step("fan", %{state: s}) do
+    specs = for kid <- Map.get(s, "kids", []), do: {GenDurable.Test.Child, state: kid}
+    {:schedule_childs, "join", specs, s}
+  end
+
+  def step("join", %{childs: childs}) do
+    {:done,
+     %{
+       "children" => length(childs),
+       "done" => Enum.count(childs, &(&1.status == "done")),
+       "failed" => Enum.count(childs, &(&1.status == "failed"))
+     }}
+  end
+end
+
 defmodule GenDurable.Test.FSMs do
   def all do
     [
@@ -106,7 +138,9 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.Crasher,
       GenDurable.Test.Reborn,
       GenDurable.Test.PartitionInc,
-      GenDurable.Test.Plain
+      GenDurable.Test.Plain,
+      GenDurable.Test.Child,
+      GenDurable.Test.Parent
     ]
   end
 end

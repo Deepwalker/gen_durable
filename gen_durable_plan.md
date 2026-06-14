@@ -281,13 +281,21 @@ uniqueness (M8) can proceed in parallel once persistence (M3) lands.
 - **M10 — Hardening. ✅** Telemetry (`[:gen_durable, :step, :stop]`, `[:gen_durable, :reaper,
   :reaped]`), config surface (`GenDurable.Supervisor` opts), README, `--warnings-as-errors` clean.
 
+### M11 — `schedule_childs` (spec §11) ✅ DONE
+Fan-out + fan-in barrier as a first-class primitive. Since the schema was never deployed, the v2
+columns were **folded into the v1 migration** (no incremental migration — per "никто не использовал"):
+enum value `awaiting_children`, columns `parent_id` / `children_pending`, index `gen_durable_parent`.
+- Outcome `{:schedule_childs, next_step, children, state}` (`Outcome.validate`); child spec is
+  `{FsmModule, insert_opts}` or a bare module.
+- `Queries.complete_schedule_childs` — batch-insert children (`parent_id` stamped) + park in one txn,
+  `children_pending` = rows actually inserted, zero ⇒ straight to `next_step` runnable.
+- Child→parent join decrement (`notify_parent`) appended to `complete_done`/`complete_stop` (no-op
+  when `parent_id` is null); the decrement that hits zero releases the barrier.
+- `ctx.childs` loaded on every run (one indexed SELECT; optimizable like the always-load-signals).
+- Tests: all-children join, a `failed` child still releasing its slot, zero-children → immediate
+  `next_step`. 36 tests green.
+
 ### Open follow-ups (post-v1, not blocking)
-- **`schedule_childs` (spec §11) — specified, not yet implemented.** Schema version 2: enum value
-  `awaiting_children`, columns `parent_id` / `children_pending`, index `gen_durable_parent`. Work:
-  `Migration.change(2, …)`; a `{:schedule_childs, next_step, children, state}` outcome (batch-insert
-  children + park in one txn); a child→parent join decrement appended to the `:done`/`:stop`
-  transactions; load `ctx.childs` on wake; tests for the all-children barrier (incl. a `failed` child
-  still releasing its slot, and zero-children → immediate `next_step`).
 - **D2:** spec §10 `:done` update lists `state = $state`, but the `{:done, result}` outcome carries no
   state. The engine writes `result` only and leaves `state` as-is. Worth reconciling in the spec.
 - Signal-consumption edge: on a *progressing* outcome the engine deletes the whole inbox snapshot; a

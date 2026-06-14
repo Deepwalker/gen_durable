@@ -71,7 +71,8 @@ defmodule GenDurable do
 
   # --- helpers ---------------------------------------------------------------
 
-  defp build_params(fsm_module, opts) do
+  @doc false
+  def build_params(fsm_module, opts) do
     state_module = fsm_module.__gd_state__()
 
     %{

@@ -126,4 +126,30 @@ defmodule GenDurable.EngineTest do
 
     assert Agent.get(GenDurable.Test.PartitionAgent, & &1) == 4
   end
+
+  test "schedule_childs fans out and joins on all children (spec §11)" do
+    start_engine()
+    kids = for i <- 1..4, do: %{"x" => i}
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Parent, state: %{"kids" => kids})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"children" => 4, "done" => 4, "failed" => 0}
+  end
+
+  test "a failed child still releases the join barrier" do
+    start_engine()
+    kids = [%{"x" => 1}, %{"x" => 2, "fail" => true}]
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Parent, state: %{"kids" => kids})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"children" => 2, "done" => 1, "failed" => 1}
+  end
+
+  test "zero children means the parent proceeds to next_step immediately" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Parent, state: %{"kids" => []})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"children" => 0, "done" => 0, "failed" => 0}
+  end
 end

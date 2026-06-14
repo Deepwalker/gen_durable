@@ -15,6 +15,7 @@ defmodule GenDurable.Outcome do
           {:next, String.t(), term()}
           | {:replay, term(), non_neg_integer()}
           | {:await, String.t(), term()}
+          | {:schedule_childs, String.t(), [term()], term()}
           | {:done, map()}
           | {:stop, term()}
 
@@ -27,6 +28,10 @@ defmodule GenDurable.Outcome do
 
   def validate({:await, name, state}) when is_binary(name) or is_atom(name),
     do: {:ok, {:await, to_string(name), state}}
+
+  def validate({:schedule_childs, step, children, state})
+      when (is_binary(step) or is_atom(step)) and is_list(children),
+      do: {:ok, {:schedule_childs, to_string(step), children, state}}
 
   def validate({:done, result}) when is_map(result),
     do: {:ok, {:done, result}}
