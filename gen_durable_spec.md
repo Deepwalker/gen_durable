@@ -109,11 +109,13 @@ create table gen_durable (
 
   -- uniqueness
   unique_key    bytea,                              -- user function result, verbatim
-  unique_scope  text[]  not null default '{}',      -- statuses in which the key is "occupied"
+  unique_scope  durable_status[] not null default '{}', -- statuses in which the key is "occupied"
   unique_guard  bytea generated always as (
-    case when unique_key is not null and status::text = any(unique_scope)
+    case when unique_key is not null and status = any(unique_scope)
          then unique_key end
-  ) stored,
+  ) stored,                                         -- NB: scope is durable_status[], not text[] —
+                                                    -- a generated column must be IMMUTABLE, and the
+                                                    -- enum->text cast (enum_out) is only STABLE.
 
   inserted_at   timestamptz not null default now(),
   updated_at    timestamptz not null default now()
