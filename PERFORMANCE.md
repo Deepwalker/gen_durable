@@ -28,19 +28,24 @@ The database work per step, and where it goes:
 
 | Phase | Statements | Round-trips | Notes |
 |---|---|---|---|
-| **pick** | 1 (`UPDATE … RETURNING` over a dedup CTE) | ~`1/B` per step | one pick claims a batch of `B`; the feeder amortizes it |
-| **load signals** | 1 `SELECT` | 1 | always-on today; gated by an FSM flag is the F4 optimization |
+| **pick** | 1 (`UPDATE … RETURNING` over a window-dedup claim) | ~`1/B` per step | one pick claims a batch of `B`; the feeder amortizes it |
+| **load signals** | 1 `SELECT` | 1 | always-on today; gated by an FSM flag is the remaining F4 step |
 | **load childs** | 1 `SELECT` | 1 | same |
 | **user `step/2`** | 0 | 0 | runs outside any transaction |
-| **outcome** | `BEGIN` · consume `DELETE` · outcome `UPDATE` · `COMMIT` | ~4 | `:done`/`:stop` add `notify_parent` (+1) |
+| **outcome** | 1 CTE (`consumed` DELETE + outcome UPDATE [+ parent-join]) | **1** | folded from a 4–5-stmt transaction into one statement (F4) |
 
-So a plain `:next` step today is **~6 round-trips** (2 loads + 4 for the outcome txn),
-with the pick amortized to near-zero by batching. The two loads and the multi-statement
-transaction are the F4 optimization target (gate the loads, collapse the outcome into a
-single autocommit CTE) — that takes it to **~1–2 round-trips/step**. See §7.
+So a plain `:next` step is now **~3 round-trips** (2 loads + 1 outcome), with the pick
+amortized to near-zero by batching. The outcome used to be a 4-statement
+`BEGIN`/consume/`UPDATE`/`COMMIT` transaction (+1 for `:done`/`:stop`'s parent-join);
+folding it into a single data-modifying CTE made it **1** — measured at exactly one
+statement (`test/perf_test.exs`), and consistently faster than the transaction form on
+wall-clock (the round-trips are the cost). Gating the two loads behind an FSM capability
+flag is the last F4 step → **~1 round-trip/step**. See §7.
 
 Round-trips, not query execution time, dominate: every statement below executes in
-**well under 1 ms** at the database. The cost is the count of client↔Postgres hops.
+**well under 1 ms** at the database, but each client↔Postgres hop is a network round-trip
+(~0.3–1 ms across hosts). The cost is the count of hops, which is why collapsing the
+outcome from 4 hops to 1 matters more than any single statement's plan.
 
 ---
 
@@ -336,21 +341,19 @@ magnitude. The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 
    advisory lock on a checked-out connection for the *whole* step (user code included), so
    in-flight partitioned steps consume pool connections 1:1. Size the pool for peak
    partitioned concurrency. Non-partitioned steps grab/release per statement.
-3. **Outcome is a multi-statement transaction.** `BEGIN`/consume/`UPDATE`/`COMMIT` is
-   ~4 round-trips; collapsible to one autocommit CTE (`DELETE … ; UPDATE …` as a single
-   statement). F4.
-4. **`load_signals` + `load_childs` run on every step**, even for FSMs that never await or
+3. **`load_signals` + `load_childs` run on every step**, even for FSMs that never await or
    spawn. Two wasted round-trips for the common machine; gate them behind
-   `use GenDurable.FSM, awaits: true, childs: true`. F4.
+   `use GenDurable.FSM, awaits: true, childs: true`. The last remaining F4 step.
 
 ---
 
-## 7. Optimization backlog (F4) — ordered by payoff
+## 7. Optimization backlog — ordered by payoff
 
-1. **Collapse the outcome transaction into one CTE statement** — ~4 round-trips → 1. The
-   biggest single win on the hot path.
+1. ✅ **Collapse the outcome transaction into one CTE statement** — done (F4): a 4–5-stmt
+   `BEGIN … COMMIT` became one data-modifying CTE, ~4 round-trips → 1, the biggest single
+   win on the hot path. Asserted single-statement in `test/perf_test.exs`.
 2. **Gate `load_signals` / `load_childs` on FSM capability flags** — ~2 round-trips → 0
-   for plain machines.
+   for plain machines. Takes a plain `:next` step from ~3 round-trips to ~1.
 3. **Picker sharding by key hash** — removes the hot-key skip cost (limit #1).
 
 Together (1)+(2) take a plain `:next` step from ~6 round-trips to ~1–2.

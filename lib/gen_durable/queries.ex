@@ -114,39 +114,70 @@ defmodule GenDurable.Queries do
   end
 
   # --- step outcomes (spec §3 / §10) -----------------------------------------
+  #
+  # Each outcome is a SINGLE statement, not a transaction (one round-trip instead
+  # of BEGIN + … + COMMIT). The signal consume (spec §5) rides along as a leading
+  # data-modifying CTE, `consumed`, atomic with the outcome UPDATE because one
+  # statement is its own implicit transaction. `consumed` deletes exactly the
+  # inbox signals whose name matches the row's current `awaits` (a no-op when
+  # `awaits` is null) and runs to completion even though the main query never
+  # reads it — Postgres guarantees data-modifying CTEs always execute fully.
+
+  # The join-barrier decrement (spec §11), used as the main statement of the
+  # terminal outcomes after the `consumed` + `terminal` CTEs. No-op when the row
+  # has no parent (the join yields nothing). The decrement that hits zero releases
+  # the barrier; concurrent siblings serialize on the parent row lock. The
+  # `terminal` CTE updates the child (id = $1); this updates the parent (a
+  # different row), reading the child's pre-statement `parent_id` under the shared
+  # snapshot — so the two table-modifications never touch the same row.
+  @notify_parent """
+  UPDATE gen_durable p
+  SET children_pending = p.children_pending - 1,
+      status = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
+                    THEN 'runnable' ELSE p.status END,
+      eligible_at = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
+                         THEN now() ELSE p.eligible_at END,
+      updated_at = now()
+  FROM gen_durable c
+  WHERE c.id = $1 AND c.parent_id = p.id
+  """
 
   def complete_next(repo, id, step, state_json) do
-    tx(repo, fn ->
-      consume_awaited(repo, id)
-
-      repo.query!(
-        """
-        UPDATE gen_durable
-        SET step = $2, state = $3::jsonb, status = 'runnable', eligible_at = now(),
-            attempt = 0, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
-        WHERE id = $1
-        """,
-        [id, step, state_json]
+    repo.query!(
+      """
+      WITH consumed AS (
+        DELETE FROM signals s USING gen_durable g
+        WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits
       )
-    end)
+      UPDATE gen_durable
+      SET step = $2, state = $3::jsonb, status = 'runnable', eligible_at = now(),
+          attempt = 0, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
+      WHERE id = $1
+      """,
+      [id, step, state_json]
+    )
+
+    :ok
   end
 
   def complete_replay(repo, id, state_json, delay_ms) do
-    tx(repo, fn ->
-      consume_awaited(repo, id)
-
-      repo.query!(
-        """
-        UPDATE gen_durable
-        SET state = $2::jsonb, status = 'runnable',
-            eligible_at = now() + $3::int * interval '1 millisecond',
-            attempt = attempt + 1, awaits = null, locked_by = null, lease_expires_at = null,
-            updated_at = now()
-        WHERE id = $1
-        """,
-        [id, state_json, delay_ms]
+    repo.query!(
+      """
+      WITH consumed AS (
+        DELETE FROM signals s USING gen_durable g
+        WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits
       )
-    end)
+      UPDATE gen_durable
+      SET state = $2::jsonb, status = 'runnable',
+          eligible_at = now() + $3::int * interval '1 millisecond',
+          attempt = attempt + 1, awaits = null, locked_by = null, lease_expires_at = null,
+          updated_at = now()
+      WHERE id = $1
+      """,
+      [id, state_json, delay_ms]
+    )
+
+    :ok
   end
 
   # Park on a signal. If a matching signal is already in the inbox (it arrived
@@ -154,75 +185,82 @@ defmodule GenDurable.Queries do
   # and consumes it — closing the lost-wakeup race. `awaits` is set either way, so
   # the eventual progressing outcome consumes by name (spec §5).
   def complete_await(repo, id, state_json, signal_name) do
-    tx(repo, fn ->
-      repo.query!(
-        """
-        UPDATE gen_durable
-        SET state = $2::jsonb, awaits = $3, eligible_at = now(),
-            status = (CASE WHEN EXISTS (SELECT 1 FROM signals WHERE target_id = $1 AND name = $3)
-                           THEN 'runnable' ELSE 'awaiting_signal' END)::durable_status,
-            locked_by = null, lease_expires_at = null, updated_at = now()
-        WHERE id = $1
-        """,
-        [id, state_json, signal_name]
-      )
-    end)
+    repo.query!(
+      """
+      UPDATE gen_durable
+      SET state = $2::jsonb, awaits = $3, eligible_at = now(),
+          status = (CASE WHEN EXISTS (SELECT 1 FROM signals WHERE target_id = $1 AND name = $3)
+                         THEN 'runnable' ELSE 'awaiting_signal' END)::durable_status,
+          locked_by = null, lease_expires_at = null, updated_at = now()
+      WHERE id = $1
+      """,
+      [id, state_json, signal_name]
+    )
+
+    :ok
   end
 
   def complete_done(repo, id, result_json) do
-    tx(repo, fn ->
-      consume_awaited(repo, id)
-
-      repo.query!(
-        """
+    repo.query!(
+      """
+      WITH consumed AS (
+        DELETE FROM signals s USING gen_durable g
+        WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits
+      ),
+      terminal AS (
         UPDATE gen_durable
         SET result = $2::jsonb, status = 'done', awaits = null,
             locked_by = null, lease_expires_at = null, updated_at = now()
         WHERE id = $1
-        """,
-        [id, result_json]
       )
+      """ <> @notify_parent,
+      [id, result_json]
+    )
 
-      notify_parent(repo, id)
-    end)
+    :ok
   end
 
   def complete_stop(repo, id, reason_text) do
-    tx(repo, fn ->
-      consume_awaited(repo, id)
-
-      repo.query!(
-        """
+    repo.query!(
+      """
+      WITH consumed AS (
+        DELETE FROM signals s USING gen_durable g
+        WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits
+      ),
+      terminal AS (
         UPDATE gen_durable
         SET status = 'failed', last_error = $2, awaits = null,
             locked_by = null, lease_expires_at = null, updated_at = now()
         WHERE id = $1
-        """,
-        [id, reason_text]
       )
+      """ <> @notify_parent,
+      [id, reason_text]
+    )
 
-      notify_parent(repo, id)
-    end)
+    :ok
   end
 
-  # :schedule_childs (spec §11) — spawn the batch and park the parent on the
-  # join barrier, in one transaction. children_pending is set to the number of
-  # children actually inserted; zero inserted ⇒ barrier pre-satisfied ⇒ runnable.
+  # :schedule_childs (spec §11) — spawn the batch and park the parent on the join
+  # barrier, in one statement (consume + insert children + park). children_pending
+  # is set to the number of children actually inserted; zero inserted ⇒ barrier
+  # pre-satisfied ⇒ runnable.
   def complete_schedule_childs(repo, parent_id, next_step, state_json, []) do
-    tx(repo, fn ->
-      consume_awaited(repo, parent_id)
-
-      repo.query!(
-        """
-        UPDATE gen_durable
-        SET step = $2, state = $3::jsonb, children_pending = 0, status = 'runnable',
-            eligible_at = now(), attempt = 0, awaits = null, locked_by = null,
-            lease_expires_at = null, updated_at = now()
-        WHERE id = $1
-        """,
-        [parent_id, next_step, state_json]
+    repo.query!(
+      """
+      WITH consumed AS (
+        DELETE FROM signals s USING gen_durable g
+        WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits
       )
-    end)
+      UPDATE gen_durable
+      SET step = $2, state = $3::jsonb, children_pending = 0, status = 'runnable',
+          eligible_at = now(), attempt = 0, awaits = null, locked_by = null,
+          lease_expires_at = null, updated_at = now()
+      WHERE id = $1
+      """,
+      [parent_id, next_step, state_json]
+    )
+
+    :ok
   end
 
   def complete_schedule_childs(repo, parent_id, next_step, state_json, children) do
@@ -232,7 +270,9 @@ defmodule GenDurable.Queries do
       |> Enum.map(fn {_p, i} -> child_row_placeholders(3 + i * 10) end)
 
     sql =
-      "WITH ins AS (INSERT INTO gen_durable " <>
+      "WITH consumed AS (DELETE FROM signals s USING gen_durable g " <>
+        "WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits), " <>
+        "ins AS (INSERT INTO gen_durable " <>
         "(fsm, fsm_version, step, state, queue, priority, partition_key, " <>
         "unique_key, unique_scope, eligible_at, parent_id) VALUES " <>
         Enum.join(placeholders, ", ") <>
@@ -247,10 +287,8 @@ defmodule GenDurable.Queries do
 
     args = [parent_id, next_step, state_json] ++ Enum.flat_map(children, &row_args/1)
 
-    tx(repo, fn ->
-      consume_awaited(repo, parent_id)
-      repo.query!(sql, args)
-    end)
+    repo.query!(sql, args)
+    :ok
   end
 
   # Child placeholders share $1 (the parent id) as the parent_id column.
@@ -258,49 +296,6 @@ defmodule GenDurable.Queries do
     "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}::jsonb, $#{base + 5}, " <>
       "$#{base + 6}, $#{base + 7}, $#{base + 8}, $#{base + 9}::text[]::durable_status[], " <>
       "COALESCE($#{base + 10}::timestamptz, now()), $1)"
-  end
-
-  # Appended to a child's :done/:stop transaction. No-op when parent_id is null
-  # (the join yields no parent row). The decrement that hits zero releases the
-  # barrier; concurrent siblings serialize on the parent row lock.
-  defp notify_parent(repo, child_id) do
-    repo.query!(
-      """
-      UPDATE gen_durable p
-      SET children_pending = p.children_pending - 1,
-          status = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
-                        THEN 'runnable' ELSE p.status END,
-          eligible_at = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
-                             THEN now() ELSE p.eligible_at END,
-          updated_at = now()
-      FROM gen_durable c
-      WHERE c.id = $1 AND c.parent_id = p.id
-      """,
-      [child_id]
-    )
-
-    :ok
-  end
-
-  defp tx(repo, fun) do
-    repo.transaction(fn -> fun.() end)
-    :ok
-  end
-
-  # Consume the signals the instance was parked on: delete exactly the rows whose
-  # name matches the row's current `awaits` (spec §5). No-op when `awaits` is null,
-  # so non-matching signals — and signals on a never-awaited instance — survive.
-  # Must run before the outcome UPDATE clears `awaits`.
-  defp consume_awaited(repo, id) do
-    repo.query!(
-      """
-      DELETE FROM signals s USING gen_durable g
-      WHERE s.target_id = $1 AND g.id = $1 AND s.name = g.awaits
-      """,
-      [id]
-    )
-
-    :ok
   end
 
   # --- signals ---------------------------------------------------------------

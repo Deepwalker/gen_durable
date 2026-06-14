@@ -13,4 +13,4 @@ end
 
 Ecto.Migrator.run(Repo, [{1, GenDurable.Test.Migrations.Setup}], :up, all: true)
 
-ExUnit.start()
+ExUnit.start(exclude: [:bench])

@@ -378,9 +378,20 @@ null keys, so non-partitioned claims skip that index write).
   per-row *claim write* (~11–16 µs/row: heap + partial-index moves + WAL), not the query shape.
 - 46 tests green (partition serialization, dedup units, cross-key parallelism all hold under M).
 
+### F9 — Outcome collapsed to one round-trip ✅ DONE
+Each `complete_*` was a `repo.transaction(BEGIN + consume DELETE + outcome UPDATE [+ notify_parent] +
+COMMIT)` = 4–5 round-trips. Folded into a **single data-modifying-CTE statement**: `consumed AS
+(DELETE …)` rides as a leading CTE, atomic with the outcome UPDATE because one statement is its own
+implicit transaction; `:done`/`:stop` carry the parent-join decrement as the main `UPDATE` after a
+`terminal AS (UPDATE …)` CTE (child id = $1 and parent are different rows, read under the shared
+snapshot). Removed the `tx` / `consume_awaited` / `notify_parent` helpers. **~4 round-trips → 1**,
+asserted single-statement via Ecto query telemetry in `test/perf_test.exs` (a `:bench` test, excluded
+by default, prints the old-vs-new wall-clock — consistently faster). 53 tests green (1 bench excluded).
+
 ### Open follow-ups (post-v1, not blocking)
-- **F4 — Always-load `signals` + `childs`:** every step does two `target/parent` SELECTs. Cheap, but
-  a gate-on-FSM-flag (`use GenDurable.FSM, awaits: true, childs: true`) is a clean optimization.
+- **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
+  SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes
+  from ~3 round-trips to ~1. (The outcome-collapse half of F4 is done — see F9.)
 - partition_key busy-spin on a hot key (picker-sharding, §6) — v2.
 - Telemetry breadth, graceful drain — v2.
 
