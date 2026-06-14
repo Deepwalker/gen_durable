@@ -129,6 +129,42 @@ defmodule GenDurable.Test.Parent do
   end
 end
 
+defmodule GenDurable.Test.Sleeper do
+  @moduledoc "Sleeps `state[\"ms\"]` then completes — used to test heartbeat & parallelism."
+  use GenDurable.FSM, name: "sleeper", version: 1, initial: "sleep"
+
+  @impl true
+  def step("sleep", %{state: s}) do
+    Process.sleep(Map.get(s, "ms", 0))
+    {:done, %{"slept" => Map.get(s, "ms", 0)}}
+  end
+end
+
+defmodule GenDurable.Test.Recorder do
+  @moduledoc "Appends `state[\"tag\"]` to a shared Agent — used to test pick ordering."
+  use GenDurable.FSM, name: "recorder", version: 1, initial: "rec"
+
+  @impl true
+  def step("rec", %{state: s}) do
+    Agent.update(GenDurable.Test.RecorderAgent, &(&1 ++ [Map.get(s, "tag")]))
+    {:done, %{}}
+  end
+end
+
+defmodule GenDurable.Test.Overlap do
+  @moduledoc "Records start/stop instants around a sleep — used to prove cross-key parallelism."
+  use GenDurable.FSM, name: "overlap", version: 1, initial: "go"
+
+  @impl true
+  def step("go", %{id: id}) do
+    agent = GenDurable.Test.OverlapAgent
+    Agent.update(agent, &Map.put(&1, {id, :start}, System.monotonic_time(:millisecond)))
+    Process.sleep(120)
+    Agent.update(agent, &Map.put(&1, {id, :stop}, System.monotonic_time(:millisecond)))
+    {:done, %{}}
+  end
+end
+
 defmodule GenDurable.Test.FSMs do
   def all do
     [
@@ -140,7 +176,10 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.PartitionInc,
       GenDurable.Test.Plain,
       GenDurable.Test.Child,
-      GenDurable.Test.Parent
+      GenDurable.Test.Parent,
+      GenDurable.Test.Sleeper,
+      GenDurable.Test.Recorder,
+      GenDurable.Test.Overlap
     ]
   end
 end

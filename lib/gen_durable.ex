@@ -36,7 +36,9 @@ defmodule GenDurable do
   @doc """
   Enqueue one FSM instance. Options: `:state`, `:step` (default the FSM's
   `:initial`), `:queue`, `:priority`, `:partition_key`, `:unique_key`,
-  `:unique_scope`, `:eligible_at`. Returns `{:ok, id}` or `{:error, :duplicate}`.
+  `:unique_scope`, and scheduling — `:eligible_at` (a `DateTime`), or the sugar
+  `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
+  Returns `{:ok, id}` or `{:error, :duplicate}`.
   """
   def insert(fsm_module, opts \\ []) do
     repo = opts[:repo] || config().repo
@@ -85,8 +87,19 @@ defmodule GenDurable do
       partition_key: opts[:partition_key],
       unique_key: opts[:unique_key],
       unique_scope: Enum.map(opts[:unique_scope] || [], &to_string/1),
-      eligible_at: opts[:eligible_at]
+      eligible_at: resolve_eligible_at(opts)
     }
+  end
+
+  # Scheduling sugar. Precedence: explicit :eligible_at, then :schedule_at
+  # (a DateTime), then :schedule_in (milliseconds from now). nil ⇒ now() in SQL.
+  defp resolve_eligible_at(opts) do
+    cond do
+      opts[:eligible_at] -> opts[:eligible_at]
+      opts[:schedule_at] -> opts[:schedule_at]
+      opts[:schedule_in] -> DateTime.add(DateTime.utc_now(), opts[:schedule_in], :millisecond)
+      true -> nil
+    end
   end
 
   defp config, do: :persistent_term.get({GenDurable, :config})

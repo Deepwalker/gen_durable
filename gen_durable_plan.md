@@ -296,15 +296,19 @@ enum value `awaiting_children`, columns `parent_id` / `children_pending`, index 
 - Tests: all-children join, a `failed` child still releasing its slot, zero-children → immediate
   `next_step`. 36 tests green.
 
-### Fixed (F1)
-- **D2 — resolved.** Spec §10 `:done` no longer lists `state = $state`; it matches the engine
+### Fixed (F1–F3)
+- **F1 / D2 — resolved.** Spec §10 `:done` no longer lists `state = $state`; it matches the engine
   (writes `result` only, leaves `state`).
-- **Signal consumption — resolved (option b).** Name-scoped delete + `awaits` kept on delivery +
-  `:await` pre-arrival guard. Non-matching signals survive (spec §5). Tests in `queries_test`.
+- **F1 / signals (option b) — resolved.** Name-scoped delete + `awaits` kept on delivery + `:await`
+  pre-arrival guard (no lost wake-up). Non-matching signals survive (spec §5). Tests in `queries_test`.
+- **F2 / test coverage — added.** Priority ordering, per-queue routing, `schedule_in` eligibility,
+  heartbeat keeps a long lease (no spurious reap), cross-key partition parallelism. (`engine_test`)
+- **F3 / scheduling sugar — added.** `insert/2` accepts `:schedule_in` (ms from now) / `:schedule_at`
+  (`DateTime`); precedence `:eligible_at` > `:schedule_at` > `:schedule_in`.
 
 ### Open follow-ups (post-v1, not blocking)
-- Always-load `signals` + `childs`: every step does two `target/parent` SELECTs. Cheap, but
-  gate-on-FSM-flag is a clean optimization (F4).
+- **F4 — Always-load `signals` + `childs`:** every step does two `target/parent` SELECTs. Cheap, but
+  a gate-on-FSM-flag (`use GenDurable.FSM, awaits: true, childs: true`) is a clean optimization.
 - partition_key busy-spin on a hot key (picker-sharding, §6) — v2.
 - Telemetry breadth, graceful drain — v2.
 

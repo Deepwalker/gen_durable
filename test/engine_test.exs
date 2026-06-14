@@ -22,6 +22,8 @@ defmodule GenDurable.EngineTest do
     start_supervised!({GenDurable, Keyword.merge(defaults, opts)})
   end
 
+  defp agent_spec(name, init), do: %{id: name, start: {Agent, :start_link, [init, [name: name]]}}
+
   defp status(id) do
     %{rows: [[s, result, err, attempt]]} =
       Repo.query!(
@@ -151,5 +153,76 @@ defmodule GenDurable.EngineTest do
 
     row = wait_status(id, "done")
     assert Jason.decode!(row.result) == %{"children" => 0, "done" => 0, "failed" => 0}
+  end
+
+  test "picker honors priority (lower number runs first)" do
+    start_supervised!(agent_spec(GenDurable.Test.RecorderAgent, fn -> [] end))
+    # Insert before the engine starts so both are runnable at the first poll.
+    {:ok, _} =
+      GenDurable.insert(GenDurable.Test.Recorder,
+        repo: Repo,
+        state: %{"tag" => "low"},
+        priority: 5
+      )
+
+    {:ok, _} =
+      GenDurable.insert(GenDurable.Test.Recorder,
+        repo: Repo,
+        state: %{"tag" => "high"},
+        priority: 0
+      )
+
+    start_engine(queues: [default: 1])
+
+    eventually(fn ->
+      if length(Agent.get(GenDurable.Test.RecorderAgent, & &1)) == 2, do: {:ok, :ok}, else: :retry
+    end)
+
+    assert Agent.get(GenDurable.Test.RecorderAgent, & &1) == ["high", "low"]
+  end
+
+  test "per-queue schedulers route by queue" do
+    start_engine(queues: [a: 1, b: 1])
+    {:ok, ia} = GenDurable.insert(GenDurable.Test.Plain, queue: "a")
+    {:ok, ib} = GenDurable.insert(GenDurable.Test.Plain, queue: "b")
+
+    wait_status(ia, "done")
+    wait_status(ib, "done")
+  end
+
+  test "schedule_in delays eligibility (scheduling sugar)" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain, schedule_in: 400)
+
+    Process.sleep(120)
+    assert status(id).status == "runnable"
+
+    assert wait_status(id, "done").status == "done"
+  end
+
+  test "heartbeat keeps a long step's lease alive (no spurious reap)" do
+    start_engine(lease_ttl: 400, heartbeat_interval: 100, reap_interval: 100)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Sleeper, state: %{"ms" => 900})
+
+    row = wait_status(id, "done")
+    # attempt stays 0 => the lease never expired, so the step was never re-run
+    assert row.attempt == 0
+    assert Jason.decode!(row.result) == %{"slept" => 900}
+  end
+
+  test "different partition_keys run in parallel (overlapping steps)" do
+    start_supervised!(agent_spec(GenDurable.Test.OverlapAgent, fn -> %{} end))
+    start_engine(queues: [default: 4])
+
+    {:ok, a} = GenDurable.insert(GenDurable.Test.Overlap, partition_key: "ka")
+    {:ok, b} = GenDurable.insert(GenDurable.Test.Overlap, partition_key: "kb")
+
+    wait_status(a, "done")
+    wait_status(b, "done")
+
+    m = Agent.get(GenDurable.Test.OverlapAgent, & &1)
+    # The two steps overlapped: each started before the other stopped.
+    assert m[{a, :start}] < m[{b, :stop}]
+    assert m[{b, :start}] < m[{a, :stop}]
   end
 end
