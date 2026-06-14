@@ -33,7 +33,7 @@ defmodule GenDurable.QueriesTest do
   test "insert then pick flips to executing and returns the job" do
     {:ok, id} = Queries.insert(Repo, params())
 
-    [job] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+    [job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
     assert job.id == id
     assert job.fsm == "counter"
     assert job.step == "tick"
@@ -50,9 +50,9 @@ defmodule GenDurable.QueriesTest do
     {:ok, _} = Queries.insert(Repo, params(%{queue: "a"}))
     {:ok, _} = Queries.insert(Repo, params(%{queue: "b"}))
 
-    assert [%{}] = Queries.pick(Repo, ["a"], 10, @worker, @ttl)
-    assert [] = Queries.pick(Repo, ["a"], 10, @worker, @ttl)
-    assert [%{}] = Queries.pick(Repo, ["b"], 10, @worker, @ttl)
+    assert [%{}] = Queries.pick(Repo, "a", 10, @worker, @ttl)
+    assert [] = Queries.pick(Repo, "a", 10, @worker, @ttl)
+    assert [%{}] = Queries.pick(Repo, "b", 10, @worker, @ttl)
   end
 
   describe "partition_key dedup in the picker (spec §6)" do
@@ -60,7 +60,7 @@ defmodule GenDurable.QueriesTest do
       for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params(%{partition_key: "k"}))
       {:ok, other} = Queries.insert(Repo, params(%{partition_key: "k2"}))
 
-      jobs = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
       keys = Enum.map(jobs, & &1.partition_key)
 
       assert Enum.count(keys, &(&1 == "k")) == 1
@@ -74,22 +74,22 @@ defmodule GenDurable.QueriesTest do
       {:ok, _b} = Queries.insert(Repo, params(%{partition_key: "k"}))
 
       # Claim one row for "k"; it becomes executing and holds the key.
-      assert [%{id: ^a}] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      assert [%{id: ^a}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
       # The sibling is runnable, but "k" is executing => not picked (no bounce).
-      assert [] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      assert [] = Queries.pick(Repo, "default", 10, @worker, @ttl)
     end
 
     test "NULL partition_key rows are never deduped against each other" do
       for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params())
 
-      assert length(Queries.pick(Repo, ["default"], 10, @worker, @ttl)) == 3
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 3
     end
   end
 
   test "complete_next resets attempt and returns to runnable" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_job] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+    [_job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
     :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}))
 
@@ -104,7 +104,7 @@ defmodule GenDurable.QueriesTest do
 
   test "complete_replay bumps attempt and delays eligibility" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
     :ok = Queries.complete_replay(Repo, id, ~s({"n":0}), 50_000)
 
@@ -142,7 +142,7 @@ defmodule GenDurable.QueriesTest do
   test "reaper returns expired-lease executing rows to runnable with attempt+1" do
     {:ok, id} = Queries.insert(Repo, params())
     # Pick with a negative TTL so the lease is already expired.
-    [_] = Queries.pick(Repo, ["default"], 10, @worker, -1000)
+    [_] = Queries.pick(Repo, "default", 10, @worker, -1000)
 
     assert Queries.reap(Repo) == [id]
 
@@ -157,7 +157,7 @@ defmodule GenDurable.QueriesTest do
   describe "signals" do
     test "deliver wakes a matching await and keeps awaits (name-scoped consumption)" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
@@ -174,7 +174,7 @@ defmodule GenDurable.QueriesTest do
 
     test "non-matching signal does not wake the instance" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
@@ -190,7 +190,7 @@ defmodule GenDurable.QueriesTest do
       # signal arrives while the instance is still runnable (not yet awaiting)
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
 
-      [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
       %{rows: [[status]]} =
@@ -213,7 +213,7 @@ defmodule GenDurable.QueriesTest do
 
     test "progress consumes only the awaited name; other signals survive (§5)" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)

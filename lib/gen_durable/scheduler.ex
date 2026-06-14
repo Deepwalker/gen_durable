@@ -49,7 +49,7 @@ defmodule GenDurable.Scheduler do
   def init(opts) do
     state = %{
       config: opts.config,
-      queues: [opts.queue],
+      queue: opts.queue,
       concurrency: opts.concurrency,
       prefetch: opts.prefetch,
       min_demand: opts.min_demand,
@@ -120,7 +120,7 @@ defmodule GenDurable.Scheduler do
 
     if demand > 0 and (demand >= state.min_demand or idle?) do
       config = state.config
-      jobs = Queries.pick(config.repo, state.queues, demand, state.worker, config.lease_ttl_ms)
+      jobs = Queries.pick(config.repo, state.queue, demand, state.worker, config.lease_ttl_ms)
       {%{state | buffer: state.buffer ++ jobs}, length(jobs)}
     else
       {state, 0}

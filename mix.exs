@@ -23,7 +23,7 @@ defmodule GenDurable.MixProject do
     [
       licenses: ["BSD-3-Clause"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md LICENSE .formatter.exs
+      files: ~w(lib mix.exs README.md LICENSE PERFORMANCE.md .formatter.exs
                 gen_durable_spec.md gen_durable_plan.md)
     ]
   end
@@ -33,6 +33,7 @@ defmodule GenDurable.MixProject do
       main: "readme",
       extras: [
         "README.md",
+        "PERFORMANCE.md": [title: "Performance"],
         "gen_durable_spec.md": [title: "Specification"],
         "gen_durable_plan.md": [title: "Implementation plan"]
       ],

@@ -345,9 +345,21 @@ The picker (`Queries.pick`) no longer claims work it can't run, killing the clai
 The advisory lock stays the correctness guard (cross-node / unlock-gap races still possible); dedup is
 the optimization that makes contention rare. New telemetry `[:gen_durable, :partition, :contended]`
 fires on the residual bounce. Deterministic picker tests in `queries_test`; 46 tests green.
-- **Cost note / follow-up:** the `candidates` scan is unbounded (dedup sorts the runnable set). Cheap
-  while the queue is kept drained; under a sustained large runnable backlog, bound it with a scan
-  window (`LIMIT batch×k` on an index-ordered inner scan) — deferred.
+### F7 — Picker performance: queue equality + bounded dedup window ✅ DONE
+Two fixes, measured in `PERFORMANCE.md` (real EXPLAIN on 1M rows, Postgres 17):
+- **`queue = $1` (equality), never `ANY`.** Each scheduler owns one queue, so the picker filters by a
+  single value. This lets the `gen_durable_pick (queue, priority, eligible_at)` index supply rows
+  already ordered, so the `LIMIT` stops after ~`batch` rows. With `ANY`, the planner cannot trust the
+  index order and scans + top-N sorts the *entire* runnable set: measured **613 ms → 0.7 ms (~850×)**
+  at 295k runnable. `Queries.pick/5` now takes a single queue string; `Scheduler` passes `opts.queue`.
+- **Bounded dedup window.** The dedup `scan` is `LIMIT $2` (the batch) on the index-ordered inner
+  scan, so DISTINCT ON sorts ≤ `batch` rows, never the backlog. The earlier unbounded `candidates`
+  scan is gone. A same-key cluster filling the window underfills the batch; completion-driven refill
+  closes it next pick. Residual limit: a hot key with a huge runnable backlog still makes the scan
+  skip past its excluded siblings (one index probe each) — picker sharding by key hash is the
+  deferred fix (noted in PERFORMANCE.md §6).
+All hot-path statements are PK/partial-index driven and sub-ms; see `PERFORMANCE.md` for plans, the
+round-trip throughput model, and the F4 round-trip-reduction backlog. 46 tests green.
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 — Always-load `signals` + `childs`:** every step does two `target/parent` SELECTs. Cheap, but

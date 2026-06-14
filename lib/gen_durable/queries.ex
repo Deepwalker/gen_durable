@@ -16,34 +16,43 @@ defmodule GenDurable.Queries do
   # the advisory-lock as the correctness guard while sparing the wasted
   # claim→try_lock→reset churn that prefetch would otherwise amplify on hot keys.
   #
-  #   candidates — runnable rows, EXCLUDING any whose key is already `executing`
-  #                (NOT EXISTS). NULL keys never serialize, so they short-circuit
-  #                the guard (no subquery) and are never excluded.
-  #   deduped    — one row per key (the most urgent), via DISTINCT ON. NULL keys
-  #                fall back to id, so each is its own group (never collapsed).
-  #   ranked     — re-impose global priority order and take the batch LIMIT.
-  #   picked     — lock exactly those ids (FOR UPDATE SKIP LOCKED) and flip them.
+  # The work is bounded to one batch window so the hot path stays index-cheap:
+  #
+  #   scan    — the top `$2` runnable rows by (priority, eligible_at) via the
+  #             `gen_durable_pick` index. The single-queue equality (`queue = $1`,
+  #             not `ANY`) is what lets the index supply that order so the LIMIT
+  #             stops early instead of scanning + sorting the whole runnable set
+  #             (see PERFORMANCE.md). EXCLUDING any whose key is already
+  #             `executing` (NOT EXISTS). NULL keys never serialize, so they
+  #             short-circuit the guard (no subquery) and are never excluded —
+  #             a non-partitioned queue pays the original index scan + LIMIT.
+  #   deduped — one id per key within the window (the most urgent), via
+  #             DISTINCT ON over ≤ `$2` rows. NULL keys fall back to id, so each
+  #             is its own group and is never collapsed.
+  #   picked  — lock exactly those ids (FOR UPDATE SKIP LOCKED) and flip them.
+  #
+  # A same-key cluster filling the window can underfill the batch; completion-
+  # driven refill closes the gap on the next pick (see PERFORMANCE.md).
   @pick_sql """
-  WITH candidates AS (
+  WITH scan AS (
     SELECT id, partition_key, priority, eligible_at
     FROM gen_durable g
-    WHERE status = 'runnable' AND eligible_at <= now() AND queue = ANY($1)
+    WHERE status = 'runnable' AND eligible_at <= now() AND queue = $1
       AND (partition_key IS NULL OR NOT EXISTS (
         SELECT 1 FROM gen_durable e
         WHERE e.partition_key = g.partition_key AND e.status = 'executing'
       ))
+    ORDER BY priority, eligible_at
+    LIMIT $2
   ),
   deduped AS (
-    SELECT DISTINCT ON (coalesce(partition_key, id::text)) id, priority, eligible_at
-    FROM candidates
+    SELECT DISTINCT ON (coalesce(partition_key, id::text)) id
+    FROM scan
     ORDER BY coalesce(partition_key, id::text), priority, eligible_at
-  ),
-  ranked AS (
-    SELECT id FROM deduped ORDER BY priority, eligible_at LIMIT $2
   ),
   picked AS (
     SELECT g.id FROM gen_durable g
-    JOIN ranked r ON r.id = g.id
+    JOIN deduped d ON d.id = g.id
     WHERE g.status = 'runnable'
     ORDER BY g.priority, g.eligible_at
     FOR UPDATE SKIP LOCKED
@@ -55,8 +64,8 @@ defmodule GenDurable.Queries do
   RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.partition_key
   """
 
-  def pick(repo, queues, batch, worker, lease_ttl_ms) do
-    %{rows: rows} = repo.query!(@pick_sql, [queues, batch, worker, lease_ttl_ms])
+  def pick(repo, queue, batch, worker, lease_ttl_ms) do
+    %{rows: rows} = repo.query!(@pick_sql, [queue, batch, worker, lease_ttl_ms])
     Enum.map(rows, &to_job/1)
   end
 

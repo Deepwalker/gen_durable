@@ -6,8 +6,9 @@ A Postgres-backed durable FSM engine for Elixir, on top of GenServer.
 before execution proceeds. On a crash before commit, the step re-executes from scratch
 (at-least-once). Idempotency of step effects is the user's responsibility.
 
-See [`gen_durable_spec.md`](gen_durable_spec.md) for the normative specification and
-[`gen_durable_plan.md`](gen_durable_plan.md) for the implementation roadmap.
+See [`gen_durable_spec.md`](gen_durable_spec.md) for the normative specification,
+[`gen_durable_plan.md`](gen_durable_plan.md) for the implementation roadmap, and
+[`PERFORMANCE.md`](PERFORMANCE.md) for the cost model and EXPLAIN plans.
 
 ## Three primitives
 
