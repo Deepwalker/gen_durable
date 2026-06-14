@@ -114,6 +114,7 @@ The engine is started as `{GenDurable, opts}`. Full reference lives in the
 | `:prefetch` | `0` | rows each queue claims into its buffer **beyond** its running slots |
 | `:min_demand` | `1` | batch gate: skip picking unless at least this many slots are free |
 | `:max_poll_interval` | `5_000` | idle-backoff ceiling: an empty pick on an idle queue doubles the poll interval up to here, then snaps back when work appears |
+| `:drain_timeout` | `5_000` | on shutdown, ms each queue waits for in-flight steps to finish before giving up to the reaper (buffered, un-started rows are released immediately) |
 
 Timings are in milliseconds; keep `heartbeat_interval × 3 ≲ lease_ttl` for margin
 (the "Balanced" defaults satisfy this).

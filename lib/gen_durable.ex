@@ -4,10 +4,10 @@ defmodule GenDurable do
 
   Start the engine in a host supervision tree:
 
-      {GenDurable,
-        repo: MyApp.Repo,
-        fsms: [Checkout],
-        queues: [default: 10, checkout: 5]}
+      {GenDurable, repo: MyApp.Repo, queues: [default: 10, checkout: 5]}
+
+  FSMs are resolved from the row (the `fsm` column defaults to the module name);
+  pass `:fsms` only for a custom `:name` or to keep an old `:version` running.
 
   Then enqueue instances and deliver signals:
 

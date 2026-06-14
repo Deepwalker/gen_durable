@@ -99,19 +99,18 @@ and the host app writes a one-line migration that delegates to it (see §4).
 ## 3. Public API (target shape)
 
 ```elixir
-# Typed state struct — one per FSM, an Ecto embedded schema
-defmodule Checkout.State do
-  use GenDurable.State            # thin wrapper over `embedded_schema`
-  embedded_schema do
-    field :order,   :integer
-    field :n,       :integer, default: 0
-    field :shipped, :boolean, default: false
-  end
-end
-
-# Defining a machine
+# Defining a machine — state is a nested embedded schema, adopted by convention
 defmodule Checkout do
-  use GenDurable.FSM, version: 1, queue: "checkout", state: Checkout.State
+  use GenDurable.FSM, version: 1, queue: "checkout"
+
+  defmodule State do
+    use GenDurable.State          # thin wrapper over `embedded_schema`
+    embedded_schema do
+      field :order,   :integer
+      field :n,       :integer, default: 0
+      field :shipped, :boolean, default: false
+    end
+  end
 
   @impl true
   def step("start",     %{state: s} = _ctx), do: {:next, "await_pay", %{s | n: s.n + 1}}
@@ -413,6 +412,14 @@ arbitrary or wrong-version module). `:fsms` is now needed only for a custom `:na
 isn't a module name) or to keep an old `:version` running (spec §8). README/Supervisor/Registry docs
 updated; `GenDurable.Test.Auto` (no custom name, unregistered) proves end-to-end + unit resolution. 57
 tests green.
+
+### F12 — Nested `State` schema adopted by convention ✅ DONE
+Declaring the state as a separate top-level module (`Checkout.State`) and wiring it via `state:` was
+busywork. The state schema can now live as a nested `defmodule State` inside the FSM; `GenDurable.FSM`
+resolves it at `@before_compile` (the nested module is already compiled by then, so `__gd_state__` is a
+zero-cost compile-time constant). An explicit `:state` opt still wins as an override; omit both for
+plain-map state. README / FSM / State docs and the `Counter` test FSM moved to the nested form. 57 tests
+green. Bumped to 0.1.1.
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`

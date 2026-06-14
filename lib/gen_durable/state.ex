@@ -1,13 +1,19 @@
 defmodule GenDurable.State do
   @moduledoc """
   Typed FSM state: an Ecto embedded schema per FSM, encoded to/from jsonb.
+  Typically defined as a nested `State` module inside the FSM, where it is
+  adopted by convention (see `GenDurable.FSM`):
 
-      defmodule Checkout.State do
-        use GenDurable.State
+      defmodule Checkout do
+        use GenDurable.FSM, version: 1
 
-        embedded_schema do
-          field :order, :integer
-          field :n, :integer, default: 0
+        defmodule State do
+          use GenDurable.State
+
+          embedded_schema do
+            field :order, :integer
+            field :n, :integer, default: 0
+          end
         end
       end
 
