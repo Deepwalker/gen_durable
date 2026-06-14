@@ -25,7 +25,7 @@ defmodule GenDurable.PerfTest do
     :ok
   end
 
-  defp params(overrides \\ %{}) do
+  defp params(overrides) do
     Map.merge(
       %{
         fsm: "counter",

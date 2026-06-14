@@ -47,6 +47,9 @@ defmodule GenDurable.Scheduler do
 
   @impl true
   def init(opts) do
+    # Trap exits so a supervisor shutdown runs terminate/2 (graceful drain).
+    Process.flag(:trap_exit, true)
+
     state = %{
       config: opts.config,
       queue: opts.queue,
@@ -58,6 +61,7 @@ defmodule GenDurable.Scheduler do
       max_poll_interval: opts.max_poll_interval,
       cur_poll: opts.poll_interval,
       heartbeat_interval: opts.heartbeat_interval,
+      drain_timeout: opts.drain_timeout,
       task_sup: opts.task_sup,
       buffer: [],
       in_flight: %{}
@@ -72,6 +76,7 @@ defmodule GenDurable.Scheduler do
   def handle_info(:poll, state) do
     {state, fetched} = fill(state)
     state = adapt(state, fetched)
+    saturation(state)
     schedule(:poll, state.cur_poll)
     {:noreply, state}
   end
@@ -104,6 +109,45 @@ defmodule GenDurable.Scheduler do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # Graceful shutdown (spec §6): stop claiming, hand the buffered (un-started)
+  # rows straight back to `runnable` so they are picked up immediately instead of
+  # waiting out the lease, then wait up to `drain_timeout` for in-flight steps to
+  # commit their outcomes. The Task.Supervisor is shut down *after* the schedulers
+  # (sibling order), so in-flight tasks are still alive to finish here. Anything
+  # still running at the deadline is left to the reaper (the lease floor).
+  @impl true
+  def terminate(_reason, state) do
+    buffered = buffer_ids(state.buffer)
+    Queries.release(state.config.repo, buffered, state.worker)
+
+    :telemetry.execute(
+      [:gen_durable, :scheduler, :drain],
+      %{released: length(buffered), in_flight: map_size(state.in_flight)},
+      %{queue: state.queue}
+    )
+
+    drain(state.in_flight, System.monotonic_time(:millisecond) + state.drain_timeout)
+  end
+
+  # Wait for in-flight tasks to report completion (their outcome already committed)
+  # or crash, until the set empties or the deadline passes.
+  defp drain(in_flight, _deadline) when map_size(in_flight) == 0, do: :ok
+
+  defp drain(in_flight, deadline) do
+    timeout = max(0, deadline - System.monotonic_time(:millisecond))
+
+    receive do
+      {ref, _result} when is_map_key(in_flight, ref) ->
+        Process.demonitor(ref, [:flush])
+        drain(Map.delete(in_flight, ref), deadline)
+
+      {:DOWN, ref, :process, _pid, _reason} when is_map_key(in_flight, ref) ->
+        drain(Map.delete(in_flight, ref), deadline)
+    after
+      timeout -> :ok
+    end
+  end
+
   # Pick into the buffer if warranted, then spawn from the buffer into free slots.
   defp fill(state) do
     {state, fetched} = refill(state)
@@ -121,6 +165,13 @@ defmodule GenDurable.Scheduler do
     if demand > 0 and (demand >= state.min_demand or idle?) do
       config = state.config
       jobs = Queries.pick(config.repo, state.queue, demand, state.worker, config.lease_ttl_ms)
+
+      :telemetry.execute(
+        [:gen_durable, :pick, :stop],
+        %{count: length(jobs), demand: demand},
+        %{queue: state.queue, worker: state.worker}
+      )
+
       {%{state | buffer: state.buffer ++ jobs}, length(jobs)}
     else
       {state, 0}
@@ -179,6 +230,21 @@ defmodule GenDurable.Scheduler do
         :skipped
       end
     end)
+  end
+
+  # Gauge of how loaded this queue is — emitted each poll so a handler can read
+  # in-flight depth, buffer depth, and free slots to tune the feeder knobs.
+  defp saturation(state) do
+    :telemetry.execute(
+      [:gen_durable, :scheduler, :saturation],
+      %{
+        in_flight: map_size(state.in_flight),
+        buffer: length(state.buffer),
+        concurrency: state.concurrency,
+        prefetch: state.prefetch
+      },
+      %{queue: state.queue}
+    )
   end
 
   defp buffer_ids(buffer), do: Enum.map(buffer, & &1.id)

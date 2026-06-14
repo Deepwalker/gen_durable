@@ -24,6 +24,16 @@ defmodule GenDurable.EngineTest do
 
   defp agent_spec(name, init), do: %{id: name, start: {Agent, :start_link, [init, [name: name]]}}
 
+  @doc false
+  def __forward_telemetry__(event, measurements, metadata, pid),
+    do: send(pid, {:telemetry, event, measurements, metadata})
+
+  defp attach_telemetry(events) do
+    handler = "test-#{System.unique_integer([:positive])}"
+    :telemetry.attach_many(handler, events, &__MODULE__.__forward_telemetry__/4, self())
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
+
   defp status(id) do
     %{rows: [[s, result, err, attempt]]} =
       Repo.query!(
@@ -250,5 +260,45 @@ defmodule GenDurable.EngineTest do
     # The two steps overlapped: each started before the other stopped.
     assert m[{a, :start}] < m[{b, :stop}]
     assert m[{b, :start}] < m[{a, :stop}]
+  end
+
+  test "graceful shutdown releases buffered work and drains in-flight (no lease wait)" do
+    # Insert before the engine starts so the first poll claims all four at once.
+    ids =
+      for _ <- 1..4 do
+        {:ok, id} = GenDurable.insert(GenDurable.Test.Sleeper, repo: Repo, state: %{"ms" => 400})
+        id
+      end
+
+    attach_telemetry([[:gen_durable, :scheduler, :drain]])
+    # concurrency 1 + prefetch 5 ⇒ one in-flight, three buffered. A 60s lease means
+    # the reaper cannot help within the test: only the drain can free them.
+    start_engine(queues: [default: 1], prefetch: 5, lease_ttl: 60_000, drain_timeout: 2_000)
+
+    Process.sleep(120)
+    :ok = stop_supervised(GenDurable.Supervisor)
+
+    assert_received {:telemetry, [:gen_durable, :scheduler, :drain], %{released: 3, in_flight: 1}, _}
+
+    statuses = Enum.map(ids, &status(&1).status)
+    refute "executing" in statuses
+    assert Enum.count(statuses, &(&1 == "done")) == 1
+    assert Enum.count(statuses, &(&1 == "runnable")) == 3
+  end
+
+  test "emits pick and saturation telemetry" do
+    attach_telemetry([[:gen_durable, :pick, :stop], [:gen_durable, :scheduler, :saturation]])
+    # Insert before the engine starts so the first pick claims it (count >= 1).
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain, repo: Repo)
+    start_engine()
+    wait_status(id, "done")
+
+    assert_receive {:telemetry, [:gen_durable, :pick, :stop], %{count: count}, %{queue: "default"}},
+                   2_000
+
+    assert count >= 1
+
+    assert_receive {:telemetry, [:gen_durable, :scheduler, :saturation], %{concurrency: 5}, _},
+                   2_000
   end
 end

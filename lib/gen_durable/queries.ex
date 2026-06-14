@@ -434,6 +434,24 @@ defmodule GenDurable.Queries do
     :ok
   end
 
+  # Release our still-claimed rows back to runnable on graceful shutdown, so the
+  # buffered (un-started) work is picked up immediately instead of waiting out the
+  # lease. Guarded by `locked_by` so we only ever release our own claims.
+  def release(_repo, [], _worker), do: :ok
+
+  def release(repo, ids, worker) when is_list(ids) do
+    repo.query!(
+      """
+      UPDATE gen_durable
+      SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
+      WHERE id = ANY($1) AND locked_by = $2 AND status = 'executing'
+      """,
+      [ids, worker]
+    )
+
+    :ok
+  end
+
   defp decode_json(value) when is_binary(value), do: Jason.decode!(value)
   defp decode_json(value) when is_map(value), do: value
   defp decode_json(nil), do: %{}

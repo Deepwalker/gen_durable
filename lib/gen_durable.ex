@@ -14,6 +14,27 @@ defmodule GenDurable do
       {:ok, id} = GenDurable.insert(Checkout, state: %{order: 42}, partition_key: "order:42")
       :ok = GenDurable.signal(id, "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
 
+  ## Telemetry
+
+  Attach to these `:telemetry` events (`[:gen_durable, …]`):
+
+    * `[:gen_durable, :step, :stop]` — a step finished. Measurements `%{duration}`
+      (native units); metadata `%{id, fsm, step, kind}` where `kind` is the outcome
+      (`:next` · `:replay` · `:await` · `:schedule_childs` · `:done` · `:stop`).
+    * `[:gen_durable, :pick, :stop]` — a picker batch ran. Measurements
+      `%{count, demand}`; metadata `%{queue, worker}`. Watch `count` vs `demand` to
+      see how full picks are.
+    * `[:gen_durable, :scheduler, :saturation]` — per-poll gauge. Measurements
+      `%{in_flight, buffer, concurrency, prefetch}`; metadata `%{queue}`. The signal
+      for tuning the feeder knobs.
+    * `[:gen_durable, :scheduler, :drain]` — graceful shutdown of a queue.
+      Measurements `%{released, in_flight}`; metadata `%{queue}`.
+    * `[:gen_durable, :partition, :contended]` — a partition advisory lock was
+      contended (a row was handed back). Measurements `%{count}`; metadata
+      `%{id, fsm, partition_key}`.
+    * `[:gen_durable, :reaper, :reaped]` — expired leases reclaimed. Measurements
+      `%{count}`; metadata `%{ids}`.
+
   See `gen_durable_spec.md` (normative) and `gen_durable_plan.md` (roadmap).
   """
 

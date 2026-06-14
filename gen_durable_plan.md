@@ -388,12 +388,28 @@ snapshot). Removed the `tx` / `consume_awaited` / `notify_parent` helpers. **~4 
 asserted single-statement via Ecto query telemetry in `test/perf_test.exs` (a `:bench` test, excluded
 by default, prints the old-vs-new wall-clock — consistently faster). 53 tests green (1 bench excluded).
 
+### F10 — Graceful drain + telemetry breadth ✅ DONE
+- **Graceful drain:** the `Scheduler` traps exits and a `terminate/2` (a) releases the buffered
+  (un-started) claims straight back to `runnable` via `Queries.release/3` — so deep-prefetch work is
+  picked up immediately on deploy instead of waiting a full `lease_ttl` — and (b) waits up to
+  `drain_timeout` (config, default 5_000 ms) for in-flight steps to commit their outcomes. The
+  sibling shutdown order (schedulers before the `Task.Supervisor`) means in-flight tasks are still
+  alive to finish; the scheduler child's `shutdown` is set to `drain_timeout + 1_000` so the
+  supervisor doesn't brutal-kill it mid-drain. Stragglers past the deadline fall to the reaper (the
+  lease floor). Test: `concurrency 1` + `prefetch 5` + 60 s lease ⇒ only the drain (not the reaper)
+  can free the buffered rows; after `stop_supervised`, 3 released to `runnable`, 1 drained to `done`.
+- **Telemetry:** added `[:gen_durable, :pick, :stop]` (count/demand per pick), `[:gen_durable,
+  :scheduler, :saturation]` (per-poll gauge: in_flight/buffer/concurrency/prefetch — the feeder-tuning
+  signal), and `[:gen_durable, :scheduler, :drain]`. Documented all events (with the existing
+  `step.stop` / `partition.contended` / `reaper.reaped`) in the `GenDurable` moduledoc. Test asserts
+  pick + saturation fire. 55 tests green (1 bench excluded).
+
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
   SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes
   from ~3 round-trips to ~1. (The outcome-collapse half of F4 is done — see F9.)
 - partition_key busy-spin on a hot key (picker-sharding, §6) — v2.
-- Telemetry breadth, graceful drain — v2.
+- per-queue (vs engine-wide) feeder knobs; property/multi-node tests — v2.
 
 ---
 
