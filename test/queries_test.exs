@@ -55,6 +55,38 @@ defmodule GenDurable.QueriesTest do
     assert [%{}] = Queries.pick(Repo, ["b"], 10, @worker, @ttl)
   end
 
+  describe "partition_key dedup in the picker (spec §6)" do
+    test "claims at most one runnable row per partition_key in a batch" do
+      for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params(%{partition_key: "k"}))
+      {:ok, other} = Queries.insert(Repo, params(%{partition_key: "k2"}))
+
+      jobs = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      keys = Enum.map(jobs, & &1.partition_key)
+
+      assert Enum.count(keys, &(&1 == "k")) == 1
+      assert Enum.count(keys, &(&1 == "k2")) == 1
+      assert length(jobs) == 2
+      assert other in Enum.map(jobs, & &1.id)
+    end
+
+    test "skips a runnable row whose partition_key is already executing" do
+      {:ok, a} = Queries.insert(Repo, params(%{partition_key: "k"}))
+      {:ok, _b} = Queries.insert(Repo, params(%{partition_key: "k"}))
+
+      # Claim one row for "k"; it becomes executing and holds the key.
+      assert [%{id: ^a}] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+
+      # The sibling is runnable, but "k" is executing => not picked (no bounce).
+      assert [] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+    end
+
+    test "NULL partition_key rows are never deduped against each other" do
+      for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params())
+
+      assert length(Queries.pick(Repo, ["default"], 10, @worker, @ttl)) == 3
+    end
+  end
+
   test "complete_next resets attempt and returns to runnable" do
     {:ok, id} = Queries.insert(Repo, params())
     [_job] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)

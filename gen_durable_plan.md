@@ -330,9 +330,24 @@ buffer depth is decoupled from `lease_ttl`. Test: `prefetch: 5` + `concurrency: 
 buffered past a 300ms lease and still completes with `attempt == 0`. 43 tests green.
 - Knob trade-offs (cross-node fairness, priority freshness, crash blip) are documented in the module
   doc; defaults are conservative (fair on a cluster), aggression is opt-in per deployment.
-- **Follow-up (deferred):** dedup `partition_key` within a batch so deep prefetch doesn't heartbeat
-  rows that are blocked on the advisory lock; per-queue (vs engine-wide) knobs; graceful drain that
-  resets the buffer on shutdown instead of waiting out the lease.
+- **Follow-up (deferred):** per-queue (vs engine-wide) knobs; graceful drain that resets the buffer
+  on shutdown instead of waiting out the lease.
+
+### F6 — Picker-side partition_key dedup ✅ DONE
+The picker (`Queries.pick`) no longer claims work it can't run, killing the claim→`try_lock`→
+`reset_to_runnable` churn that `prefetch` amplifies on hot keys. Two guards in one statement:
+- **`NOT EXISTS`** — exclude a runnable row whose `partition_key` is already `executing` (so a sibling
+  isn't claimed only to bounce off the advisory lock). `partition_key IS NULL` short-circuits the
+  guard, so non-partitioned work pays nothing. Backed by a new partial index
+  `gen_durable_partition_active (partition_key) WHERE status='executing'` (folded into v1).
+- **`DISTINCT ON (coalesce(partition_key, id::text))`** — at most one row per key per batch (the most
+  urgent); NULL keys fall back to `id` so each is its own group and is never collapsed.
+The advisory lock stays the correctness guard (cross-node / unlock-gap races still possible); dedup is
+the optimization that makes contention rare. New telemetry `[:gen_durable, :partition, :contended]`
+fires on the residual bounce. Deterministic picker tests in `queries_test`; 46 tests green.
+- **Cost note / follow-up:** the `candidates` scan is unbounded (dedup sorts the runnable set). Cheap
+  while the queue is kept drained; under a sustained large runnable backlog, bound it with a scan
+  window (`LIMIT batch×k` on an index-ordered inner scan) — deferred.
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 — Always-load `signals` + `childs`:** every step does two `target/parent` SELECTs. Cheap, but

@@ -113,6 +113,13 @@ defmodule GenDurable.Migration do
       WHERE status = 'executing'
     """)
 
+    # Supports the picker's "skip a key already being processed" guard
+    # (partition_key dedup): NOT EXISTS over executing rows by partition_key.
+    execute("""
+    CREATE INDEX gen_durable_partition_active ON #{p}.gen_durable (partition_key)
+      WHERE status = 'executing'
+    """)
+
     execute("""
     CREATE UNIQUE INDEX gen_durable_unique ON #{p}.gen_durable (unique_guard)
       WHERE unique_guard IS NOT NULL

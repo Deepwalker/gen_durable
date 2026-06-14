@@ -11,14 +11,42 @@ defmodule GenDurable.Queries do
 
   # --- picker ----------------------------------------------------------------
 
+  # partition_key dedup (spec §6): never claim more than one row per partition_key
+  # in a batch, and never claim a key that is already being processed. This keeps
+  # the advisory-lock as the correctness guard while sparing the wasted
+  # claim→try_lock→reset churn that prefetch would otherwise amplify on hot keys.
+  #
+  #   candidates — runnable rows, EXCLUDING any whose key is already `executing`
+  #                (NOT EXISTS). NULL keys never serialize, so they short-circuit
+  #                the guard (no subquery) and are never excluded.
+  #   deduped    — one row per key (the most urgent), via DISTINCT ON. NULL keys
+  #                fall back to id, so each is its own group (never collapsed).
+  #   ranked     — re-impose global priority order and take the batch LIMIT.
+  #   picked     — lock exactly those ids (FOR UPDATE SKIP LOCKED) and flip them.
   @pick_sql """
-  WITH picked AS (
-    SELECT id FROM gen_durable
-    WHERE status = 'runnable' AND eligible_at <= now()
-      AND queue = ANY($1)
-    ORDER BY priority, eligible_at
+  WITH candidates AS (
+    SELECT id, partition_key, priority, eligible_at
+    FROM gen_durable g
+    WHERE status = 'runnable' AND eligible_at <= now() AND queue = ANY($1)
+      AND (partition_key IS NULL OR NOT EXISTS (
+        SELECT 1 FROM gen_durable e
+        WHERE e.partition_key = g.partition_key AND e.status = 'executing'
+      ))
+  ),
+  deduped AS (
+    SELECT DISTINCT ON (coalesce(partition_key, id::text)) id, priority, eligible_at
+    FROM candidates
+    ORDER BY coalesce(partition_key, id::text), priority, eligible_at
+  ),
+  ranked AS (
+    SELECT id FROM deduped ORDER BY priority, eligible_at LIMIT $2
+  ),
+  picked AS (
+    SELECT g.id FROM gen_durable g
+    JOIN ranked r ON r.id = g.id
+    WHERE g.status = 'runnable'
+    ORDER BY g.priority, g.eligible_at
     FOR UPDATE SKIP LOCKED
-    LIMIT $2
   )
   UPDATE gen_durable g
   SET status = 'executing', locked_by = $3,

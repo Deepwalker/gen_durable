@@ -166,7 +166,15 @@ defmodule GenDurable.Scheduler do
           Queries.advisory_unlock(repo, key)
         end
       else
-        # Another worker holds this key; hand the row back.
+        # Another worker holds this key; hand the row back. With the picker's
+        # partition dedup this should be rare (only a cross-node or unlock-gap
+        # race), so it is worth a telemetry signal.
+        :telemetry.execute(
+          [:gen_durable, :partition, :contended],
+          %{count: 1},
+          %{id: job.id, fsm: job.fsm, partition_key: key}
+        )
+
         Queries.reset_to_runnable(repo, job.id)
         :skipped
       end
