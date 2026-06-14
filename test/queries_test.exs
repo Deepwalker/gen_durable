@@ -59,7 +59,7 @@ defmodule GenDurable.QueriesTest do
     {:ok, id} = Queries.insert(Repo, params())
     [_job] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
 
-    :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [])
+    :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}))
 
     %{rows: [[status, step, attempt, state]]} =
       Repo.query!("SELECT status::text, step, attempt, state FROM gen_durable WHERE id = $1", [id])
@@ -74,7 +74,7 @@ defmodule GenDurable.QueriesTest do
     {:ok, id} = Queries.insert(Repo, params())
     [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
 
-    :ok = Queries.complete_replay(Repo, id, ~s({"n":0}), 50_000, [])
+    :ok = Queries.complete_replay(Repo, id, ~s({"n":0}), 50_000)
 
     %{rows: [[status, attempt, future]]} =
       Repo.query!(
@@ -89,7 +89,7 @@ defmodule GenDurable.QueriesTest do
 
   test "complete_done and complete_stop are terminal" do
     {:ok, d} = Queries.insert(Repo, params())
-    :ok = Queries.complete_done(Repo, d, ~s({"ok":true}), [])
+    :ok = Queries.complete_done(Repo, d, ~s({"ok":true}))
 
     %{rows: [[status, result]]} =
       Repo.query!("SELECT status::text, result FROM gen_durable WHERE id = $1", [d])
@@ -98,7 +98,7 @@ defmodule GenDurable.QueriesTest do
     assert Jason.decode!(result) == %{"ok" => true}
 
     {:ok, s} = Queries.insert(Repo, params())
-    :ok = Queries.complete_stop(Repo, s, "boom", [])
+    :ok = Queries.complete_stop(Repo, s, "boom")
 
     %{rows: [[status, err]]} =
       Repo.query!("SELECT status::text, last_error FROM gen_durable WHERE id = $1", [s])
@@ -123,10 +123,10 @@ defmodule GenDurable.QueriesTest do
   end
 
   describe "signals" do
-    test "deliver inserts the row and wakes a matching await" do
+    test "deliver wakes a matching await and keeps awaits (name-scoped consumption)" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, ~s({}), "go", [])
+      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
 
@@ -134,7 +134,8 @@ defmodule GenDurable.QueriesTest do
         Repo.query!("SELECT status::text, awaits FROM gen_durable WHERE id = $1", [id])
 
       assert status == "runnable"
-      assert awaits == nil
+      # awaits is kept until the woken step progresses (spec §5)
+      assert awaits == "go"
 
       assert [%{name: "go", payload: %{"v" => 1}}] = Queries.load_signals(Repo, id)
     end
@@ -142,7 +143,7 @@ defmodule GenDurable.QueriesTest do
     test "non-matching signal does not wake the instance" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, ~s({}), "go", [])
+      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
 
@@ -150,6 +151,21 @@ defmodule GenDurable.QueriesTest do
         Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
 
       assert status == "awaiting_signal"
+    end
+
+    test "a signal that arrived before the await unparks the instance (no lost wakeup)" do
+      {:ok, id} = Queries.insert(Repo, params())
+      # signal arrives while the instance is still runnable (not yet awaiting)
+      :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
+
+      [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
+      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
+
+      %{rows: [[status]]} =
+        Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
+
+      # EXISTS race-fix: matching signal already present => straight back to runnable
+      assert status == "runnable"
     end
 
     test "dedup_key makes redelivery idempotent; nil dedup allows duplicates" do
@@ -163,15 +179,21 @@ defmodule GenDurable.QueriesTest do
       assert length(Queries.load_signals(Repo, id)) == 3
     end
 
-    test "consumed signals are deleted in the outcome transaction" do
+    test "progress consumes only the awaited name; other signals survive (§5)" do
       {:ok, id} = Queries.insert(Repo, params())
-      :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), "k1")
-      [%{id: sig_id}] = Queries.load_signals(Repo, id)
-
       [_] = Queries.pick(Repo, ["default"], 10, @worker, @ttl)
-      :ok = Queries.complete_done(Repo, id, ~s({}), [sig_id])
+      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
 
-      assert Queries.load_signals(Repo, id) == []
+      :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
+      :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
+
+      # the woken step progresses
+      :ok = Queries.complete_next(Repo, id, "tick", ~s({}))
+
+      assert [%{name: "other"}] = Queries.load_signals(Repo, id)
+
+      %{rows: [[awaits]]} = Repo.query!("SELECT awaits FROM gen_durable WHERE id = $1", [id])
+      assert awaits == nil
     end
   end
 
@@ -196,7 +218,7 @@ defmodule GenDurable.QueriesTest do
 
       {:ok, id} = Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
       # Move to a status outside the scope.
-      :ok = Queries.complete_done(Repo, id, ~s({}), [])
+      :ok = Queries.complete_done(Repo, id, ~s({}))
 
       assert {:ok, _} = Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
     end

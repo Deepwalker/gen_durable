@@ -45,7 +45,11 @@ Not to be conflated:
 
 Parking writes `awaits := signal_name`. Signal delivery moves the instance to `runnable` **only on a name match**; non-matching signals stay in the inbox until their own await.
 
-A signal into an await must be durable (a row in `signals`), at-least-once. Loss is not allowed — otherwise the instance hangs forever; duplicates are allowed (caught by dedup or the step itself). Delivery inserts the signal row **before** flipping to `runnable`, so on wake-up the same step re-executes and already sees the signal in the inbox. The step reads and deletes consumed signals in the same transaction as its outcome.
+A signal into an await must be durable (a row in `signals`), at-least-once. Loss is not allowed — otherwise the instance hangs forever; duplicates are allowed (caught by dedup or the step itself). Delivery inserts the signal row **before** flipping to `runnable`, so on wake-up the same step re-executes and already sees the signal in the inbox.
+
+**Consumption is name-scoped.** Delivery sets `runnable` but leaves `awaits` set. When the woken step then *progresses* (any outcome other than another `:await`), its outcome transaction deletes exactly the inbox signals whose `name = awaits` and clears `awaits`. Signals for other names — and signals on a never-awaited instance — are left untouched (so a non-matching signal survives until *its* own await). The `ctx.signals` snapshot the step reads is just a view; deletion is the engine's, scoped to the awaited name.
+
+**No lost wake-up.** A signal can arrive before the step has parked (delivery sees the instance still `executing`, so the flip is a no-op but the row is inserted). To avoid a hang, parking is guarded: `:await` commits as `runnable` instead of `awaiting_signal` when a matching signal is already in the inbox, so the step re-runs and consumes it. Combined with the row lock, every interleaving of deliver vs. park ends with the instance either flipped or already runnable.
 
 ## 6. Scheduler
 
@@ -196,24 +200,33 @@ set status = 'runnable', locked_by = null, lease_expires_at = null,
 where status = 'executing' and lease_expires_at < now();
 ```
 
-### Step outcomes (one transaction per outcome; consumed signals are deleted here too)
+### Step outcomes (one transaction per outcome)
+
+Every **progressing** outcome (`:next`, `:replay`, `:schedule_childs`, `:done`, `:stop`) runs the
+name-scoped consume below first, then clears `awaits` (§5). `:await` does **not** consume.
 
 ```sql
+-- name-scoped consume: prelude to every PROGRESSING outcome (no-op when awaits is null)
+delete from signals s using gen_durable g
+where s.target_id = $id and g.id = $id and s.name = g.awaits;
+
 -- :next
 update gen_durable
 set step = $next, state = $state, status = 'runnable', eligible_at = now(),
-    attempt = 0, locked_by = null, lease_expires_at = null, updated_at = now()
+    attempt = 0, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
 -- :replay
 update gen_durable
 set state = $state, status = 'runnable', eligible_at = now() + $delay_ms,
-    attempt = attempt + 1, locked_by = null, lease_expires_at = null, updated_at = now()
+    attempt = attempt + 1, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
--- :await
+-- :await  (park; but go straight to runnable if a matching signal already arrived — no lost wake-up)
 update gen_durable
-set state = $state, status = 'awaiting_signal', awaits = $signal_name,
+set state = $state, awaits = $signal_name, eligible_at = now(),
+    status = case when exists (select 1 from signals where target_id = $id and name = $signal_name)
+                  then 'runnable' else 'awaiting_signal' end,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
@@ -232,19 +245,19 @@ set step = $step, state = $state,
     children_pending = (select count(*) from ins),
     -- zero children actually inserted ⇒ barrier already satisfied ⇒ run next_step now
     status = case when (select count(*) from ins) = 0 then 'runnable' else 'awaiting_children' end,
-    eligible_at = now(), attempt = 0,
+    eligible_at = now(), attempt = 0, awaits = null,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
--- :done
+-- :done  (state is not rewritten — the {:done, result} outcome carries no state)
 update gen_durable
-set state = $state, result = $result, status = 'done',
+set result = $result, status = 'done', awaits = null,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
 -- :stop
 update gen_durable
-set status = 'failed', last_error = $reason,
+set status = 'failed', last_error = $reason, awaits = null,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
@@ -269,8 +282,9 @@ where c.id = $id and c.parent_id = p.id;
 insert into signals (target_id, name, payload, dedup_key)
 values ($id, $name, $payload, $dedup) on conflict (target_id, dedup_key) do nothing;
 
+-- flip to runnable but KEEP awaits: the woken step consumes by name on its outcome (§5)
 update gen_durable
-set status = 'runnable', eligible_at = now(), awaits = null, updated_at = now()
+set status = 'runnable', eligible_at = now(), updated_at = now()
 where id = $id and status = 'awaiting_signal' and awaits = $name;
 ```
 

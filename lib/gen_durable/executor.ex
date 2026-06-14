@@ -8,10 +8,11 @@ defmodule GenDurable.Executor do
   worker *crash* (no return at all) is **not** handled here — it is the reaper's
   job (spec §4.3), the at-least-once safety floor.
 
-  Consumed signals are deleted in the outcome transaction. Per the agreed
-  semantics, the engine deletes exactly the snapshotted inbox **except** on an
-  `:await` outcome, where the instance stays parked and the inbox is preserved
-  (so a non-matching signal survives until its own await, spec §5).
+  Signal consumption is name-scoped (spec §5): on a progressing outcome the
+  outcome transaction deletes exactly the inbox signals whose name matches the
+  row's `awaits` (the name the step was parked on), and clears `awaits`. Signals
+  for other names — and signals on a never-awaited instance — survive. The
+  snapshot in `ctx.signals` is read-only; deletion happens in SQL, not by id.
   """
 
   alias GenDurable.{Context, Outcome, Queries, Registry, State}
@@ -42,7 +43,7 @@ defmodule GenDurable.Executor do
 
     started = System.monotonic_time()
     outcome = invoke(module, ctx)
-    apply_outcome(repo, state_module, job.id, signals, outcome)
+    apply_outcome(repo, state_module, job.id, outcome)
 
     :telemetry.execute(
       [:gen_durable, :step, :stop],
@@ -67,19 +68,16 @@ defmodule GenDurable.Executor do
       end
   end
 
-  defp apply_outcome(repo, state_module, id, signals, outcome) do
-    consumed = Enum.map(signals, & &1.id)
-
+  defp apply_outcome(repo, state_module, id, outcome) do
     case outcome do
       {:next, step, state} ->
-        Queries.complete_next(repo, id, step, State.to_db(state_module, state), consumed)
+        Queries.complete_next(repo, id, step, State.to_db(state_module, state))
 
       {:replay, state, delay} ->
-        Queries.complete_replay(repo, id, State.to_db(state_module, state), delay, consumed)
+        Queries.complete_replay(repo, id, State.to_db(state_module, state), delay)
 
       {:await, name, state} ->
-        # Stay parked: keep the inbox, delete nothing.
-        Queries.complete_await(repo, id, State.to_db(state_module, state), name, [])
+        Queries.complete_await(repo, id, State.to_db(state_module, state), name)
 
       {:schedule_childs, next_step, children, state} ->
         child_params = Enum.map(children, &child_to_params/1)
@@ -89,15 +87,14 @@ defmodule GenDurable.Executor do
           id,
           next_step,
           State.to_db(state_module, state),
-          child_params,
-          consumed
+          child_params
         )
 
       {:done, result} ->
-        Queries.complete_done(repo, id, Jason.encode!(result), consumed)
+        Queries.complete_done(repo, id, Jason.encode!(result))
 
       {:stop, reason} ->
-        Queries.complete_stop(repo, id, format_reason(reason), consumed)
+        Queries.complete_stop(repo, id, format_reason(reason))
     end
   end
 

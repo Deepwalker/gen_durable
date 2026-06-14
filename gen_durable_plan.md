@@ -23,7 +23,7 @@ items marked **CONFIRM** are worth a yes/no before we lean on them.
 | FSM definition | `use GenDurable.FSM` behaviour, `step/2` + `handle/2` callbacks, `state:` struct module | The `step` text column maps to a function-clause head; `state:` names the embedded schema. |
 | FSM versioning | **Explicit registry** `{fsm_name, fsm_version} => module` in config/start (**DECIDED**) | Spec §8: old instances finish on their `fsm_version`. Old versions (`Checkout.V1`, `Checkout.V2`) coexist as explicitly-registered modules; we resolve module per row, never assume "latest", no compile-time magic. |
 | Defaults (timings) | lease 60s · heartbeat 20s · poll 1s · reaper 30s ("Balanced", **DECIDED**) | All config-overridable. Margin: `heartbeat × 3 = lease`. |
-| Signal consume | **Engine auto-deletes** the snapshotted signal ids on the outcome txn (**DECIDED**) | Outcomes (§3) carry no signal info; engine snapshots the ids it loaded into `ctx` and deletes exactly those. Signals arriving mid-step survive. |
+| Signal consume | **Name-scoped (spec §5)** — on a progressing outcome the engine deletes the inbox signals whose `name = awaits`, then clears `awaits` (**DECIDED → option (b)**) | Non-matching signals survive until their own await. Delivery keeps `awaits`; `:await` also guards against a pre-arrived signal (no lost wake-up). Supersedes the earlier snapshot-delete idea. |
 | Step ↔ connection | one DB connection is **held for the whole step** when `partition_key` is set | Session-level `pg_try_advisory_lock` must live on a connection that survives the step, which runs *outside* any transaction. This ties a connection to each in-flight partitioned step — call it out in capacity planning. |
 
 ### The advisory-lock subtlety (read this before Phase 9)
@@ -203,20 +203,21 @@ Notes to verify during implementation:
 One function per spec §10 block, all parameterized, all raw SQL:
 `pick/3`, `heartbeat/2`, `reap/0`, `complete_next/…`, `complete_replay/…`, `complete_await/…`,
 `complete_done/…`, `complete_stop/…`, `deliver_signal/…`, `insert/…`, `insert_all/…`.
-The five "complete_*" run the outcome `UPDATE` **and** the consumed-signal `DELETE` in one txn.
+Progressing `complete_*` run a name-scoped signal `DELETE` (signals whose `name = awaits`) **and** the
+outcome `UPDATE` (which clears `awaits`) in one txn; `complete_await` guards a pre-arrived signal.
 
 ### 5.2 Executor (`executor.ex`)
 Given a picked row map, run the step to a committed outcome:
 1. If `partition_key`, `pg_try_advisory_lock(hashtext(partition_key))` on the step connection; on
    `false`, reset row to `runnable` (drop lease) and stop — another worker owns the key.
-2. Load pending signals for `id` (snapshot their ids — we delete *exactly these* on commit, so
-   signals arriving mid-step aren't lost).
+2. Load pending signals for `id` into `ctx.signals` (read-only view; deletion is name-scoped in SQL
+   on the outcome, not by these ids).
 3. Resolve module via `Registry.fetch!({fsm, fsm_version})`; **load jsonb → state struct** (the FSM's
    `state:` embedded schema, via `Ecto.embedded_load`); build `Context` with the struct.
 4. `try` → `module.step(step, ctx)`; on raised exception → `module.handle(reason, ctx)`; if
    `handle/2` itself raises → write `:stop`/`failed` (spec §4.2).
 5. **Dump the returned state struct → jsonb** (`Ecto.embedded_dump`), then apply the outcome via the
-   matching `complete_*` query, deleting the snapshotted consumed signals in the same txn.
+   matching `complete_*` query, which name-scope-deletes the awaited signals in the same txn.
 6. `pg_advisory_unlock`, stop heartbeat.
 
 A worker process crash before step 5 means *no outcome row* → reaper path. We do **not** trap and
@@ -295,13 +296,17 @@ enum value `awaiting_children`, columns `parent_id` / `children_pending`, index 
 - Tests: all-children join, a `failed` child still releasing its slot, zero-children → immediate
   `next_step`. 36 tests green.
 
+### Fixed (F1)
+- **D2 — resolved.** Spec §10 `:done` no longer lists `state = $state`; it matches the engine
+  (writes `result` only, leaves `state`).
+- **Signal consumption — resolved (option b).** Name-scoped delete + `awaits` kept on delivery +
+  `:await` pre-arrival guard. Non-matching signals survive (spec §5). Tests in `queries_test`.
+
 ### Open follow-ups (post-v1, not blocking)
-- **D2:** spec §10 `:done` update lists `state = $state`, but the `{:done, result}` outcome carries no
-  state. The engine writes `result` only and leaves `state` as-is. Worth reconciling in the spec.
-- Signal-consumption edge: on a *progressing* outcome the engine deletes the whole inbox snapshot; a
-  non-matching signal present at that moment is dropped. Fine for one-await-one-signal (the common
-  case); revisit if multi-name inboxes become real (spec §5 wants non-matching signals to persist).
-- Always-load-signals: every step does one `signals_target` SELECT. Cheap, but optimizable later.
+- Always-load `signals` + `childs`: every step does two `target/parent` SELECTs. Cheap, but
+  gate-on-FSM-flag is a clean optimization (F4).
+- partition_key busy-spin on a hot key (picker-sharding, §6) — v2.
+- Telemetry breadth, graceful drain — v2.
 
 ---
 
@@ -334,7 +339,9 @@ fights advisory locks and multi-connection flows — run engine tests against a 
    unsupported. `result` stays a plain string-keyed map.
 4. **Timings (Balanced):** lease 60s · heartbeat 20s · poll 1s · reaper 30s, all config-overridable.
 5. **Registry:** explicit `{name, version} => module` config; old versions coexist as registered modules.
-6. **Signals:** engine auto-deletes the snapshotted consumed signal ids in the outcome txn.
+6. **Signals:** name-scoped consumption (spec §5, option b) — a progressing outcome deletes inbox
+   signals whose `name = awaits` and clears `awaits`; non-matching signals survive; delivery keeps
+   `awaits`; `:await` guards a pre-arrived signal against lost wake-up.
 
 ## 9. Risks / watch-items
 
