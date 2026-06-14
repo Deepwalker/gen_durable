@@ -9,13 +9,13 @@ before execution proceeds. On a crash before commit, the step re-executes from s
 See [`gen_durable_spec.md`](gen_durable_spec.md) for the normative specification and
 [`gen_durable_plan.md`](gen_durable_plan.md) for the implementation roadmap.
 
-## Two primitives
+## Three primitives
 
 - **durable step** — user code that returns an outcome on completion.
 - **durable await** — a step parks the instance until a named signal arrives.
-
-Everything else (fan-out, fan-in) is expressed with these two in user code. The engine
-knows nothing about parent/child trees — "children" are ordinary independent instances.
+- **durable childs** — a step fans out a batch of child instances and parks on a
+  built-in await-on-all-children barrier; when every child reaches a terminal
+  state the parent's next step runs with `ctx.childs` holding their results.
 
 ## Step outcomes
 
@@ -24,8 +24,13 @@ knows nothing about parent/child trees — "children" are ordinary independent i
 | `{:next, step, state}` | transition to `step`, `runnable`, `attempt := 0` |
 | `{:replay, state, delay_ms}` | same step again, `runnable`, `attempt += 1`, after `delay_ms` |
 | `{:await, signal_name, state}` | park, `awaiting_signal` |
+| `{:schedule_childs, next_step, children, state}` | spawn `children`, park on the join barrier (`awaiting_children`); run `next_step` once all finish |
 | `{:done, result}` | terminal, `done` |
 | `{:stop, reason}` | terminal, `failed` |
+
+Each child is `{FsmModule, insert_opts}` (or a bare `FsmModule`); they are ordinary
+instances stamped with a `parent_id`, and a failed child still releases its slot in
+the barrier.
 
 ## Usage
 
@@ -85,6 +90,38 @@ children = [
 {:ok, id} = GenDurable.insert(Checkout, state: %{order: 42}, partition_key: "order:42")
 :ok = GenDurable.signal(id, "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
 ```
+
+## Configuration
+
+The engine is started as `{GenDurable, opts}`. Full reference lives in the
+`GenDurable.Supervisor` and `GenDurable.Scheduler` docs; the options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `:repo` | — (required) | the host's `Ecto.Repo` |
+| `:fsms` | `[]` | FSM modules to register |
+| `:queues` | `[default: 10]` | `queue_name => concurrency` (max Tasks running at once) |
+| `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
+| `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows (`buffer ++ in_flight`) |
+| `:poll_interval` | `1_000` | base ms between idle polls |
+| `:reap_interval` | `30_000` | ms between reaper sweeps |
+| `:prefetch` | `0` | rows each queue claims into its buffer **beyond** its running slots |
+| `:min_demand` | `1` | batch gate: skip picking unless at least this many slots are free |
+| `:max_poll_interval` | `5_000` | idle-backoff ceiling: an empty pick on an idle queue doubles the poll interval up to here, then snaps back when work appears |
+
+Timings are in milliseconds; keep `heartbeat_interval × 3 ≲ lease_ttl` for margin
+(the "Balanced" defaults satisfy this).
+
+`:prefetch`, `:min_demand`, and `:max_poll_interval` are the **feeder aggressiveness**
+knobs. Defaults are conservative (fair across nodes, low idle DB chatter). Raising
+`:prefetch` claims more work ahead into an in-memory buffer — buffered rows are
+heartbeated, so depth is safe with respect to `:lease_ttl`, but a deep buffer trades
+off cross-node fairness, priority freshness, and crash blast radius. See
+`GenDurable.Scheduler` for the trade-offs.
+
+Per-instance options to `insert/2` / `insert_all/3`: `:state`, `:step`, `:queue`,
+`:priority`, `:partition_key`, `:unique_key`, `:unique_scope`, and scheduling sugar
+`:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`) / `:schedule_in` (ms).
 
 ## Development
 
