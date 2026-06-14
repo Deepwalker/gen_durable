@@ -110,7 +110,9 @@ defmodule GenDurable.PerfTest do
   test "complete_schedule_childs is a single statement (consume + insert + park)" do
     id = setup_executing()
     children = [params(%{fsm: "child"}), params(%{fsm: "child"})]
-    sql = statements(fn -> Queries.complete_schedule_childs(Repo, id, "join", ~s({}), children) end)
+
+    sql =
+      statements(fn -> Queries.complete_schedule_childs(Repo, id, "join", ~s({}), children) end)
 
     assert length(sql) == 1
     assert hd(sql) =~ "INSERT INTO gen_durable"

@@ -180,9 +180,16 @@ defmodule GenDurable.Scheduler do
 
   # Spawn buffered jobs into free executor slots, highest-priority first (the
   # buffer preserves the picker's ORDER BY priority, eligible_at).
-  defp drain(%{buffer: [job | rest]} = state) when map_size(state.in_flight) < state.concurrency do
+  defp drain(%{buffer: [job | rest]} = state)
+       when map_size(state.in_flight) < state.concurrency do
     task = Task.Supervisor.async_nolink(state.task_sup, fn -> execute_job(state.config, job) end)
-    state = %{state | buffer: rest, in_flight: Map.put(state.in_flight, task.ref, {job.id, job.partition_key})}
+
+    state = %{
+      state
+      | buffer: rest,
+        in_flight: Map.put(state.in_flight, task.ref, {job.id, job.partition_key})
+    }
+
     drain(state)
   end
 
@@ -193,11 +200,14 @@ defmodule GenDurable.Scheduler do
   defp adapt(state, fetched) do
     cur =
       cond do
-        fetched > 0 -> state.poll_interval
+        fetched > 0 ->
+          state.poll_interval
+
         map_size(state.in_flight) == 0 and state.buffer == [] ->
           min(state.cur_poll * 2, state.max_poll_interval)
 
-        true -> state.poll_interval
+        true ->
+          state.poll_interval
       end
 
     %{state | cur_poll: cur}
