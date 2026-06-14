@@ -35,20 +35,21 @@ the barrier.
 
 ## Usage
 
-Define the state (a typed Ecto embedded schema) and the machine:
+Define the machine, with its state as a nested typed Ecto embedded schema
+(adopted by convention — no `state:` opt needed):
 
 ```elixir
-defmodule Checkout.State do
-  use GenDurable.State
-
-  embedded_schema do
-    field :order, :integer
-    field :n, :integer, default: 0
-  end
-end
-
 defmodule Checkout do
-  use GenDurable.FSM, version: 1, queue: "checkout", state: Checkout.State, initial: "start"
+  use GenDurable.FSM, version: 1, queue: "checkout", initial: "start"
+
+  defmodule State do
+    use GenDurable.State
+
+    embedded_schema do
+      field :order, :integer
+      field :n, :integer, default: 0
+    end
+  end
 
   @impl true
   def step("start", %{state: s}), do: {:next, "await_pay", %{s | n: s.n + 1}}

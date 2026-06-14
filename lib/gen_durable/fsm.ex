@@ -3,7 +3,15 @@ defmodule GenDurable.FSM do
   Behaviour for a durable FSM definition.
 
       defmodule Checkout do
-        use GenDurable.FSM, version: 1, queue: "checkout", state: Checkout.State
+        use GenDurable.FSM, version: 1, queue: "checkout"
+
+        defmodule State do
+          use GenDurable.State
+
+          embedded_schema do
+            field :n, :integer, default: 0
+          end
+        end
 
         @impl true
         def step("start", %{state: s}), do: {:next, "await_pay", %{s | n: s.n + 1}}
@@ -27,8 +35,9 @@ defmodule GenDurable.FSM do
     * `:version` — `fsm_version` (default `1`). Old versions coexist as separate
       registered modules; see `GenDurable.Registry`.
     * `:queue`   — default queue for instances (default `"default"`).
-    * `:state`   — the `GenDurable.State` embedded-schema module (default `nil`,
-      i.e. plain-map state).
+    * `:state`   — the `GenDurable.State` embedded-schema module. Optional: if a
+      nested `State` schema module is defined inside the FSM (as above) it is picked
+      up by convention, so you rarely pass this. Omit both for plain-map state.
     * `:initial` — initial step for `GenDurable.insert/2` (default `"start"`).
 
   `handle/2` defaults to `{:stop, reason}` and is overridable.
@@ -42,18 +51,36 @@ defmodule GenDurable.FSM do
   defmacro __using__(opts) do
     quote do
       @behaviour GenDurable.FSM
+      @before_compile GenDurable.FSM
       @gd_opts unquote(opts)
 
       def __gd_name__, do: Keyword.get(@gd_opts, :name, inspect(__MODULE__))
       def __gd_version__, do: Keyword.get(@gd_opts, :version, 1)
       def __gd_queue__, do: Keyword.get(@gd_opts, :queue, "default")
-      def __gd_state__, do: Keyword.get(@gd_opts, :state)
       def __gd_initial__, do: Keyword.get(@gd_opts, :initial, "start")
 
       @impl true
       def handle(reason, _ctx), do: {:stop, reason}
 
       defoverridable handle: 2
+    end
+  end
+
+  # Resolve the state schema at compile time: an explicit `:state` wins; otherwise a
+  # nested `State` schema module is adopted by convention. By `@before_compile` the
+  # nested module is already compiled, so this costs nothing at runtime.
+  @doc false
+  defmacro __before_compile__(env) do
+    explicit = env.module |> Module.get_attribute(:gd_opts) |> Keyword.get(:state)
+    nested = Module.concat(env.module, "State")
+
+    state =
+      explicit ||
+        if Code.ensure_loaded?(nested) and function_exported?(nested, :__schema__, 1),
+          do: nested
+
+    quote do
+      def __gd_state__, do: unquote(state)
     end
   end
 end

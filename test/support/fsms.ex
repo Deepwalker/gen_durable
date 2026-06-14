@@ -1,19 +1,16 @@
-defmodule GenDurable.Test.Counter.State do
-  use GenDurable.State
-
-  embedded_schema do
-    field(:target, :integer, default: 0)
-    field(:n, :integer, default: 0)
-  end
-end
-
 defmodule GenDurable.Test.Counter do
   @moduledoc "Typed-state FSM: loops on :next until n reaches target, then :done."
-  use GenDurable.FSM,
-    name: "counter",
-    version: 1,
-    state: GenDurable.Test.Counter.State,
-    initial: "tick"
+  use GenDurable.FSM, name: "counter", version: 1, initial: "tick"
+
+  # Nested state schema, adopted by convention — no `state:` opt needed.
+  defmodule State do
+    use GenDurable.State
+
+    embedded_schema do
+      field(:target, :integer, default: 0)
+      field(:n, :integer, default: 0)
+    end
+  end
 
   @impl true
   def step("tick", %{state: s}) do
