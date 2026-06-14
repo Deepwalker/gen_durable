@@ -331,4 +331,3 @@ fights advisory locks and multi-connection flows — run engine tests against a 
   twice. The TTL margin and the at-least-once contract make this safe, but tune the margin.
 - **`handle/2` re-entrancy:** a caught exception calls `handle/2`, which may `:replay`; ensure the
   re-run path is identical to a fresh run (no leftover lease/lock state).
-```

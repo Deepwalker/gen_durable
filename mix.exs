@@ -8,7 +8,32 @@ defmodule GenDurable.MixProject do
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      name: "gen_durable",
+      description: "Postgres-backed durable FSM engine on top of GenServer.",
+      docs: docs()
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: [
+        "README.md",
+        "gen_durable_spec.md": [title: "Specification"],
+        "gen_durable_plan.md": [title: "Implementation plan"]
+      ],
+      groups_for_modules: [
+        "Public API": [GenDurable, GenDurable.FSM, GenDurable.State, GenDurable.Migration],
+        Runtime: [
+          GenDurable.Supervisor,
+          GenDurable.Scheduler,
+          GenDurable.Reaper,
+          GenDurable.Registry,
+          GenDurable.Executor
+        ],
+        Internals: [GenDurable.Queries, GenDurable.Outcome, GenDurable.Context]
+      ]
     ]
   end
 
@@ -25,7 +50,8 @@ defmodule GenDurable.MixProject do
     [
       {:ecto_sql, "~> 3.12"},
       {:postgrex, "~> 0.19"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
 end
