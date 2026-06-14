@@ -35,8 +35,31 @@ the barrier.
 
 ## Usage
 
-Define the machine, with its state as a nested typed Ecto embedded schema
-(adopted by convention — no `state:` opt needed):
+The simplest durable unit is a **job**: one function that runs to completion, with
+retries for free. Define `perform/1` or `perform/2`:
+
+```elixir
+defmodule Cleanup do
+  use GenDurable.FSM
+
+  @impl true
+  def perform(args, _ctx) do
+    File.rm_rf!(args["path"])
+    :ok
+  end
+end
+
+GenDurable.insert(Cleanup, args: %{"path" => "/tmp/x"})
+```
+
+`perform` returns `:ok` / `{:ok, result}` (→ `done`), `{:error, reason}` (retried with
+`backoff/1` until `:max_attempts`, default 20, then `failed`), or `{:cancel, reason}`
+(`failed`, no retry); a raised exception is treated as `{:error, _}`.
+
+For multiple steps, awaits, or child fan-out, define `step/2` instead — the full
+state machine, with its state as a nested typed Ecto embedded schema (adopted by
+convention — no `state:` opt needed). A module defines **either** `step/2` **or**
+`perform`, never both:
 
 ```elixir
 defmodule Checkout do

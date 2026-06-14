@@ -55,10 +55,10 @@ defmodule GenDurable do
   # --- public API ------------------------------------------------------------
 
   @doc """
-  Enqueue one FSM instance. Options: `:state`, `:step` (default the FSM's
-  `:initial`), `:queue`, `:priority`, `:partition_key`, `:unique_key`,
-  `:unique_scope`, and scheduling — `:eligible_at` (a `DateTime`), or the sugar
-  `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
+  Enqueue one FSM instance. Options: `:state` (alias `:args`, the job-form name),
+  `:step` (default the FSM's `:initial`), `:queue`, `:priority`, `:partition_key`,
+  `:unique_key`, `:unique_scope`, and scheduling — `:eligible_at` (a `DateTime`), or
+  the sugar `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
   Returns `{:ok, id}` or `{:error, :duplicate}`.
   """
   def insert(fsm_module, opts \\ []) do
@@ -102,7 +102,7 @@ defmodule GenDurable do
       fsm: fsm_module.__gd_name__(),
       fsm_version: fsm_module.__gd_version__(),
       step: opts[:step] || fsm_module.__gd_initial__(),
-      state_json: State.cast(state_module, opts[:state] || %{}),
+      state_json: State.cast(state_module, opts[:state] || opts[:args] || %{}),
       queue: opts[:queue] || fsm_module.__gd_queue__(),
       priority: opts[:priority] || 0,
       partition_key: opts[:partition_key],

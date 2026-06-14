@@ -421,6 +421,18 @@ zero-cost compile-time constant). An explicit `:state` opt still wins as an over
 plain-map state. README / FSM / State docs and the `Counter` test FSM moved to the nested form. 57 tests
 green. Bumped to 0.1.1.
 
+### F13 — Job form: `perform/1|2` folded into `GenDurable.FSM` ✅ DONE
+The trivial "run once and finish" case carried the whole FSM vocabulary (step names, `{:done, map}`,
+plain-map state flagged "unsupported"). Rather than a separate `GenDurable.Job` behaviour, the job form
+is folded into `GenDurable.FSM` via the same `@before_compile` trick: define `perform/1` or `perform/2`
+(instead of `step/2`) and the macro generates the bridging one-step `step/2`, a retry `handle/2`, and a
+default `backoff/1`. `perform` returns `:ok` / `{:ok, map}` (done), `{:error, reason}` (retry w/ backoff
+until `:max_attempts`, default 20), `{:cancel, reason}` (fail, no retry); a raise is treated as
+`{:error, _}`. A module defines **exactly one** of `step/2` / `perform/1|2` — both or neither is a
+compile error. `:args` is an alias for `:state` at insert. README leads with the job form. New tests:
+five engine tests (ok / result+ctx / retry-then-succeed / exhaust-max_attempts / cancel) plus
+compile-guard + default-backoff unit tests. 66 tests green.
+
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
   SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes

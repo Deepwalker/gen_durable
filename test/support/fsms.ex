@@ -170,6 +170,55 @@ defmodule GenDurable.Test.Auto do
   def step("go", _ctx), do: {:done, %{"auto" => true}}
 end
 
+defmodule GenDurable.Test.JobOk do
+  @moduledoc "Simplest job: runs and finishes. perform/1, default name (resolved dynamically)."
+  use GenDurable.FSM
+
+  @impl true
+  def perform(_args), do: :ok
+end
+
+defmodule GenDurable.Test.JobResult do
+  @moduledoc "Job returning a result map; reads args and ctx via perform/2."
+  use GenDurable.FSM
+
+  @impl true
+  def perform(args, ctx), do: {:ok, %{"doubled" => args["n"] * 2, "attempt" => ctx.attempt}}
+end
+
+defmodule GenDurable.Test.JobRetry do
+  @moduledoc "Errors until attempt 2, then succeeds — exercises {:error, _} retry."
+  use GenDurable.FSM, max_attempts: 5
+
+  @impl true
+  def perform(_args, ctx) do
+    if ctx.attempt < 2, do: {:error, "transient"}, else: {:ok, %{"ok_at" => ctx.attempt}}
+  end
+
+  # Zero backoff so the test doesn't wait on the schedule.
+  @impl true
+  def backoff(_attempt), do: 0
+end
+
+defmodule GenDurable.Test.JobGiveUp do
+  @moduledoc "Always errors — exercises max_attempts exhaustion → failed."
+  use GenDurable.FSM, max_attempts: 3
+
+  @impl true
+  def perform(_args, _ctx), do: {:error, "always"}
+
+  @impl true
+  def backoff(_attempt), do: 0
+end
+
+defmodule GenDurable.Test.JobCancel do
+  @moduledoc "Cancels — failed immediately, no retry."
+  use GenDurable.FSM, max_attempts: 5
+
+  @impl true
+  def perform(_args, _ctx), do: {:cancel, "nope"}
+end
+
 defmodule GenDurable.Test.FSMs do
   def all do
     [

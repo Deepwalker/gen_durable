@@ -271,6 +271,50 @@ defmodule GenDurable.EngineTest do
     assert Jason.decode!(row.result) == %{"auto" => true}
   end
 
+  test "job form: a perform/1 job runs and finishes" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.JobOk, args: %{"x" => 1})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{}
+    assert row.attempt == 0
+  end
+
+  test "job form: perform/2 returns a result and sees ctx" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.JobResult, args: %{"n" => 21})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"doubled" => 42, "attempt" => 0}
+  end
+
+  test "job form: {:error, _} retries with backoff then succeeds" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.JobRetry)
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"ok_at" => 2}
+    assert row.attempt == 2
+  end
+
+  test "job form: errors exhaust max_attempts then fail" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.JobGiveUp)
+
+    row = wait_status(id, "failed")
+    assert row.last_error == "always"
+    assert row.attempt == 2
+  end
+
+  test "job form: {:cancel, _} fails immediately, no retry" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.JobCancel)
+
+    row = wait_status(id, "failed")
+    assert row.last_error == "nope"
+    assert row.attempt == 0
+  end
+
   test "graceful shutdown releases buffered work and drains in-flight (no lease wait)" do
     # Insert before the engine starts so the first poll claims all four at once.
     ids =
@@ -287,7 +331,8 @@ defmodule GenDurable.EngineTest do
     Process.sleep(120)
     :ok = stop_supervised(GenDurable.Supervisor)
 
-    assert_received {:telemetry, [:gen_durable, :scheduler, :drain], %{released: 3, in_flight: 1}, _}
+    assert_received {:telemetry, [:gen_durable, :scheduler, :drain], %{released: 3, in_flight: 1},
+                     _}
 
     statuses = Enum.map(ids, &status(&1).status)
     refute "executing" in statuses
@@ -302,7 +347,8 @@ defmodule GenDurable.EngineTest do
     start_engine()
     wait_status(id, "done")
 
-    assert_receive {:telemetry, [:gen_durable, :pick, :stop], %{count: count}, %{queue: "default"}},
+    assert_receive {:telemetry, [:gen_durable, :pick, :stop], %{count: count},
+                    %{queue: "default"}},
                    2_000
 
     assert count >= 1
