@@ -212,24 +212,46 @@ take the median of several runs before believing a delta.
 
 ## 3. The outcome and point queries (all O(1) by primary key)
 
-Every outcome statement and every signal/insert touches rows **by primary key or a
-covering index** — constant work regardless of table size.
+Every outcome and every signal/insert touches rows **by primary key or a covering index** —
+constant work regardless of table size.
 
-**`complete_next` — outcome `UPDATE` by id:**
+### The collapsed outcome (F4) — the plan, not the statement count
+
+Each `complete_*` is one statement (§1): the signal consume rides as a leading `consumed`
+CTE, and `:done`/`:stop` carry the parent-join as the main `UPDATE` after a `terminal` CTE.
+Counting "one statement" only proves the *round-trip* — the plan has to prove the single
+statement is *cheap*. Here is the heaviest outcome, `complete_done` on a **child** (all
+three parts: consume + done + parent decrement), measured with **50,000 children present**
+so the parent path is real, not a one-row fixture:
+
 ```
-Update on gen_durable
-  ->  Index Scan using gen_durable_pkey (rows=1)   Index Cond: (id = 800000)
-Execution Time: 0.855 ms
+Update on gen_durable p                                          ← the parent decrement
+  CTE consumed
+    ->  Delete on signals s   (Index Scan signals_target → gen_durable_pkey)
+  CTE terminal
+    ->  Update on gen_durable  ->  Index Scan using gen_durable_pkey  (id = $1)
+  ->  Nested Loop
+        ->  Index Scan using gen_durable_pkey on c   (id = $1)            ← child by PK
+        ->  Index Scan using gen_durable_pkey on p   (id = c.parent_id)   ← parent by PK
+Execution Time: 0.268 ms
 ```
 
-**`consume_awaited` — delete the awaited signals (name = `awaits`):**
-```
-Delete on signals s
-  ->  Nested Loop  Join Filter: (s.name = g.awaits)
-        ->  Index Scan using signals_target on signals s (rows=1)   Index Cond: (target_id = 700001)
-        ->  Index Scan using gen_durable_pkey on gen_durable g       Index Cond: (id = 700001)
-Execution Time: 0.093 ms
-```
+**Every node is a primary-key index scan — no `Seq Scan` on `gen_durable`**, even with 50k
+rows in the parent index. The `c.id = $1` equality is the selective path so the planner
+stays on the PK (a *one-row* fixture can fool it onto the partial parent index with an
+`id` filter — harmless there, and it does not happen once stats are real). For a non-child
+`:done` the parent-join is a clean PK no-op (`p` matches 0 rows).
+
+And it is not only fewer round-trips: the single statement is **less DB execution time**
+than the old three separate statements — median **~0.25 ms vs ~0.42 ms** (EXPLAIN ANALYZE,
+300k-row table), before even counting the `BEGIN`/`COMMIT` round-trips the transaction form
+also paid. Consume stays name-scoped (spec §5): on an instance parked on `go` with `{go,
+other}` in its inbox, only `go` is deleted — `other` survives.
+
+(The statement-count assertions in `test/perf_test.exs` guard the *round-trip* count; this
+EXPLAIN is the *execution-cost* evidence. Different claims, both checked.)
+
+### Point queries
 
 **`deliver_signal` — wake by id+status+awaits:**
 ```

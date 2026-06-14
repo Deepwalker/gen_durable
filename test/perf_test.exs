@@ -4,6 +4,12 @@ defmodule GenDurable.PerfTest do
   database statement (one round-trip), not a `BEGIN … COMMIT` transaction — the
   signal consume and parent-join are folded in as data-modifying CTEs (F4).
 
+  These tests guard the *round-trip count* only — that the collapse didn't
+  silently revert to a multi-statement transaction. They say nothing about
+  whether that one statement is *cheap*: a fat CTE could still have a bad plan.
+  That is verified separately by EXPLAIN ANALYZE on a realistic table (every
+  node a PK index scan, faster than the old 3 statements) — see PERFORMANCE.md §3.
+
   The `:bench` test (excluded by default; `mix test --only bench`) prints the
   old-vs-new wall-clock so the win is measurable, not asserted-on-flaky-timing.
   """
