@@ -1,6 +1,8 @@
 defmodule GenDurable.MixProject do
   use Mix.Project
 
+  @source_url "https://github.com/Deepwalker/gen_durable"
+
   def project do
     [
       app: :gen_durable,
@@ -11,7 +13,18 @@ defmodule GenDurable.MixProject do
       deps: deps(),
       name: "gen_durable",
       description: "Postgres-backed durable FSM engine on top of GenServer.",
-      docs: docs()
+      source_url: @source_url,
+      docs: docs(),
+      package: package()
+    ]
+  end
+
+  defp package do
+    [
+      licenses: ["BSD-3-Clause"],
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib mix.exs README.md LICENSE .formatter.exs
+                gen_durable_spec.md gen_durable_plan.md)
     ]
   end
 
