@@ -13,7 +13,10 @@ See [`gen_durable_spec.md`](gen_durable_spec.md) for the normative specification
 ## Three primitives
 
 - **durable step** — user code that returns an outcome on completion.
-- **durable await** — a step parks the instance until a named signal arrives.
+- **durable await** — a step parks the instance until a signal from a named set
+  arrives, then runs a chosen step with the matched signals in `ctx.awaited` (the
+  full inbox is always in `ctx.all`). It is sugar over a step that inspects the
+  inbox itself; the engine just pre-filters the set you waited for and consumes it.
 - **durable childs** — a step fans out a batch of child instances and parks on a
   built-in await-on-all-children barrier; when every child reaches a terminal
   state the parent's next step runs with `ctx.childs` holding their results.
@@ -24,7 +27,7 @@ See [`gen_durable_spec.md`](gen_durable_spec.md) for the normative specification
 |---|---|
 | `{:next, step, state}` | transition to `step`, `runnable`, `attempt := 0` |
 | `{:replay, state, delay_ms}` | same step again, `runnable`, `attempt += 1`, after `delay_ms` |
-| `{:await, signal_name, state}` | park, `awaiting_signal` |
+| `{:await, names, next_step, state}` | park (`awaiting_signal`) on one name or a set; when any arrives, run `next_step` with the matched signals as `ctx.awaited` |
 | `{:schedule_childs, next_step, children, state}` | spawn `children`, park on the join barrier (`awaiting_children`); run `next_step` once all finish |
 | `{:done, result}` | terminal, `done` |
 | `{:stop, reason}` | terminal, `failed` |
@@ -75,16 +78,12 @@ defmodule Checkout do
   end
 
   @impl true
-  def step("start", %{state: s}), do: {:next, "await_pay", %{s | n: s.n + 1}}
-
-  def step("await_pay", ctx) do
-    case Enum.find(ctx.signals, &(&1.name == "payment_confirmed")) do
-      nil -> {:await, "payment_confirmed", ctx.state}
-      sig -> {:next, "ship", apply_payment(ctx.state, sig)}
-    end
+  def step("start", %{state: s}) do
+    # park until the signal arrives, then run "ship" with it in ctx.awaited
+    {:await, "payment_confirmed", "ship", %{s | n: s.n + 1}}
   end
 
-  def step("ship", _ctx), do: {:done, %{"shipped" => true}}
+  def step("ship", ctx), do: {:done, %{"shipped" => true, "paid" => hd(ctx.awaited).payload}}
 
   @impl true
   def handle(reason, ctx) do

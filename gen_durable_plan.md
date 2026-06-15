@@ -113,9 +113,8 @@ defmodule Checkout do
   end
 
   @impl true
-  def step("start",     %{state: s} = _ctx), do: {:next, "await_pay", %{s | n: s.n + 1}}
-  def step("await_pay", ctx),                 do: {:await, "payment_confirmed", ctx.state}
-  def step("ship",      %{state: s} = _ctx),  do: {:done, %{"shipped" => true}}
+  def step("start", %{state: s}), do: {:await, "payment_confirmed", "ship", %{s | n: s.n + 1}}
+  def step("ship",  ctx),         do: {:done, %{"shipped" => true, "paid" => hd(ctx.awaited).payload}}
 
   @impl true
   def handle(reason, ctx) do
@@ -141,11 +140,12 @@ GenDurable.signal(id, "payment_confirmed", %{"amount" => 100}, dedup_key: "evt-7
 return a struct of the same type in `:next`/`:replay`/`:await`, which the engine dumps back to jsonb.
 `result` in `:done` stays a plain string-keyed map (terminal payload, never re-loaded into step code).
 
-`ctx` for `step/2`: `%Context{id, fsm, fsm_version, step, attempt, state, signals}`.
-`ctx` for `handle/2`: same minus `signals` (spec §4.2: `%{id, fsm, fsm_version, step, attempt, state}`).
+`ctx` for `step/2`: `%Context{id, fsm, fsm_version, step, attempt, state, signal, signals, childs}`
+(`signal` is the awaited signal on the step an `:await` transitioned to, else `nil`).
+`ctx` for `handle/2`: same minus `signal`/`signals`/`childs`.
 
 Outcomes returned by `step/2` and `handle/2` are exactly the spec §3 table:
-`{:next, step, state}` · `{:replay, state, delay_ms}` · `{:await, name, state}` ·
+`{:next, step, state}` · `{:replay, state, delay_ms}` · `{:await, name, next_step, state}` ·
 `{:done, result}` · `{:stop, reason}`. `Outcome` validates the shape before it touches SQL.
 
 ---
@@ -202,15 +202,16 @@ Notes to verify during implementation:
 One function per spec §10 block, all parameterized, all raw SQL:
 `pick/3`, `heartbeat/2`, `reap/0`, `complete_next/…`, `complete_replay/…`, `complete_await/…`,
 `complete_done/…`, `complete_stop/…`, `deliver_signal/…`, `insert/…`, `insert_all/…`.
-Progressing `complete_*` run a name-scoped signal `DELETE` (signals whose `name = awaits`) **and** the
-outcome `UPDATE` (which clears `awaits`) in one txn; `complete_await` guards a pre-arrived signal.
+`:next`/`:schedule_childs` run a by-id signal `DELETE` (the received `ctx.awaited` ids) **and** the
+outcome `UPDATE` in one statement; `:done`/`:stop` delete the whole inbox; `:replay`/`:await` consume
+nothing. `complete_await` parks on a name set (`awaits text[]`) and guards a pre-arrived signal.
 
 ### 5.2 Executor (`executor.ex`)
 Given a picked row map, run the step to a committed outcome:
 1. If `partition_key`, `pg_try_advisory_lock(hashtext(partition_key))` on the step connection; on
    `false`, reset row to `runnable` (drop lease) and stop — another worker owns the key.
-2. Load pending signals for `id` into `ctx.signals` (read-only view; deletion is name-scoped in SQL
-   on the outcome, not by these ids).
+2. Load pending signals for `id` into `ctx.all`; the awaited subset (names ∈ `awaits`) into
+   `ctx.awaited`. Deletion on the outcome is by the received `ctx.awaited` ids.
 3. Resolve module via `Registry.fetch!({fsm, fsm_version})`; **load jsonb → state struct** (the FSM's
    `state:` embedded schema, via `Ecto.embedded_load`); build `Context` with the struct.
 4. `try` → `module.step(step, ctx)`; on raised exception → `module.handle(reason, ctx)`; if
@@ -433,6 +434,33 @@ compile error. `:args` is an alias for `:state` at insert. README leads with the
 five engine tests (ok / result+ctx / retry-then-succeed / exhaust-max_attempts / cancel) plus
 compile-guard + default-backoff unit tests. 66 tests green.
 
+### F14 — await is a transition, not a re-entry ✅ DONE
+The old `{:await, name, state}` re-ran the **same** step on wake-up, so every awaiting step had to
+branch `Enum.find(ctx.signals, …) -> nil | sig` to tell "first entry, park" from "woke, proceed" — the
+low-level park+resume primitive leaking into the API. Replaced by `{:await, signal_name, next_step,
+state}`: the engine parks (`step := next_step`, `awaits := signal_name`), and on the signal runs
+`next_step` with the matching signal handed in as `ctx.signal` (full inbox still `ctx.signals`). The
+pre-arrived-signal race is unchanged (`complete_await` commits `runnable` at `next_step` when a match
+already exists). The 3-tuple form is **removed** (rejected by `Outcome.validate`). `pick` now returns
+`awaits` so the executor can resolve `ctx.signal`. Spec §2/§3/§5/§10, README, FSM/Context/Outcome docs
+and the `Awaiter` FSM updated; new engine test for the pre-arrived race; outcome/queries/perf tests
+moved to the 4-tuple. 67 tests green.
+
+### F15 — await a signal set; deliver subset; consume by id; terminal cleanup ✅ DONE
+Generalized await from one name to a **set**, and reworked consumption around a principle: the engine
+delivers signals and never silently sweeps by name. `{:await, name | [names], next_step, state}` parks on
+`awaits` (now `text[]`); on wake the step gets two views — `ctx.awaited` (only the names it waited for)
+and `ctx.all` (the full inbox); `ctx.signal` (singular) is gone. Consume is now **by received id**: a
+progressing `:next`/`:schedule_childs` deletes exactly the `ctx.awaited` ids the step saw (so a same-name
+signal that arrived after the snapshot, or a never-awaited one, survives — no silent loss), which also
+enables **pack accumulation** via re-await (consumes nothing until you progress). `:replay` consumes
+nothing and **keeps** `awaits` (redo sees the same inputs — fixes the old name-sweep that dropped it). A
+**terminal** `:done`/`:stop` deletes the **whole** inbox (cleanup of a finished instance). Delivery flips
+on `$name = ANY(awaits)`. No migration — DDL changed in place (`awaits text[]`). Spec §2/§3/§5/§9/§10,
+README, FSM/Context/Executor/Outcome docs updated; new test FSMs `Selector` (any-of branch) and
+`Collector` (accumulate {a,b,c} then sum) + engine tests for any-of / accumulation / terminal cleanup;
+outcome/queries/perf tests reworked. 71 tests green.
+
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
   SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes
@@ -471,9 +499,10 @@ fights advisory locks and multi-connection flows — run engine tests against a 
    unsupported. `result` stays a plain string-keyed map.
 4. **Timings (Balanced):** lease 60s · heartbeat 20s · poll 1s · reaper 30s, all config-overridable.
 5. **Registry:** explicit `{name, version} => module` config; old versions coexist as registered modules.
-6. **Signals:** name-scoped consumption (spec §5, option b) — a progressing outcome deletes inbox
-   signals whose `name = awaits` and clears `awaits`; non-matching signals survive; delivery keeps
-   `awaits`; `:await` guards a pre-arrived signal against lost wake-up.
+6. **Signals:** durable inbox per instance; await parks on a name **set** (`awaits text[]`). Consume is
+   by **received id** on `:next`/`:schedule_childs` (latecomers/non-awaited survive), the **whole inbox**
+   on `:done`/`:stop` (cleanup), nothing on `:replay`/`:await`. Delivery keeps `awaits` and guards a
+   pre-arrived signal against lost wake-up.
 
 ## 9. Risks / watch-items
 

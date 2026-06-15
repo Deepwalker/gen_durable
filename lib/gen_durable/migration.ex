@@ -76,7 +76,7 @@ defmodule GenDurable.Migration do
       status        #{p}.durable_status not null default 'runnable',
       state         jsonb not null default '{}',
       result        jsonb,
-      awaits        text,
+      awaits        text[],
 
       queue         text     not null default 'default',
       priority      smallint not null default 0,

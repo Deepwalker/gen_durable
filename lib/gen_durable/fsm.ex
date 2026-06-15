@@ -48,14 +48,8 @@ defmodule GenDurable.FSM do
         end
 
         @impl true
-        def step("start", %{state: s}), do: {:next, "await_pay", %{s | n: s.n + 1}}
-        def step("await_pay", ctx) do
-          case Enum.find(ctx.signals, & &1.name == "payment_confirmed") do
-            nil -> {:await, "payment_confirmed", ctx.state}
-            sig -> {:next, "ship", apply_payment(ctx.state, sig)}
-          end
-        end
-        def step("ship", _ctx), do: {:done, %{"shipped" => true}}
+        def step("start", %{state: s}), do: {:await, "payment_confirmed", "ship", %{s | n: s.n + 1}}
+        def step("ship", ctx), do: {:done, %{"shipped" => true, "paid" => hd(ctx.awaited).payload}}
 
         @impl true
         def handle(reason, ctx) do

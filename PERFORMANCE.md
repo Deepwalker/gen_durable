@@ -245,8 +245,9 @@ stays on the PK (a *one-row* fixture can fool it onto the partial parent index w
 And it is not only fewer round-trips: the single statement is **less DB execution time**
 than the old three separate statements — median **~0.25 ms vs ~0.42 ms** (EXPLAIN ANALYZE,
 300k-row table), before even counting the `BEGIN`/`COMMIT` round-trips the transaction form
-also paid. Consume stays name-scoped (spec §5): on an instance parked on `go` with `{go,
-other}` in its inbox, only `go` is deleted — `other` survives.
+also paid. Consume is by received id (spec §5): a progressing outcome deletes exactly the
+`ctx.awaited` ids the step saw (`id = ANY($consumed)`, a PK lookup), so latecomers and
+never-awaited signals survive; a terminal outcome drops the whole inbox (`target_id = $id`).
 
 (The statement-count assertions in `test/perf_test.exs` guard the *round-trip* count; this
 EXPLAIN is the *execution-cost* evidence. Different claims, both checked.)

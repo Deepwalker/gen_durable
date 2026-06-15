@@ -88,7 +88,7 @@ defmodule GenDurable.EngineTest do
     assert Jason.decode!(row.result) == %{"count" => 2}
   end
 
-  test "await parks, signal wakes, step consumes and deletes the signal" do
+  test "await parks, signal wakes next_step which reads ctx.awaited and consumes it" do
     start_engine()
     {:ok, id} = GenDurable.insert(GenDurable.Test.Awaiter)
 
@@ -98,7 +98,58 @@ defmodule GenDurable.EngineTest do
     row = wait_status(id, "done")
     assert Jason.decode!(row.result) == %{"got" => %{"v" => 7}}
 
-    # Consumed signal was removed in the outcome transaction.
+    # The instance is done, so its inbox was cleaned up.
+    assert GenDurable.Queries.load_signals(Repo, id) == []
+  end
+
+  test "await: a signal that arrived before parking still wakes (no lost wake-up)" do
+    # Deliver before the engine runs the step: the row is still runnable, so delivery
+    # only inserts the signal (no flip). When "wait" parks, complete_await must see it
+    # already in the inbox and go straight to "woke".
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Awaiter, repo: Repo)
+    :ok = GenDurable.signal(id, "go", %{v: 9}, repo: Repo)
+
+    start_engine()
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"got" => %{"v" => 9}}
+  end
+
+  test "await on a set wakes on any one and branches on which arrived" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Selector)
+
+    wait_status(id, "awaiting_signal")
+    :ok = GenDurable.signal(id, "reject", %{"why" => "nope"})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"decision" => "reject", "by" => %{"why" => "nope"}}
+  end
+
+  test "await accumulates a pack across re-awaits, then processes all of it" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Collector)
+
+    # Deliver the three out of order; each wakes "wait", which re-awaits until all here.
+    :ok = GenDurable.signal(id, "b", %{"v" => 2})
+    :ok = GenDurable.signal(id, "a", %{"v" => 1})
+    :ok = GenDurable.signal(id, "c", %{"v" => 4})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"sum" => 7, "count" => 3}
+    # Terminal cleanup removed the whole pack.
+    assert GenDurable.Queries.load_signals(Repo, id) == []
+  end
+
+  test "terminal cleanup deletes leftover (never-awaited) signals" do
+    # Plain reaches :done immediately and never awaits, so a stray signal would
+    # otherwise linger on the terminal row. complete_done must clear the inbox.
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain, repo: Repo)
+    :ok = GenDurable.signal(id, "noise", %{}, repo: Repo)
+
+    start_engine()
+
+    wait_status(id, "done")
     assert GenDurable.Queries.load_signals(Repo, id) == []
   end
 

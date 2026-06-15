@@ -91,7 +91,7 @@ defmodule GenDurable.QueriesTest do
     {:ok, id} = Queries.insert(Repo, params())
     [_job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
-    :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}))
+    :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [])
 
     %{rows: [[status, step, attempt, state]]} =
       Repo.query!("SELECT status::text, step, attempt, state FROM gen_durable WHERE id = $1", [id])
@@ -155,10 +155,10 @@ defmodule GenDurable.QueriesTest do
   end
 
   describe "signals" do
-    test "deliver wakes a matching await and keeps awaits (name-scoped consumption)" do
+    test "deliver wakes a matching await and keeps the awaited set" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
+      :ok = Queries.complete_await(Repo, id, ~s({}), ["go", "stop"], "woke")
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
 
@@ -166,16 +166,16 @@ defmodule GenDurable.QueriesTest do
         Repo.query!("SELECT status::text, awaits FROM gen_durable WHERE id = $1", [id])
 
       assert status == "runnable"
-      # awaits is kept until the woken step progresses (spec §5)
-      assert awaits == "go"
+      # awaits (the whole set) is kept until the woken step progresses
+      assert awaits == ["go", "stop"]
 
       assert [%{name: "go", payload: %{"v" => 1}}] = Queries.load_signals(Repo, id)
     end
 
-    test "non-matching signal does not wake the instance" do
+    test "a signal outside the awaited set does not wake the instance" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
+      :ok = Queries.complete_await(Repo, id, ~s({}), ["go", "stop"], "woke")
 
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
 
@@ -191,13 +191,15 @@ defmodule GenDurable.QueriesTest do
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
+      :ok = Queries.complete_await(Repo, id, ~s({}), ["go", "stop"], "woke")
 
-      %{rows: [[status]]} =
-        Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
+      %{rows: [[status, step]]} =
+        Repo.query!("SELECT status::text, step FROM gen_durable WHERE id = $1", [id])
 
-      # EXISTS race-fix: matching signal already present => straight back to runnable
+      # EXISTS race-fix: a matching signal already present => straight to runnable,
+      # parked at next_step
       assert status == "runnable"
+      assert step == "woke"
     end
 
     test "dedup_key makes redelivery idempotent; nil dedup allows duplicates" do
@@ -211,21 +213,33 @@ defmodule GenDurable.QueriesTest do
       assert length(Queries.load_signals(Repo, id)) == 3
     end
 
-    test "progress consumes only the awaited name; other signals survive (§5)" do
+    test "progress consumes exactly the passed ids; other signals survive" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, ~s({}), "go")
+      :ok = Queries.complete_await(Repo, id, ~s({}), ["go"], "woke")
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
 
-      # the woken step progresses
-      :ok = Queries.complete_next(Repo, id, "tick", ~s({}))
+      go = Enum.find(Queries.load_signals(Repo, id), &(&1.name == "go"))
+      # progress, consuming exactly the awaited "go" id
+      :ok = Queries.complete_next(Repo, id, "tick", ~s({}), [go.id])
 
       assert [%{name: "other"}] = Queries.load_signals(Repo, id)
 
       %{rows: [[awaits]]} = Repo.query!("SELECT awaits FROM gen_durable WHERE id = $1", [id])
       assert awaits == nil
+    end
+
+    test "a terminal outcome deletes the whole inbox (cleanup)" do
+      {:ok, id} = Queries.insert(Repo, params())
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.deliver_signal(Repo, id, "a", ~s({}), nil)
+      :ok = Queries.deliver_signal(Repo, id, "b", ~s({}), nil)
+
+      :ok = Queries.complete_done(Repo, id, ~s({}))
+
+      assert Queries.load_signals(Repo, id) == []
     end
   end
 

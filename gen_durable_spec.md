@@ -13,7 +13,7 @@ The unit of re-execution is the **whole step**. Everything inside a step re-runs
 ## 2. Three primitives
 
 - **durable step** — user step code that returns an outcome on completion (see §3).
-- **durable await** — a step parks the instance until a named signal arrives; the wake-up only changes state, with no side effects, so re-running it is harmless.
+- **durable await** — a step parks the instance until a signal from a named **set** arrives, naming the step to run next; on arrival the engine runs that step with the matched signals as `ctx.awaited` (full inbox in `ctx.all`). It is sugar over a step that inspects the inbox itself — the engine pre-filters the awaited set and consumes it. The wake-up only changes state, with no side effects, so re-running it is harmless.
 - **durable childs** — a step spawns a batch of child instances and parks until **all** of them reach a terminal status; the engine owns the fan-in barrier (see §11). The wake-up only reads child results — no side effects, so re-running it is harmless.
 
 These compose into larger shapes in user code. The spawn-and-join shape is first-class: the engine tracks the `parent_id` link and the join barrier. A child is otherwise an ordinary independent instance — cancel and cascade are **not** implied (see §8, §11).
@@ -26,7 +26,7 @@ A step, and the error handler `handle/2`, return one of:
 |---|---|---|---|
 | `{:next, step, state}` | transition to `step`, `runnable` | `:= 0` | `now()` |
 | `{:replay, state, delay_ms}` | same step again, `runnable` | `+1` | `now() + delay_ms` |
-| `{:await, signal_name, state}` | park, `awaiting_signal`, `awaits := signal_name` | — | — |
+| `{:await, names, next_step, state}` | park, `awaiting_signal`, `awaits := names` (one name or a set), `step := next_step`; on any match, run `next_step` with `ctx.awaited` | — | — |
 | `{:schedule_childs, step, children, state}` | spawn `children`, park `awaiting_children`; on barrier release advance to `step`, `runnable` (see §11) | `:= 0` | `now()` on release |
 | `{:done, result}` | terminal, `done`, `result` recorded | — | — |
 | `{:stop, reason}` | terminal, `failed`, `last_error := reason` | — | — |
@@ -43,13 +43,13 @@ Not to be conflated:
 
 ## 5. await and signals
 
-Parking writes `awaits := signal_name`. Signal delivery moves the instance to `runnable` **only on a name match**; non-matching signals stay in the inbox until their own await.
+`await` is sugar over the raw signal model. The primitives: every instance has a durable **inbox** (`signals` rows), always fully visible to a step as `ctx.all`; and a step can **park** on a set of names (`awaits`, a `text[]`) until any of them arrives. `{:await, names, next_step, state}` writes `awaits := names` and `step := next_step`. Delivery moves the instance to `runnable` **only on a name match** (`$name = ANY(awaits)`); non-matching signals stay in the inbox. On wake-up the engine runs `next_step`, handing it the matched subset as `ctx.awaited` (and the whole inbox as `ctx.all`).
 
-A signal into an await must be durable (a row in `signals`), at-least-once. Loss is not allowed — otherwise the instance hangs forever; duplicates are allowed (caught by dedup or the step itself). Delivery inserts the signal row **before** flipping to `runnable`, so on wake-up the same step re-executes and already sees the signal in the inbox.
+A signal into an await must be durable (a row in `signals`), at-least-once. Loss is not allowed — otherwise the instance hangs forever; duplicates are allowed (caught by dedup or the step itself). Delivery inserts the signal row **before** flipping to `runnable`, so on wake-up `next_step` already sees it in the inbox.
 
-**Consumption is name-scoped.** Delivery sets `runnable` but leaves `awaits` set. When the woken step then *progresses* (any outcome other than another `:await`), its outcome transaction deletes exactly the inbox signals whose `name = awaits` and clears `awaits`. Signals for other names — and signals on a never-awaited instance — are left untouched (so a non-matching signal survives until *its* own await). The `ctx.signals` snapshot the step reads is just a view; deletion is the engine's, scoped to the awaited name.
+**Consumption is by received id, on progress.** `await` itself deletes nothing. When the woken step *progresses* (`:next`/`:schedule_childs`), its outcome transaction deletes exactly the signal ids it received in `ctx.awaited` — **not** by name. So a signal of an awaited name that arrives *after* the step's snapshot (which the step never saw) is not deleted, and never-awaited signals are never touched. This also lets a step **accumulate a pack**: re-await (which consumes nothing) until `ctx.awaited` holds the whole set, then progress once, consuming it all. `:replay` consumes nothing and keeps `awaits` (the redo must see the same inputs). A **terminal** outcome (`:done`/`:stop`) deletes the *whole* inbox — the instance is finished, so nothing will read its signals again (cleanup).
 
-**No lost wake-up.** A signal can arrive before the step has parked (delivery sees the instance still `executing`, so the flip is a no-op but the row is inserted). To avoid a hang, parking is guarded: `:await` commits as `runnable` instead of `awaiting_signal` when a matching signal is already in the inbox, so the step re-runs and consumes it. Combined with the row lock, every interleaving of deliver vs. park ends with the instance either flipped or already runnable.
+**No lost wake-up.** A signal can arrive before the step has parked (delivery sees the instance still `executing`, so the flip is a no-op but the row is inserted). To avoid a hang, parking is guarded: `:await` commits as `runnable` (at `next_step`) instead of `awaiting_signal` when a matching signal is already in the inbox, so `next_step` runs at once. Combined with the row lock, every interleaving of deliver vs. park ends with the instance either flipped or already runnable.
 
 ## 6. Scheduler
 
@@ -99,7 +99,7 @@ create table gen_durable (
   status        durable_status not null default 'runnable',
   state         jsonb    not null default '{}',
   result        jsonb,                              -- set on :done
-  awaits        text,                               -- awaited signal when awaiting_signal
+  awaits        text[],                             -- awaited signal name set when awaiting_signal
 
   -- scheduling
   queue         text     not null default 'default',
@@ -202,13 +202,13 @@ where status = 'executing' and lease_expires_at < now();
 
 ### Step outcomes (one transaction per outcome)
 
-Every **progressing** outcome (`:next`, `:replay`, `:schedule_childs`, `:done`, `:stop`) runs the
-name-scoped consume below first, then clears `awaits` (§5). `:await` does **not** consume.
+Consume rules (§5): `:next`/`:schedule_childs` delete exactly the awaited ids the step received
+(`$consumed`, a `bigint[]`); `:done`/`:stop` delete the whole inbox (cleanup); `:replay`/`:await`
+consume nothing. The consume rides each statement as a leading data-modifying CTE.
 
 ```sql
--- name-scoped consume: prelude to every PROGRESSING outcome (no-op when awaits is null)
-delete from signals s using gen_durable g
-where s.target_id = $id and g.id = $id and s.name = g.awaits;
+-- consume on a PROGRESSING outcome (:next / :schedule_childs): exactly the received ids
+delete from signals where target_id = $id and id = any($consumed);  -- empty array ⇒ no-op
 
 -- :next
 update gen_durable
@@ -216,21 +216,21 @@ set step = $next, state = $state, status = 'runnable', eligible_at = now(),
     attempt = 0, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
--- :replay
+-- :replay  (redo the same step — consumes nothing, KEEPS awaits so the redo sees the same inputs)
 update gen_durable
 set state = $state, status = 'runnable', eligible_at = now() + $delay_ms,
-    attempt = attempt + 1, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
+    attempt = attempt + 1, locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
--- :await  (park; but go straight to runnable if a matching signal already arrived — no lost wake-up)
+-- :await  (park at next_step on a name set; but go straight to runnable if a match already arrived)
 update gen_durable
-set state = $state, awaits = $signal_name, eligible_at = now(),
-    status = case when exists (select 1 from signals where target_id = $id and name = $signal_name)
+set step = $next_step, state = $state, awaits = $names::text[], eligible_at = now(),
+    status = case when exists (select 1 from signals where target_id = $id and name = any($names::text[]))
                   then 'runnable' else 'awaiting_signal' end,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
--- :schedule_childs  (one transaction; spawn the batch, then park on the join barrier)
+-- :schedule_childs  (one transaction; consume received ids, spawn the batch, then park on the join barrier)
 with ins as (
   insert into gen_durable
     (fsm, step, state, queue, priority, partition_key,
@@ -248,6 +248,9 @@ set step = $step, state = $state,
     eligible_at = now(), attempt = 0, awaits = null,
     locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
+
+-- terminal cleanup: prelude to :done and :stop — the instance is finished, drop its whole inbox
+delete from signals where target_id = $id;
 
 -- :done  (state is not rewritten — the {:done, result} outcome carries no state)
 update gen_durable
@@ -282,10 +285,10 @@ where c.id = $id and c.parent_id = p.id;
 insert into signals (target_id, name, payload, dedup_key)
 values ($id, $name, $payload, $dedup) on conflict (target_id, dedup_key) do nothing;
 
--- flip to runnable but KEEP awaits: the woken step consumes by name on its outcome (§5)
+-- flip to runnable but KEEP awaits: the woken step consumes by received id on its outcome (§5)
 update gen_durable
 set status = 'runnable', eligible_at = now(), updated_at = now()
-where id = $id and status = 'awaiting_signal' and awaits = $name;
+where id = $id and status = 'awaiting_signal' and $name = any(awaits);
 ```
 
 ### Batch insert with uniqueness

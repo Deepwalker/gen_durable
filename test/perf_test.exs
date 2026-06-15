@@ -77,7 +77,7 @@ defmodule GenDurable.PerfTest do
 
   test "complete_next is a single statement (one round-trip)" do
     id = setup_executing()
-    sql = statements(fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1})) end)
+    sql = statements(fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), []) end)
 
     assert length(sql) == 1
     assert hd(sql) =~ "WITH consumed"
@@ -90,7 +90,9 @@ defmodule GenDurable.PerfTest do
 
   test "complete_await is a single statement" do
     id = setup_executing()
-    assert length(statements(fn -> Queries.complete_await(Repo, id, ~s({}), "go") end)) == 1
+
+    assert length(statements(fn -> Queries.complete_await(Repo, id, ~s({}), ["go"], "woke") end)) ==
+             1
   end
 
   test "complete_done is a single statement (consume + done + parent-join folded in)" do
@@ -112,7 +114,9 @@ defmodule GenDurable.PerfTest do
     children = [params(%{fsm: "child"}), params(%{fsm: "child"})]
 
     sql =
-      statements(fn -> Queries.complete_schedule_childs(Repo, id, "join", ~s({}), children) end)
+      statements(fn ->
+        Queries.complete_schedule_childs(Repo, id, "join", ~s({}), children, [])
+      end)
 
     assert length(sql) == 1
     assert hd(sql) =~ "INSERT INTO gen_durable"
@@ -123,7 +127,7 @@ defmodule GenDurable.PerfTest do
     id = setup_executing()
     iters = 500
 
-    new = bench(iters, fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1})) end)
+    new = bench(iters, fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), []) end)
     old = bench(iters, fn -> complete_next_tx(id, "tick", ~s({"n":1})) end)
 
     IO.puts("\n  complete_next over #{iters} iters (median µs/call):")
@@ -150,7 +154,7 @@ defmodule GenDurable.PerfTest do
   defp complete_next_tx(id, step, state_json) do
     Repo.transaction(fn ->
       Repo.query!(
-        "DELETE FROM signals s USING gen_durable g WHERE s.target_id=$1 AND g.id=$1 AND s.name=g.awaits",
+        "DELETE FROM signals s USING gen_durable g WHERE s.target_id=$1 AND g.id=$1 AND s.name=ANY(g.awaits)",
         [id]
       )
 

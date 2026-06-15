@@ -38,14 +38,44 @@ defmodule GenDurable.Test.MapCounter do
 end
 
 defmodule GenDurable.Test.Awaiter do
-  @moduledoc "Parks on a signal, completes with its payload once delivered."
+  @moduledoc "Parks on one signal, then runs the next step with ctx.awaited once delivered."
   use GenDurable.FSM, name: "awaiter", version: 1, initial: "wait"
 
   @impl true
+  def step("wait", ctx), do: {:await, "go", "woke", ctx.state}
+  def step("woke", ctx), do: {:done, %{"got" => hd(ctx.awaited).payload}}
+end
+
+defmodule GenDurable.Test.Selector do
+  @moduledoc "Awaits any of a set, branches on which name arrived."
+  use GenDurable.FSM, name: "selector", version: 1, initial: "wait"
+
+  @impl true
+  def step("wait", ctx), do: {:await, ["approve", "reject"], "decide", ctx.state}
+
+  def step("decide", ctx) do
+    sig = hd(ctx.awaited)
+    {:done, %{"decision" => sig.name, "by" => sig.payload}}
+  end
+end
+
+defmodule GenDurable.Test.Collector do
+  @moduledoc "Awaits a pack {a,b,c}; re-awaits (accumulating) until all arrive, then sums them."
+  use GenDurable.FSM, name: "collector", version: 1, initial: "wait"
+
+  @names ["a", "b", "c"]
+
+  @impl true
   def step("wait", ctx) do
-    case Enum.find(ctx.signals, &(&1.name == "go")) do
-      nil -> {:await, "go", ctx.state}
-      sig -> {:done, %{"got" => sig.payload}}
+    names = MapSet.new(ctx.awaited, & &1.name)
+
+    if MapSet.size(names) == length(@names) do
+      # All here: process the whole pack in place, then finish (terminal cleans up).
+      total = ctx.awaited |> Enum.map(& &1.payload["v"]) |> Enum.sum()
+      {:done, %{"sum" => total, "count" => length(ctx.awaited)}}
+    else
+      # Re-await without consuming — the pack accumulates across wakeups.
+      {:await, @names, "wait", ctx.state}
     end
   end
 end
@@ -225,6 +255,8 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.Counter,
       GenDurable.Test.MapCounter,
       GenDurable.Test.Awaiter,
+      GenDurable.Test.Selector,
+      GenDurable.Test.Collector,
       GenDurable.Test.Crasher,
       GenDurable.Test.Reborn,
       GenDurable.Test.PartitionInc,

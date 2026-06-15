@@ -4,17 +4,18 @@ defmodule GenDurable.Outcome do
 
       {:next, step, state}        # transition, runnable, attempt := 0
       {:replay, state, delay_ms}  # same step, runnable, attempt += 1, eligible_at += delay
-      {:await, signal_name, state} # park, awaiting_signal
+      {:await, names, next_step, state} # park; on any of `names`, run next_step (ctx.awaited)
       {:done, result}             # terminal, done
       {:stop, reason}             # terminal, failed
 
-  Step names and signal names are normalized to strings.
+  Step names and signal names are normalized to strings. `:await` accepts a single
+  name or a list of names; both normalize to a list.
   """
 
   @type t ::
           {:next, String.t(), term()}
           | {:replay, term(), non_neg_integer()}
-          | {:await, String.t(), term()}
+          | {:await, [String.t()], String.t(), term()}
           | {:schedule_childs, String.t(), [term()], term()}
           | {:done, map()}
           | {:stop, term()}
@@ -26,8 +27,14 @@ defmodule GenDurable.Outcome do
   def validate({:replay, state, delay}) when is_integer(delay) and delay >= 0,
     do: {:ok, {:replay, state, delay}}
 
-  def validate({:await, name, state}) when is_binary(name) or is_atom(name),
-    do: {:ok, {:await, to_string(name), state}}
+  def validate({:await, names, next_step, state})
+      when is_binary(next_step) or is_atom(next_step) do
+    list = List.wrap(names)
+
+    if list != [] and Enum.all?(list, &(is_binary(&1) or is_atom(&1))),
+      do: {:ok, {:await, Enum.map(list, &to_string/1), to_string(next_step), state}},
+      else: {:error, {:bad_outcome, {:await, names, next_step, state}}}
+  end
 
   def validate({:schedule_childs, step, children, state})
       when (is_binary(step) or is_atom(step)) and is_list(children),
