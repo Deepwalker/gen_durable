@@ -59,6 +59,25 @@ defmodule GenDurable.Test.Selector do
   end
 end
 
+defmodule GenDurable.Test.AwaitReplay do
+  @moduledoc """
+  Awaits, then `:replay`s the woken step once before finishing. Proves a replay
+  keeps `awaits` and re-sees `ctx.awaited` — if the redo lost them, `hd([])` raises.
+  """
+  use GenDurable.FSM, name: "await_replay", version: 1, initial: "wait"
+
+  @impl true
+  def step("wait", ctx), do: {:await, "go", "woke", ctx.state}
+
+  def step("woke", ctx) do
+    sig = hd(ctx.awaited)
+
+    if ctx.attempt < 1,
+      do: {:replay, ctx.state, 0},
+      else: {:done, %{"v" => sig.payload["v"], "attempt" => ctx.attempt}}
+  end
+end
+
 defmodule GenDurable.Test.Collector do
   @moduledoc "Awaits a pack {a,b,c}; re-awaits (accumulating) until all arrive, then sums them."
   use GenDurable.FSM, name: "collector", version: 1, initial: "wait"
@@ -257,6 +276,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.Awaiter,
       GenDurable.Test.Selector,
       GenDurable.Test.Collector,
+      GenDurable.Test.AwaitReplay,
       GenDurable.Test.Crasher,
       GenDurable.Test.Reborn,
       GenDurable.Test.PartitionInc,

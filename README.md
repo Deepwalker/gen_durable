@@ -133,6 +133,9 @@ The engine is started as `{GenDurable, opts}`. Full reference lives in the
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows (`buffer ++ in_flight`) |
 | `:poll_interval` | `1_000` | base ms between idle polls |
 | `:reap_interval` | `30_000` | ms between reaper sweeps |
+| `:gc_interval` | `60_000` | ms between GC sweeps of terminal rows; `nil` disables GC |
+| `:gc_retention` | `86_400_000` | ms a `done`/`failed` row is kept after terminating before GC may delete it (default 1 day) |
+| `:gc_batch` | `10_000` | max rows deleted per GC sweep (it re-sweeps at once when a sweep fills the batch) |
 | `:prefetch` | `0` | rows each queue claims into its buffer **beyond** its running slots |
 | `:min_demand` | `1` | batch gate: skip picking unless at least this many slots are free |
 | `:max_poll_interval` | `5_000` | idle-backoff ceiling: an empty pick on an idle queue doubles the poll interval up to here, then snaps back when work appears |

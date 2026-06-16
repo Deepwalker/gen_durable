@@ -115,6 +115,19 @@ defmodule GenDurable.EngineTest do
     assert Jason.decode!(row.result) == %{"got" => %{"v" => 9}}
   end
 
+  test "a replay on an await step re-sees ctx.awaited across the redo" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitReplay)
+
+    wait_status(id, "awaiting_signal")
+    :ok = GenDurable.signal(id, "go", %{"v" => 5})
+
+    # "woke" replays once (attempt 0), then finishes (attempt 1). It would crash on
+    # hd([]) if the replay had cleared awaits / consumed the signal.
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"v" => 5, "attempt" => 1}
+  end
+
   test "await on a set wakes on any one and branches on which arrived" do
     start_engine()
     {:ok, id} = GenDurable.insert(GenDurable.Test.Selector)
@@ -406,5 +419,33 @@ defmodule GenDurable.EngineTest do
 
     assert_receive {:telemetry, [:gen_durable, :scheduler, :saturation], %{concurrency: 5}, _},
                    2_000
+  end
+
+  defp row_count(id) do
+    %{rows: [[n]]} = Repo.query!("SELECT count(*) FROM gen_durable WHERE id = $1", [id])
+    n
+  end
+
+  test "GC deletes a completed instance after retention and emits :swept" do
+    attach_telemetry([[:gen_durable, :gc, :swept]])
+    # retention 0 ⇒ a terminated row is collectible at once; sweep often.
+    start_engine(gc_interval: 30, gc_retention: 0)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+
+    eventually(fn -> if row_count(id) == 0, do: {:ok, :gone}, else: :retry end)
+
+    assert_receive {:telemetry, [:gen_durable, :gc, :swept], %{count: c}, _}, 2_000
+    assert c >= 1
+  end
+
+  test "gc_interval: nil disables the GC process; terminal rows persist" do
+    start_engine(gc_interval: nil, gc_retention: 0)
+    refute Process.whereis(GenDurable.GC)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    wait_status(id, "done")
+
+    Process.sleep(100)
+    assert row_count(id) == 1
   end
 end

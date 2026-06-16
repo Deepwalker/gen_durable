@@ -78,10 +78,11 @@ Uniqueness = **key** (user function, stored verbatim, no transformation) + **sco
 - **limited trees** — `schedule_childs` (§11) provides spawn + an all-children fan-in barrier, and the engine tracks the `parent_id` link. Still out: **cancel/cascade** (failing or terminating a parent does not touch its children, nor the reverse), quorum/`k`-of-`n` barriers, and arbitrary DAG joins beyond "all my children";
 - **no cancel**;
 - **no transition history / event sourcing** — current-state snapshot only;
-- **the engine does not cap retries** — no `max_attempts`, only an `attempt` counter; `handle/2` decides when to stop by reading it;
+- **the FSM `step/2` path does not cap retries** — no `max_attempts`, only an `attempt` counter; `handle/2` decides when to stop by reading it (the job `perform` form *does* cap, via `:max_attempts`);
 - **no global cross-node concurrency limit** — local pools only;
-- **no auto-migration of in-flight instances on FSM change** — old ones finish on their `fsm_version`;
-- **GC of terminal rows and the inbox** — not the engine's job, an external cron.
+- **no auto-migration of in-flight instances on FSM change** — old ones finish on their `fsm_version`.
+
+GC of terminal rows is **built in**: a periodic sweep deletes `done`/`failed` rows whose termination is older than `:gc_retention` (default 1 day), sparing a terminal child still needed for a parent's join. Disable it with `gc_interval: nil` to prune externally instead. The inbox is cleaned on terminal outcomes (§5) and cascades on row delete.
 
 ---
 

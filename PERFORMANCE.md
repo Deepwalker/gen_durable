@@ -301,6 +301,48 @@ what you want.
 
 ---
 
+## 4b. The GC sweep (must scale with the batch, not the table)
+
+GC (`GenDurable.GC`) deletes terminal rows older than `:gc_retention` in bounded
+batches. The naïve form is a trap — measured on a **1,000,000-row** table (800k old
+terminal, 100k terminal children of active parents, 100k active), retention 1 day,
+batch 10k:
+
+```
+-- DELETE FROM gen_durable WHERE id IN (SELECT … LIMIT 10000)
+Hash Semi Join                       (actual 7.8..352 ms)
+  ->  Seq Scan on gen_durable        (rows=1000000, 190 ms)   ← scans the WHOLE table
+Execution Time: 410 ms
+```
+
+`WHERE id IN (subquery)` (and `… USING doomed`) makes the planner **Seq Scan the entire
+table** to match the small doomed set: cost is **O(table)**, ~190 ms here and *seconds*
+on a 100M-row table — to delete only 10k rows. The shipped form splits it: select the
+≤ `batch` ids, then delete by `id = ANY($ids)`:
+
+```
+-- DELETE FROM gen_durable WHERE id = ANY($ids)   (10k ids)
+Delete on gen_durable                              (actual 5.9 ms)
+  ->  Index Scan using gen_durable_pkey            (rows=10000, 1.9 ms)   ← PK, O(batch)
+Trigger gen_durable_parent_id_fkey: 22 ms          (ON DELETE SET NULL, 10k)
+Trigger signals_target_id_fkey:     23 ms          (cascade, 10k)
+Execution Time: 52 ms
+```
+
+**52 ms vs 410 ms**, and — the point — the delete is a **primary-key index scan**, so
+cost tracks the *batch* (10k), not the table. The remaining ~45 ms is the two FK
+triggers, inherent to deleting 10k rows that may have children/signals, also O(batch).
+Terminal rows are immutable, so the ids stay valid between the two round-trips.
+
+The id-select uses `gen_durable_gc (updated_at) WHERE status IN ('done','failed')` when
+old terminal rows are sparse; when they dominate the table the planner prefers a
+Seq Scan that the `LIMIT` short-circuits. One honest caveat: the `NOT EXISTS` parent
+guard means a sweep can wade past terminal **children of still-active parents** before
+filling the batch — bounded by how many such children cluster ahead of collectibles
+(transient in practice, since parents join quickly).
+
+---
+
 ## 5. Index coverage
 
 Every hot statement is served by a partial or primary-key index; the big terminal-row
@@ -314,6 +356,8 @@ bulk (700k `done`/`failed`) sits in none of the partial indexes.
 | `reap` | `gen_durable_lease (lease_expires_at) WHERE status='executing'` | partial |
 | `insert` dedup | `gen_durable_unique (unique_guard) WHERE unique_guard IS NOT NULL` | partial unique |
 | child join | `gen_durable_parent (parent_id) WHERE parent_id IS NOT NULL` | partial |
+| `gc` id-select | `gen_durable_gc (updated_at) WHERE status IN ('done','failed')` | partial (situational) |
+| `gc` delete | `gen_durable_pkey (id)` | primary key |
 | `load_signals` | `signals_target (target_id, name)` | covering |
 
 The partial predicates matter: `gen_durable_pick` indexes only the ~295k runnable rows,

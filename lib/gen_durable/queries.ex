@@ -114,6 +114,47 @@ defmodule GenDurable.Queries do
     List.flatten(rows)
   end
 
+  # Garbage-collect terminal instances (spec §8). Deletes up to `batch` `done`/`failed`
+  # rows whose `updated_at` (their termination instant — terminal rows are immutable)
+  # is older than `retention_ms`. The `NOT EXISTS` guard spares a terminal child whose
+  # parent is still active (`awaiting_children`/runnable/executing): the parent may yet
+  # read it via `ctx.childs` on the join (spec §11). A deleted parent SET-NULLs its
+  # children's `parent_id` (FK), and `signals` cascade-delete. Returns the count deleted.
+  # Two round-trips on purpose (GC is a background sweep, not latency-critical):
+  # collect ≤ `batch` doomed ids, then delete them by `id = ANY($ids)`. A single
+  # `DELETE … WHERE id IN (subquery)` / `USING` makes the planner Seq Scan the whole
+  # table to match the small id set — O(table) per sweep, seconds on a 100M-row table.
+  # `id = ANY($ids)` is a PK Index Scan instead — O(batch) (~50ms for 10k incl. FK
+  # cascades; see PERFORMANCE.md §4b). Terminal rows are immutable, so the ids stay
+  # valid between the two statements.
+  def gc(repo, retention_ms, batch) do
+    %{rows: rows} =
+      repo.query!(
+        """
+        SELECT g.id FROM gen_durable g
+        WHERE g.status IN ('done', 'failed')
+          AND g.updated_at < now() - $1::int * interval '1 millisecond'
+          AND NOT EXISTS (
+            SELECT 1 FROM gen_durable p
+            WHERE p.id = g.parent_id AND p.status NOT IN ('done', 'failed')
+          )
+        LIMIT $2
+        """,
+        [retention_ms, batch]
+      )
+
+    case List.flatten(rows) do
+      [] ->
+        0
+
+      ids ->
+        %{num_rows: n} =
+          repo.query!("DELETE FROM gen_durable WHERE id = ANY($1::bigint[])", [ids])
+
+        n
+    end
+  end
+
   # --- step outcomes (spec §3 / §10) -----------------------------------------
   #
   # Each outcome is a SINGLE statement, not a transaction (one round-trip instead

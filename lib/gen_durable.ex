@@ -34,6 +34,8 @@ defmodule GenDurable do
       `%{id, fsm, partition_key}`.
     * `[:gen_durable, :reaper, :reaped]` — expired leases reclaimed. Measurements
       `%{count}`; metadata `%{ids}`.
+    * `[:gen_durable, :gc, :swept]` — terminal rows deleted by a GC sweep.
+      Measurements `%{count}`; metadata `%{}`.
 
   See `gen_durable_spec.md` (normative) and `gen_durable_plan.md` (roadmap).
   """

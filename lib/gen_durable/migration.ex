@@ -132,6 +132,12 @@ defmodule GenDurable.Migration do
       WHERE parent_id IS NOT NULL
     """)
 
+    # Supports the GC sweep: terminal rows ordered by termination instant.
+    execute("""
+    CREATE INDEX gen_durable_gc ON #{p}.gen_durable (updated_at)
+      WHERE status IN ('done', 'failed')
+    """)
+
     execute("""
     CREATE TABLE #{p}.signals (
       id          bigint generated always as identity primary key,

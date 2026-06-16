@@ -30,6 +30,18 @@ defmodule GenDurable.QueriesTest do
     )
   end
 
+  defp exists?(id) do
+    %{rows: [[n]]} = Repo.query!("SELECT count(*) FROM gen_durable WHERE id = $1", [id])
+    n == 1
+  end
+
+  defp age_past_retention(ids) do
+    Repo.query!(
+      "UPDATE gen_durable SET updated_at = now() - interval '1 hour' WHERE id = ANY($1)",
+      [List.wrap(ids)]
+    )
+  end
+
   test "insert then pick flips to executing and returns the job" do
     {:ok, id} = Queries.insert(Repo, params())
 
@@ -117,6 +129,24 @@ defmodule GenDurable.QueriesTest do
     assert status == "runnable"
     assert attempt == 1
     assert future == true
+  end
+
+  test "complete_replay keeps awaits and consumes nothing (redo sees the same inputs)" do
+    {:ok, id} = Queries.insert(Repo, params())
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    :ok = Queries.complete_await(Repo, id, ~s({}), ["go"], "woke")
+    :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+    :ok = Queries.complete_replay(Repo, id, ~s({}), 0)
+
+    %{rows: [[status, awaits]]} =
+      Repo.query!("SELECT status::text, awaits FROM gen_durable WHERE id = $1", [id])
+
+    assert status == "runnable"
+    # awaits is KEPT (not cleared) and the signal survives — the redo re-sees it
+    assert awaits == ["go"]
+    assert [%{name: "go"}] = Queries.load_signals(Repo, id)
   end
 
   test "complete_done and complete_stop are terminal" do
@@ -240,6 +270,70 @@ defmodule GenDurable.QueriesTest do
       :ok = Queries.complete_done(Repo, id, ~s({}))
 
       assert Queries.load_signals(Repo, id) == []
+    end
+  end
+
+  describe "gc" do
+    test "deletes terminal rows past retention; keeps fresh terminal and non-terminal" do
+      {:ok, old_done} = Queries.insert(Repo, params())
+      {:ok, old_failed} = Queries.insert(Repo, params())
+      {:ok, fresh_done} = Queries.insert(Repo, params())
+      {:ok, runnable} = Queries.insert(Repo, params())
+
+      :ok = Queries.complete_done(Repo, old_done, ~s({}))
+      :ok = Queries.complete_stop(Repo, old_failed, "x")
+      :ok = Queries.complete_done(Repo, fresh_done, ~s({}))
+      age_past_retention([old_done, old_failed])
+
+      assert Queries.gc(Repo, 60_000, 100) == 2
+
+      assert exists?(runnable)
+      assert exists?(fresh_done)
+      refute exists?(old_done)
+      refute exists?(old_failed)
+    end
+
+    test "spares a terminal child whose parent is still mid-join" do
+      {:ok, parent} = Queries.insert(Repo, params())
+
+      Repo.query!(
+        "UPDATE gen_durable SET status = 'awaiting_children', children_pending = 1 WHERE id = $1",
+        [parent]
+      )
+
+      {:ok, child} = Queries.insert(Repo, params())
+      :ok = Queries.complete_done(Repo, child, ~s({}))
+      Repo.query!("UPDATE gen_durable SET parent_id = $1 WHERE id = $2", [parent, child])
+      age_past_retention(child)
+
+      # parent active ⇒ child kept (it may still be read on the join)
+      assert Queries.gc(Repo, 60_000, 100) == 0
+      assert exists?(child)
+
+      # parent terminal ⇒ both collectible
+      Repo.query!(
+        "UPDATE gen_durable SET status = 'done', updated_at = now() - interval '1 hour' WHERE id = $1",
+        [parent]
+      )
+
+      assert Queries.gc(Repo, 60_000, 100) == 2
+      refute exists?(child)
+      refute exists?(parent)
+    end
+
+    test "batch bounds the number deleted per sweep" do
+      ids =
+        for _ <- 1..3 do
+          {:ok, id} = Queries.insert(Repo, params())
+          :ok = Queries.complete_done(Repo, id, ~s({}))
+          id
+        end
+
+      age_past_retention(ids)
+
+      assert Queries.gc(Repo, 60_000, 2) == 2
+      assert Queries.gc(Repo, 60_000, 2) == 1
+      assert Queries.gc(Repo, 60_000, 2) == 0
     end
   end
 

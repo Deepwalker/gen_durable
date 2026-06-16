@@ -13,6 +13,11 @@ defmodule GenDurable.Supervisor do
       (default `[default: 10]`).
     * `:lease_ttl`, `:heartbeat_interval`, `:poll_interval`, `:reap_interval` —
       timings in ms (Balanced defaults: 60_000 / 20_000 / 1_000 / 30_000).
+    * `:gc_interval` — ms between GC sweeps of terminal rows (default `60_000`).
+      Set to `nil` to disable GC entirely (terminal rows then accumulate).
+    * `:gc_retention` — ms a `done`/`failed` row is kept after it terminates before
+      GC may delete it (default `86_400_000`, i.e. 1 day).
+    * `:gc_batch` — max rows deleted per GC sweep (default `10_000`).
     * `:prefetch` — extra rows each queue claims and buffers beyond its running
       slots (default `0` ⇒ no over-fetch). See `GenDurable.Scheduler`.
     * `:min_demand` — batch gate for the picker (default `1`).
@@ -35,6 +40,9 @@ defmodule GenDurable.Supervisor do
     heartbeat_interval: 20_000,
     poll_interval: 1_000,
     reap_interval: 30_000,
+    gc_interval: 60_000,
+    gc_retention: 86_400_000,
+    gc_batch: 10_000,
     prefetch: 0,
     min_demand: 1,
     max_poll_interval: 5_000,
@@ -88,9 +96,28 @@ defmodule GenDurable.Supervisor do
         {GenDurable.Registry, fsms: Keyword.fetch!(opts, :fsms)},
         {Task.Supervisor, name: task_sup},
         {GenDurable.Reaper, %{repo: repo, interval: Keyword.fetch!(opts, :reap_interval)}}
-      ] ++ schedulers
+      ] ++ gc_child(repo, opts) ++ schedulers
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  # GC is optional: `gc_interval: nil` omits the process entirely.
+  defp gc_child(repo, opts) do
+    case Keyword.fetch!(opts, :gc_interval) do
+      nil ->
+        []
+
+      interval ->
+        [
+          {GenDurable.GC,
+           %{
+             repo: repo,
+             interval: interval,
+             retention_ms: Keyword.fetch!(opts, :gc_retention),
+             batch: Keyword.fetch!(opts, :gc_batch)
+           }}
+        ]
+    end
   end
 
   defp worker_id(queue), do: "#{queue}@#{node()}-#{System.unique_integer([:positive])}"

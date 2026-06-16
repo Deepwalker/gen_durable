@@ -461,6 +461,21 @@ README, FSM/Context/Executor/Outcome docs updated; new test FSMs `Selector` (any
 `Collector` (accumulate {a,b,c} then sum) + engine tests for any-of / accumulation / terminal cleanup;
 outcome/queries/perf tests reworked. 71 tests green.
 
+### F16 — built-in GC of terminal rows ✅ DONE
+Terminal-row cleanup was a spec §8 non-goal (external cron); now it's built in. `GenDurable.GC` (a
+Reaper-style GenServer) sweeps every `:gc_interval` (default 60s), deleting up to `:gc_batch` (10k)
+`done`/`failed` rows whose `updated_at` — their immutable termination instant — is older than
+`:gc_retention` (default 1 day). It re-sweeps at once when a sweep fills the batch (drains a backlog).
+`Queries.gc/3` is two round-trips on purpose (background sweep): select ≤ `batch` doomed ids, then
+`DELETE … WHERE id = ANY($ids)` — a PK index scan, **O(batch)**. (A single `WHERE id IN (SELECT … LIMIT)`
+/ `USING` Seq-Scans the whole table for the semi-join — O(table), measured 410 ms vs 52 ms for 10k on 1M
+rows; see PERFORMANCE.md §4b.) A `NOT EXISTS` guard spares a terminal **child** whose parent is still
+active (`awaiting_children`/runnable/executing) so the join can still read it via `ctx.childs` (§11). A deleted parent SET-NULLs its children's `parent_id` (FK);
+`signals` cascade-delete. New partial index `gen_durable_gc (updated_at) WHERE status IN ('done','failed')`
+backs the sweep. `gc_interval: nil` omits the process entirely. Telemetry `[:gen_durable, :gc, :swept]`.
+Spec §8, README config, Supervisor/GenDurable docs updated; unit tests (retention / parent-join guard /
+batch bound) + engine tests (delete-after-terminate + :swept, and disable). 76 tests green.
+
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
   SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes
