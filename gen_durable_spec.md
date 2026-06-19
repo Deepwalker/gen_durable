@@ -67,22 +67,18 @@ Plain `SKIP LOCKED` already provides concurrent executors with no coordination. 
 
 **One concept** serves both signal addressing (§5) and uniqueness: a **`correlation_key`** (the instance's business identity) + a **scope** (the statuses in which the key is "occupied"). This is the durable-execution model — Temporal's Workflow ID, DBOS's workflow ID: the business key you assign is *both* how you find/signal the instance *and* how the engine deduplicates it; the internal `id` is the per-execution handle (≈ Temporal's Run ID). (Job queues like Oban have the uniqueness half but no addressing — instances aren't signalable; we are a durable-execution engine, so the two are the same key.)
 
-`correlation_guard` is a generated column: equal to the key while the current status is in the instance's `correlation_scope`, otherwise NULL (drops out of the index). A single partial unique index on `correlation_guard` does double duty — it enforces uniqueness **and** resolves the signal address. Per-key scope **and** single-statement batch insert, unlike Oban's imperative check.
-
-The user-facing surface is the **`:unique` policy**, which expands to a scope:
-
-- `:live` (default) — occupied in the non-terminal statuses; a terminal instance **frees** the key for reuse;
-- `:global` — occupied in every status; the key is **never** reused (until GC removes the terminal row).
-
-Properties:
+`correlation_guard` is a generated column: equal to the key while the current status is in the instance's `correlation_scope` (the statuses in which the key is "occupied," supplied by the caller per instance), otherwise NULL (drops out of the index). A single partial unique index on `correlation_guard` does double duty — it enforces uniqueness **and** resolves the signal address. Per-instance scope **and** single-statement batch insert, unlike Oban's imperative check.
 
 - per-instance opt-in: `correlation_key IS NULL` → neither addressable nor deduplicated (NULLs don't conflict in btree);
+- `correlation_scope` defaults to the non-terminal statuses — unique among live instances, the key freed on termination; pass the terminal statuses too to keep it reserved forever, or `[]` to drop uniqueness entirely;
 - the guard is recomputed on every status transition (free — the row is rewritten anyway);
-- leaving the occupied statuses (`:live` on termination) → the key is free for re-insertion;
-- collision: a new instance is rejected (`{:error, :duplicate}`) if a row with the same key currently sits in a status the policy considers occupied;
+- leaving the occupied statuses → the key is free for re-insertion;
+- collision: a new instance is rejected (`{:error, :duplicate}`) if a row with the same key currently sits in a status it considers occupied;
 - windowed uniqueness (Oban `period` style) — fold a coarse timestamp into the key, turning the window into key equality. No engine magic.
 
-`correlation_scope` is stored as `durable_status[]` (not `text[]`) so the generated guard stays IMMUTABLE — the enum→text cast (`enum_out`) is only STABLE. The `:unique` policy is the public surface; the raw scope is an implementation detail.
+`correlation_scope` is stored as `durable_status[]` (not `text[]`) so the generated guard stays IMMUTABLE — the enum→text cast (`enum_out`) is only STABLE.
+
+> **Note.** If `correlation_scope` includes a terminal status (`done`/`failed`), a finished instance still occupies its key — so `signal/4` resolves to that terminal row and silently parks a signal that the (already-ended) instance never reads. Keep terminal statuses out of the scope unless you specifically want the key reserved (not addressable-for-wakeup) after the instance ends.
 
 ## 8. Non-goals (v1)
 

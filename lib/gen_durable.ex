@@ -68,16 +68,18 @@ defmodule GenDurable do
   @doc """
   Enqueue one FSM instance. Options: `:state` (alias `:args`, the job-form name),
   `:step` (default the FSM's `:initial`), `:queue`, `:priority`, `:partition_key`,
-  `:correlation_key`, `:unique`, and scheduling — `:eligible_at` (a `DateTime`), or
-  the sugar `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
+  `:correlation_key`, `:correlation_scope`, and scheduling — `:eligible_at` (a `DateTime`),
+  or the sugar `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
   Returns `{:ok, id}` or `{:error, :duplicate}`.
 
   `:correlation_key` is the instance's business identity — both the key you can later
-  `signal/4` by (instead of the internal id) and a uniqueness guard. `:unique` is its
-  policy: `:live` (default) keeps it unique among non-terminal instances (a terminal one
-  frees the key for reuse); `:global` keeps it unique across all statuses (never reused).
-  A duplicate under the active policy is rejected as `{:error, :duplicate}`. With no
-  `:correlation_key` the instance is neither addressable nor deduplicated.
+  `signal/4` by (instead of the internal id) and a uniqueness guard. `:correlation_scope`
+  is the list of statuses in which the key is "occupied": uniqueness is enforced and the
+  signal address resolves only while the instance sits in one of them. It defaults to the
+  non-terminal statuses (unique among live instances; freed on termination); pass `[]` to
+  disable uniqueness, or include `:done`/`:failed` to keep the key reserved after the
+  instance ends. A duplicate within the occupied scope is rejected as `{:error, :duplicate}`.
+  With no `:correlation_key` the instance is neither addressable nor deduplicated.
   """
   def insert(fsm_module, opts \\ []) do
     repo = opts[:repo] || config().repo
@@ -100,7 +102,7 @@ defmodule GenDurable do
 
   `target` is either the internal id (an integer) or a `:correlation_key` (a string) set
   at insert. Addressing by `correlation_key` resolves to the single instance currently
-  occupying it (per its `:unique` policy); if none exists it returns `{:error, :no_target}`
+  occupying it (per its `:correlation_scope`); if none exists it returns `{:error, :no_target}`
   (a freed/terminal key can no longer be woken, and a signal is not held for an instance
   that does not exist yet). Returns `:ok` otherwise.
   """
@@ -131,24 +133,20 @@ defmodule GenDurable do
       priority: opts[:priority] || 0,
       partition_key: opts[:partition_key],
       correlation_key: opts[:correlation_key],
-      correlation_scope: correlation_scope(opts[:unique] || :live),
+      correlation_scope: correlation_scope(opts),
       eligible_at: resolve_eligible_at(opts)
     }
   end
 
-  # Statuses in which a correlation_key is "occupied" — the :unique policy expands to a
-  # status set the engine enforces uniqueness over (and addresses signals within):
-  #   :live   — the non-terminal statuses; a terminal instance frees the key for reuse.
-  #   :global — every status; the key is never reusable (until GC removes the row).
+  # The statuses in which a correlation_key is "occupied": the engine enforces uniqueness
+  # over them and resolves the signal address within them. Supplied directly as
+  # :correlation_scope; defaults to the non-terminal statuses (unique among live instances,
+  # freed on termination). Pass [] for a key with no uniqueness, or include :done/:failed
+  # to keep it reserved after the instance ends.
   @live_statuses ~w(runnable executing awaiting_signal awaiting_children)
-  @all_statuses @live_statuses ++ ~w(done failed)
 
-  defp correlation_scope(:live), do: @live_statuses
-  defp correlation_scope(:global), do: @all_statuses
-
-  defp correlation_scope(other),
-    do:
-      raise(ArgumentError, "invalid :unique policy #{inspect(other)} (expected :live or :global)")
+  defp correlation_scope(opts),
+    do: Enum.map(opts[:correlation_scope] || @live_statuses, &to_string/1)
 
   # Scheduling sugar. Precedence: explicit :eligible_at, then :schedule_at
   # (a DateTime), then :schedule_in (milliseconds from now). nil ⇒ now() in SQL.

@@ -298,7 +298,7 @@ defmodule GenDurable.QueriesTest do
       assert {:error, :no_target} = Queries.deliver_signal(Repo, "nope", "go", ~s({}), nil)
     end
 
-    test "a :live key is freed on termination; not a target, reusable for a new instance" do
+    test "a key is freed on termination; not a target, reusable for a new instance" do
       {:ok, old} =
         Queries.insert(
           Repo,
@@ -422,7 +422,7 @@ defmodule GenDurable.QueriesTest do
       assert {:ok, _} = Queries.insert(Repo, params())
     end
 
-    test "leaving the occupied scope frees the key for re-insertion (:live)" do
+    test "leaving the occupied scope frees the key for re-insertion" do
       key = "k9"
       scope = ["runnable", "executing"]
 
@@ -434,7 +434,7 @@ defmodule GenDurable.QueriesTest do
                Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
     end
 
-    test "a :global scope keeps the key occupied after termination (no reuse)" do
+    test "a scope including terminal statuses reserves the key after termination (no reuse)" do
       key = "g1"
       scope = ~w(runnable executing awaiting_signal awaiting_children done failed)
 

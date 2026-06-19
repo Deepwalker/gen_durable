@@ -92,10 +92,10 @@ defmodule GenDurable.Migration do
       children_pending int not null default 0,
 
       -- correlation_key: the instance's business identity — both the signal address
-      -- (§5) and the uniqueness guard (§7). correlation_scope is the set of statuses
-      -- in which the key is "occupied" (the :unique policy expands to it): :live = the
-      -- non-terminal statuses, :global = all of them. The guard equals the key while
-      -- the status is occupied, else NULL (drops out of the unique/address index).
+      -- (§5) and the uniqueness guard (§7). correlation_scope is the set of statuses in
+      -- which the key is "occupied", supplied by the caller (defaults to the non-terminal
+      -- statuses ⇒ unique among live, freed on termination). The guard equals the key
+      -- while the status is occupied, else NULL (drops out of the unique/address index).
       -- scope is durable_status[] (not text[]) so the generated column stays IMMUTABLE
       -- — the enum->text cast (enum_out) is only STABLE.
       correlation_key   text,
@@ -132,7 +132,7 @@ defmodule GenDurable.Migration do
     # correlation_key: one partial unique index does double duty — it enforces
     # uniqueness among "occupied" statuses (per the :unique policy / scope) AND backs
     # the address lookup in deliver_signal (`correlation_guard = $1` resolves to the
-    # single occupied instance). A terminal :live row drops out, freeing the key.
+    # single occupied instance). A row whose status leaves the scope drops out, freeing the key.
     execute("""
     CREATE UNIQUE INDEX gen_durable_correlation ON #{p}.gen_durable (correlation_guard)
       WHERE correlation_guard IS NOT NULL

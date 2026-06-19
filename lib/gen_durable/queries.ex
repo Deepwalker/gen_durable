@@ -417,8 +417,8 @@ defmodule GenDurable.Queries do
   # An integer target is the id itself (the FK enforces existence). A string is a
   # correlation_key — resolved via `correlation_guard` (the partial unique index) to
   # the single occupied instance carrying it, or nil if none: an instance whose key is
-  # no longer occupied (a terminal :live row) can no longer be woken, and we do not
-  # durably hold a signal for an instance that does not exist yet.
+  # no longer occupied (its status left correlation_scope) can no longer be woken, and we
+  # do not durably hold a signal for an instance that does not exist yet.
   defp resolve_target(_repo, id) when is_integer(id), do: id
 
   defp resolve_target(repo, key) when is_binary(key) do

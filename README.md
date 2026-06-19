@@ -162,12 +162,13 @@ off cross-node fairness, priority freshness, and crash blast radius. See
 `GenDurable.Scheduler` for the trade-offs.
 
 Per-instance options to `insert/2` / `insert_all/3`: `:state`, `:step`, `:queue`,
-`:priority`, `:partition_key`, `:correlation_key`, `:unique`, and scheduling sugar
-`:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`) / `:schedule_in` (ms).
+`:priority`, `:partition_key`, `:correlation_key`, `:correlation_scope`, and scheduling
+sugar `:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`) / `:schedule_in` (ms).
 `:correlation_key` is the instance's business identity — both the key you can later
-`signal/4` by (instead of the internal id) **and** a uniqueness guard. `:unique` is its
-policy: `:live` (default, unique among non-terminal instances; freed on termination) or
-`:global` (unique forever). A duplicate under the policy is rejected as `{:error, :duplicate}`.
+`signal/4` by (instead of the internal id) **and** a uniqueness guard. `:correlation_scope`
+is the statuses in which the key is "occupied" (uniqueness + addressing apply); it defaults
+to the non-terminal statuses (unique among live, freed on termination). A duplicate within
+the occupied scope is rejected as `{:error, :duplicate}`.
 
 ## Development
 

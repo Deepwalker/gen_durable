@@ -130,7 +130,7 @@ end
   state: %{order: 42},
   partition_key: "order:42",
   priority: 0,
-  correlation_key: "order:42", unique: :live)   # signal address + uniqueness (default :live)
+  correlation_key: "order:42")   # signal address + uniqueness (scope defaults to the live statuses)
 
 # Batch (single statement, dedup via the partial unique index)
 GenDurable.insert_all(Checkout, [ %{...}, %{...} ])
@@ -492,13 +492,17 @@ internal `id` — so the caller no longer maps its own key to the engine's id. C
 workflow ID). `unique_key`/`unique_scope`/`unique_guard` and the never-shipped `external_id` were
 **merged** into `correlation_key` (text) + `correlation_scope` (durable_status[]) + `correlation_guard`
 (generated). One partial unique index `gen_durable_correlation (correlation_guard)` does double duty —
-uniqueness **and** the address lookup (`correlation_guard = $key`). The public surface is a `:unique`
-policy that expands to a scope: `:live` (default — occupied in non-terminal statuses, freed on
-termination) and `:global` (occupied always, never reused). `signal/4` accepts an integer id (trusts the
-FK) or a string correlation_key (resolved via the guard, else `{:error, :no_target}` — no durable
-pending-signal, no waking a freed/terminal key). A duplicate under the active policy is `{:error,
+uniqueness **and** the address lookup (`correlation_guard = $key`). `correlation_scope` (a
+`durable_status[]`) is the statuses in which the key is occupied — supplied by the caller, defaulting to
+the non-terminal statuses (unique among live, freed on termination). `signal/4` accepts an integer id
+(trusts the FK) or a string correlation_key (resolved via the guard, else `{:error, :no_target}` — no
+durable pending-signal, no waking a freed key). A duplicate within the occupied scope is `{:error,
 :duplicate}` (uniform — the old external_id hard-raise is gone). Spec §5/§7/§9/§10/§11, README, moduledocs
-updated; unit + engine tests. 85 tests green.
+updated; unit + engine tests.
+
+(An earlier cut exposed a `:unique` policy enum — `:live`/`:global` — over the scope; dropped as needless
+indirection. The raw scope is the surface; the only nuance is that putting a terminal status in scope
+makes a finished instance still resolve as a signal target, see spec §7 note.)
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
