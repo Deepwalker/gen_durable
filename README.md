@@ -1,6 +1,14 @@
 # gen_durable
 
-A Postgres-backed durable FSM engine for Elixir, on top of GenServer.
+A Postgres-backed durable-execution engine for Elixir. You declare a finite-state
+machine; the engine commits its state to Postgres before each step proceeds, so an
+instance survives process and node death and resumes where it left off.
+
+Inspired by durable-execution systems (Temporal, DBOS) and Postgres-backed job runners
+(Oban) — but the unit of durability is an explicit FSM step, and the state lives in the
+database, not in a process. There is **no GenServer per instance**: an FSM is a row, and
+each step runs as an ephemeral task. The runtime backbone (scheduler, reaper, GC) is a
+small set of GenServers that pick runnable rows and dispatch them.
 
 **The one guarantee:** on step completion, the new state is committed to the database
 before execution proceeds. On a crash before commit, the step re-executes from scratch
@@ -26,7 +34,7 @@ See [`gen_durable_spec.md`](gen_durable_spec.md) for the normative specification
 | Outcome | Effect |
 |---|---|
 | `{:next, step, state}` | transition to `step`, `runnable`, `attempt := 0` |
-| `{:replay, state, delay_ms}` | same step again, `runnable`, `attempt += 1`, after `delay_ms` |
+| `{:retry, state, delay_ms}` | same step again, `runnable`, `attempt += 1`, after `delay_ms` |
 | `{:await, names, next_step, state}` | park (`awaiting_signal`) on one name or a set; when any arrives, run `next_step` with the matched signals as `ctx.awaited` |
 | `{:schedule_childs, next_step, children, state}` | spawn `children`, park on the join barrier (`awaiting_children`); run `next_step` once all finish |
 | `{:done, result}` | terminal, `done` |
@@ -87,7 +95,7 @@ defmodule Checkout do
 
   @impl true
   def handle(reason, ctx) do
-    if ctx.attempt < 5, do: {:replay, ctx.state, 1_000 * ctx.attempt}, else: {:stop, reason}
+    if ctx.attempt < 5, do: {:retry, ctx.state, 1_000 * ctx.attempt}, else: {:stop, reason}
   end
 end
 ```
@@ -111,8 +119,10 @@ children = [
   {GenDurable, repo: MyApp.Repo, queues: [default: 10, checkout: 5]}
 ]
 
-{:ok, id} = GenDurable.insert(Checkout, state: %{order: 42}, partition_key: "order:42")
-:ok = GenDurable.signal(id, "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
+{:ok, _id} = GenDurable.insert(Checkout, state: %{order: 42}, correlation_key: "order:42")
+
+# address the signal by the returned internal id, or by the correlation_key you set:
+:ok = GenDurable.signal("order:42", "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
 ```
 
 You don't list your FSM modules: they're resolved from the row (the `fsm` column
@@ -152,8 +162,12 @@ off cross-node fairness, priority freshness, and crash blast radius. See
 `GenDurable.Scheduler` for the trade-offs.
 
 Per-instance options to `insert/2` / `insert_all/3`: `:state`, `:step`, `:queue`,
-`:priority`, `:partition_key`, `:unique_key`, `:unique_scope`, and scheduling sugar
+`:priority`, `:partition_key`, `:correlation_key`, `:unique`, and scheduling sugar
 `:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`) / `:schedule_in` (ms).
+`:correlation_key` is the instance's business identity — both the key you can later
+`signal/4` by (instead of the internal id) **and** a uniqueness guard. `:unique` is its
+policy: `:live` (default, unique among non-terminal instances; freed on termination) or
+`:global` (unique forever). A duplicate under the policy is rejected as `{:error, :duplicate}`.
 
 ## Development
 

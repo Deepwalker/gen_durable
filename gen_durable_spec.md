@@ -1,12 +1,12 @@
 # gen_durable — durable FSM engine: specification and schema
 
-Status: normative draft v1, plus §11 `schedule_childs` (schema version 2). Postgres-backed engine for long-running FSMs on top of GenServer.
+Status: normative draft v1, plus §11 `schedule_childs` (schema version 2). Postgres-backed durable-execution engine for long-running FSMs — an FSM is a row, not a process; the runtime backbone is a small set of GenServers.
 
 ## 1. Guarantee
 
 The engine's only guarantee: **on step completion, the new state is committed to the database before execution proceeds.** On a crash before commit, the step re-executes from scratch (at-least-once). Idempotency of step effects is the user's responsibility.
 
-The engine guarantees exactly-once of nothing: not delivery, not effects. `:replay`, retries, and failure policy are user decisions; the engine does not guess them.
+The engine guarantees exactly-once of nothing: not delivery, not effects. `:retry`, retries, and failure policy are user decisions; the engine does not guess them.
 
 The unit of re-execution is the **whole step**. Everything inside a step re-runs as one bundle on re-execution; the user makes the entire step idempotent, not individual effects. Hence the practice: keep steps small.
 
@@ -25,20 +25,20 @@ A step, and the error handler `handle/2`, return one of:
 | Outcome | Effect | `attempt` | `eligible_at` |
 |---|---|---|---|
 | `{:next, step, state}` | transition to `step`, `runnable` | `:= 0` | `now()` |
-| `{:replay, state, delay_ms}` | same step again, `runnable` | `+1` | `now() + delay_ms` |
+| `{:retry, state, delay_ms}` | same step again, `runnable` | `+1` | `now() + delay_ms` |
 | `{:await, names, next_step, state}` | park, `awaiting_signal`, `awaits := names` (one name or a set), `step := next_step`; on any match, run `next_step` with `ctx.awaited` | — | — |
 | `{:schedule_childs, step, children, state}` | spawn `children`, park `awaiting_children`; on barrier release advance to `step`, `runnable` (see §11) | `:= 0` | `now()` on release |
 | `{:done, result}` | terminal, `done`, `result` recorded | — | — |
 | `{:stop, reason}` | terminal, `failed`, `last_error := reason` | — | — |
 
-Backoff for `:replay` is computed by the user from `attempt` (available in the step context and in `handle/2`). The engine does not compute the delay.
+Backoff for `:retry` is computed by the user from `attempt` (available in the step context and in `handle/2`). The engine does not compute the delay.
 
 ## 4. Three sources of re-execution
 
 Not to be conflated:
 
-1. **explicit `:replay`** from a step — controlled retry;
-2. **caught exception** → the engine calls `handle(reason, ctx)`, where `ctx = %{id, fsm, fsm_version, step, attempt, state}`; the handler returns any outcome from §3, including `:replay` or `:stop`. If `handle/2` itself raises — `failed`;
+1. **explicit `:retry`** from a step — controlled retry;
+2. **caught exception** → the engine calls `handle(reason, ctx)`, where `ctx = %{id, fsm, fsm_version, step, attempt, state}`; the handler returns any outcome from §3, including `:retry` or `:stop`. If `handle/2` itself raises — `failed`;
 3. **worker crash** (no outcome returned, lease expired) → the reaper moves the row back to `runnable`, `attempt + 1`, and the step runs from scratch. `handle/2` is **not** called — this is the at-least-once safety floor, not an `:error`.
 
 ## 5. await and signals
@@ -47,9 +47,11 @@ Not to be conflated:
 
 A signal into an await must be durable (a row in `signals`), at-least-once. Loss is not allowed — otherwise the instance hangs forever; duplicates are allowed (caught by dedup or the step itself). Delivery inserts the signal row **before** flipping to `runnable`, so on wake-up `next_step` already sees it in the inbox.
 
-**Consumption is by received id, on progress.** `await` itself deletes nothing. When the woken step *progresses* (`:next`/`:schedule_childs`), its outcome transaction deletes exactly the signal ids it received in `ctx.awaited` — **not** by name. So a signal of an awaited name that arrives *after* the step's snapshot (which the step never saw) is not deleted, and never-awaited signals are never touched. This also lets a step **accumulate a pack**: re-await (which consumes nothing) until `ctx.awaited` holds the whole set, then progress once, consuming it all. `:replay` consumes nothing and keeps `awaits` (the redo must see the same inputs). A **terminal** outcome (`:done`/`:stop`) deletes the *whole* inbox — the instance is finished, so nothing will read its signals again (cleanup).
+**Consumption is by received id, on progress.** `await` itself deletes nothing. When the woken step *progresses* (`:next`/`:schedule_childs`), its outcome transaction deletes exactly the signal ids it received in `ctx.awaited` — **not** by name. So a signal of an awaited name that arrives *after* the step's snapshot (which the step never saw) is not deleted, and never-awaited signals are never touched. This also lets a step **accumulate a pack**: re-await (which consumes nothing) until `ctx.awaited` holds the whole set, then progress once, consuming it all. `:retry` consumes nothing and keeps `awaits` (the redo must see the same inputs). A **terminal** outcome (`:done`/`:stop`) deletes the *whole* inbox — the instance is finished, so nothing will read its signals again (cleanup).
 
 **No lost wake-up.** A signal can arrive before the step has parked (delivery sees the instance still `executing`, so the flip is a no-op but the row is inserted). To avoid a hang, parking is guarded: `:await` commits as `runnable` (at `next_step`) instead of `awaiting_signal` when a matching signal is already in the inbox, so `next_step` runs at once. Combined with the row lock, every interleaving of deliver vs. park ends with the instance either flipped or already runnable.
+
+**Addressing.** A signal targets an instance by its internal `id`, or by an optional **`correlation_key`** — a business key (e.g. `"order:42"`) stamped at insert. The same key is the engine's uniqueness guard (§7): it resolves to the single instance currently *occupying* it (per the key's `:unique` policy), via the partial unique index on `correlation_guard` (`correlation_guard = $key`). Addressing a key that no instance occupies is a no-op error (`{:error, :no_target}`) — a freed/terminal key can no longer be woken, and the engine does **not** durably hold a signal for an instance that does not exist yet. The internal-id path trusts the FK. This removes the caller's need to map its own business key to the engine's `id`.
 
 ## 6. Scheduler
 
@@ -61,17 +63,26 @@ The picker is dumb: it selects `runnable` rows whose `eligible_at` has arrived, 
 
 Plain `SKIP LOCKED` already provides concurrent executors with no coordination. Picker sharding (`hashtext(partition_key) % N`) is only worth it once head-of-queue contention shows up in a profile; it requires membership/rebalancing and works against the dumb-picker principle.
 
-## 7. Uniqueness
+## 7. Correlation key: identity = addressing + uniqueness
 
-Uniqueness = **key** (user function, stored verbatim, no transformation) + **scope** (the statuses in which the key is "occupied," set by the user per job).
+**One concept** serves both signal addressing (§5) and uniqueness: a **`correlation_key`** (the instance's business identity) + a **scope** (the statuses in which the key is "occupied"). This is the durable-execution model — Temporal's Workflow ID, DBOS's workflow ID: the business key you assign is *both* how you find/signal the instance *and* how the engine deduplicates it; the internal `id` is the per-execution handle (≈ Temporal's Run ID). (Job queues like Oban have the uniqueness half but no addressing — instances aren't signalable; we are a durable-execution engine, so the two are the same key.)
 
-`unique_guard` is a generated column: equal to the key while the current status is in the instance's `unique_scope`, otherwise NULL (drops out of the index). A single partial unique index on `unique_guard`. This delivers per-job scope **and** single-statement batch insert, unlike Oban's imperative check.
+`correlation_guard` is a generated column: equal to the key while the current status is in the instance's `correlation_scope`, otherwise NULL (drops out of the index). A single partial unique index on `correlation_guard` does double duty — it enforces uniqueness **and** resolves the signal address. Per-key scope **and** single-statement batch insert, unlike Oban's imperative check.
 
-- per-job opt-in: `unique_key IS NULL` → not deduplicated (NULLs don't conflict in btree);
+The user-facing surface is the **`:unique` policy**, which expands to a scope:
+
+- `:live` (default) — occupied in the non-terminal statuses; a terminal instance **frees** the key for reuse;
+- `:global` — occupied in every status; the key is **never** reused (until GC removes the terminal row).
+
+Properties:
+
+- per-instance opt-in: `correlation_key IS NULL` → neither addressable nor deduplicated (NULLs don't conflict in btree);
 - the guard is recomputed on every status transition (free — the row is rewritten anyway);
-- leaving the "occupied" statuses → the key is free for re-insertion;
-- collision: a new job is rejected if a row with the same key currently sits in a status that **it** considers occupied;
-- windowed uniqueness (Oban `period` style) — the user folds a coarse timestamp into the key, turning the window into key equality. No engine magic.
+- leaving the occupied statuses (`:live` on termination) → the key is free for re-insertion;
+- collision: a new instance is rejected (`{:error, :duplicate}`) if a row with the same key currently sits in a status the policy considers occupied;
+- windowed uniqueness (Oban `period` style) — fold a coarse timestamp into the key, turning the window into key equality. No engine magic.
+
+`correlation_scope` is stored as `durable_status[]` (not `text[]`) so the generated guard stays IMMUTABLE — the enum→text cast (`enum_out`) is only STABLE. The `:unique` policy is the public surface; the raw scope is an implementation detail.
 
 ## 8. Non-goals (v1)
 
@@ -118,15 +129,15 @@ create table gen_durable (
   parent_id        bigint references gen_durable(id) on delete set null,
   children_pending int not null default 0,           -- non-terminal children left to join on
 
-  -- uniqueness
-  unique_key    bytea,                              -- user function result, verbatim
-  unique_scope  durable_status[] not null default '{}', -- statuses in which the key is "occupied"
-  unique_guard  bytea generated always as (
-    case when unique_key is not null and status = any(unique_scope)
-         then unique_key end
-  ) stored,                                         -- NB: scope is durable_status[], not text[] —
-                                                    -- a generated column must be IMMUTABLE, and the
-                                                    -- enum->text cast (enum_out) is only STABLE.
+  -- correlation key: business identity = signal address (§5) + uniqueness guard (§7)
+  correlation_key   text,                            -- the key the user assigns (e.g. "order:42")
+  correlation_scope durable_status[] not null default '{}', -- statuses in which the key is "occupied"
+  correlation_guard text generated always as (       -- = key while occupied, else NULL
+    case when correlation_key is not null and status = any(correlation_scope)
+         then correlation_key end
+  ) stored,                                          -- NB: scope is durable_status[], not text[] —
+                                                     -- a generated column must be IMMUTABLE, and the
+                                                     -- enum->text cast (enum_out) is only STABLE.
 
   inserted_at   timestamptz not null default now(),
   updated_at    timestamptz not null default now()
@@ -140,9 +151,10 @@ create index gen_durable_pick on gen_durable (queue, priority, eligible_at)
 create index gen_durable_lease on gen_durable (lease_expires_at)
   where status = 'executing';
 
--- uniqueness among "occupied" statuses, per-job scope
-create unique index gen_durable_unique on gen_durable (unique_guard)
-  where unique_guard is not null;
+-- one index, two jobs: uniqueness among "occupied" statuses (§7) AND the signal
+-- address lookup `correlation_guard = $key` (§5)
+create unique index gen_durable_correlation on gen_durable (correlation_guard)
+  where correlation_guard is not null;
 
 -- fan-in barrier: a parent's children, and the join decrement (§11)
 create index gen_durable_parent on gen_durable (parent_id)
@@ -204,7 +216,7 @@ where status = 'executing' and lease_expires_at < now();
 ### Step outcomes (one transaction per outcome)
 
 Consume rules (§5): `:next`/`:schedule_childs` delete exactly the awaited ids the step received
-(`$consumed`, a `bigint[]`); `:done`/`:stop` delete the whole inbox (cleanup); `:replay`/`:await`
+(`$consumed`, a `bigint[]`); `:done`/`:stop` delete the whole inbox (cleanup); `:retry`/`:await`
 consume nothing. The consume rides each statement as a leading data-modifying CTE.
 
 ```sql
@@ -217,7 +229,7 @@ set step = $next, state = $state, status = 'runnable', eligible_at = now(),
     attempt = 0, awaits = null, locked_by = null, lease_expires_at = null, updated_at = now()
 where id = $id;
 
--- :replay  (redo the same step — consumes nothing, KEEPS awaits so the redo sees the same inputs)
+-- :retry  (redo the same step — consumes nothing, KEEPS awaits so the redo sees the same inputs)
 update gen_durable
 set state = $state, status = 'runnable', eligible_at = now() + $delay_ms,
     attempt = attempt + 1, locked_by = null, lease_expires_at = null, updated_at = now()
@@ -235,10 +247,10 @@ where id = $id;
 with ins as (
   insert into gen_durable
     (fsm, step, state, queue, priority, partition_key,
-     unique_key, unique_scope, eligible_at, parent_id)
+     eligible_at, correlation_key, correlation_scope, parent_id)
   values
     (...), (...)                                      -- one row per child, parent_id = $id
-  on conflict (unique_guard) where unique_guard is not null do nothing
+  on conflict (correlation_guard) where correlation_guard is not null do nothing
   returning 1
 )
 update gen_durable
@@ -282,6 +294,8 @@ where c.id = $id and c.parent_id = p.id;
 
 ### Signal delivery (sender side, one transaction)
 
+`$id` is the internal id, or resolved from a `correlation_key` first (§5): `select id from gen_durable where correlation_guard = $key` (the guard is NULL unless the key is occupied) — no row ⇒ `{:error, :no_target}`, no insert.
+
 ```sql
 insert into signals (target_id, name, payload, dedup_key)
 values ($id, $name, $payload, $dedup) on conflict (target_id, dedup_key) do nothing;
@@ -296,10 +310,10 @@ where id = $id and status = 'awaiting_signal' and $name = any(awaits);
 
 ```sql
 insert into gen_durable
-  (fsm, step, state, queue, priority, partition_key, unique_key, unique_scope, eligible_at)
+  (fsm, step, state, queue, priority, partition_key, eligible_at, correlation_key, correlation_scope)
 values
   (...), (...), (...)
-on conflict (unique_guard) where unique_guard is not null
+on conflict (correlation_guard) where correlation_guard is not null
 do nothing
 returning id;
 ```
@@ -312,7 +326,7 @@ One index catches duplicates both against existing rows and within the batch its
 
 `schedule_childs` is one outcome that does two things atomically: it spawns a batch of child instances and parks the parent on a **join barrier** that releases only when every child has reached a terminal status (`done` **or** `failed`). It is the engine's answer to "fan work out, then wait for all of it." Schema version 2 (`awaiting_children`, `parent_id`, `children_pending`, `gen_durable_parent`) backs it.
 
-**Shape.** `{:schedule_childs, next_step, children, state}`. `children` is a list of child specs, each an ordinary insert: `fsm`, `version`, `step`, `state`, `queue`, `priority`, `partition_key`, `unique_key`, `unique_scope`, `eligible_at`. The engine stamps every child's `parent_id` with the parent's id. It is shaped like `:next` — the parent advances to `next_step` — but the transition is gated behind the barrier, so the parent re-runs at `next_step` (never at the spawning step), and there is no "re-run re-spawns" ambiguity.
+**Shape.** `{:schedule_childs, next_step, children, state}`. `children` is a list of child specs, each an ordinary insert: `fsm`, `version`, `step`, `state`, `queue`, `priority`, `partition_key`, `correlation_key`, `:unique`, `eligible_at`. The engine stamps every child's `parent_id` with the parent's id. It is shaped like `:next` — the parent advances to `next_step` — but the transition is gated behind the barrier, so the parent re-runs at `next_step` (never at the spawning step), and there is no "re-run re-spawns" ambiguity.
 
 **Atomic spawn + park.** The whole thing is the parent's step-completion transaction (§10): the children are inserted **and** the parent flips to `awaiting_children` in one commit. Children become visible (`runnable`) only once that commits — a child can never finish and try to release a barrier that does not yet exist. `children_pending` is set to the number of children **actually inserted** (per-child uniqueness may drop some); if zero are inserted the barrier is pre-satisfied and the parent goes straight to `next_step`, `runnable`.
 
@@ -322,4 +336,4 @@ One index catches duplicates both against existing rows and within the batch its
 
 **Failures.** The barrier waits for *termination*, not success: a child that ends `failed` still releases its slot. The parent sees `status: "failed"` + `last_error` in `ctx.childs` and decides (proceed, `:stop`, compensate). The engine does not auto-propagate child failure.
 
-**Not covered.** No cancel/cascade — terminating or failing a parent does not touch its children, and vice-versa. No quorum / `k`-of-`n` barrier — the join is all-or-nothing; quorum is the user's to build with `await` + per-child signals. No barrier deadline — a child that hangs forever hangs the parent; bound it inside the child (e.g. `:replay` with a timeout). Nesting is free: a child may itself `schedule_childs`, each level an independent barrier.
+**Not covered.** No cancel/cascade — terminating or failing a parent does not touch its children, and vice-versa. No quorum / `k`-of-`n` barrier — the join is all-or-nothing; quorum is the user's to build with `await` + per-child signals. No barrier deadline — a child that hangs forever hangs the parent; bound it inside the child (e.g. `:retry` with a timeout). Nesting is free: a child may itself `schedule_childs`, each level an independent barrier.

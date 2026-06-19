@@ -115,15 +115,15 @@ defmodule GenDurable.EngineTest do
     assert Jason.decode!(row.result) == %{"got" => %{"v" => 9}}
   end
 
-  test "a replay on an await step re-sees ctx.awaited across the redo" do
+  test "a retry on an await step re-sees ctx.awaited across the redo" do
     start_engine()
-    {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitReplay)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitRetry)
 
     wait_status(id, "awaiting_signal")
     :ok = GenDurable.signal(id, "go", %{"v" => 5})
 
-    # "woke" replays once (attempt 0), then finishes (attempt 1). It would crash on
-    # hd([]) if the replay had cleared awaits / consumed the signal.
+    # "woke" retries once (attempt 0), then finishes (attempt 1). It would crash on
+    # hd([]) if the retry had cleared awaits / consumed the signal.
     row = wait_status(id, "done")
     assert Jason.decode!(row.result) == %{"v" => 5, "attempt" => 1}
   end
@@ -137,6 +137,18 @@ defmodule GenDurable.EngineTest do
 
     row = wait_status(id, "done")
     assert Jason.decode!(row.result) == %{"decision" => "reject", "by" => %{"why" => "nope"}}
+  end
+
+  test "a signal addressed by correlation_key wakes the instance" do
+    start_engine()
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Awaiter, correlation_key: "cust:42")
+
+    wait_status(id, "awaiting_signal")
+    # deliver by the business key, never having seen the internal id
+    :ok = GenDurable.signal("cust:42", "go", %{"v" => 11})
+
+    row = wait_status(id, "done")
+    assert Jason.decode!(row.result) == %{"got" => %{"v" => 11}}
   end
 
   test "await accumulates a pack across re-awaits, then processes all of it" do
@@ -166,7 +178,7 @@ defmodule GenDurable.EngineTest do
     assert GenDurable.Queries.load_signals(Repo, id) == []
   end
 
-  test "caught exception routes to handle/2, which replays then stops" do
+  test "caught exception routes to handle/2, which retries then stops" do
     start_engine()
     {:ok, id} = GenDurable.insert(GenDurable.Test.Crasher)
 

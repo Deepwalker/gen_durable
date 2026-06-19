@@ -91,11 +91,18 @@ defmodule GenDurable.Migration do
       parent_id        bigint references #{p}.gen_durable(id) on delete set null,
       children_pending int not null default 0,
 
-      unique_key    bytea,
-      unique_scope  #{p}.durable_status[] not null default '{}',
-      unique_guard  bytea generated always as (
-        case when unique_key is not null and status = any(unique_scope)
-             then unique_key end
+      -- correlation_key: the instance's business identity — both the signal address
+      -- (§5) and the uniqueness guard (§7). correlation_scope is the set of statuses
+      -- in which the key is "occupied" (the :unique policy expands to it): :live = the
+      -- non-terminal statuses, :global = all of them. The guard equals the key while
+      -- the status is occupied, else NULL (drops out of the unique/address index).
+      -- scope is durable_status[] (not text[]) so the generated column stays IMMUTABLE
+      -- — the enum->text cast (enum_out) is only STABLE.
+      correlation_key   text,
+      correlation_scope #{p}.durable_status[] not null default '{}',
+      correlation_guard text generated always as (
+        case when correlation_key is not null and status = any(correlation_scope)
+             then correlation_key end
       ) stored,
 
       inserted_at   timestamptz not null default now(),
@@ -122,9 +129,13 @@ defmodule GenDurable.Migration do
       WHERE status = 'executing' AND partition_key IS NOT NULL
     """)
 
+    # correlation_key: one partial unique index does double duty — it enforces
+    # uniqueness among "occupied" statuses (per the :unique policy / scope) AND backs
+    # the address lookup in deliver_signal (`correlation_guard = $1` resolves to the
+    # single occupied instance). A terminal :live row drops out, freeing the key.
     execute("""
-    CREATE UNIQUE INDEX gen_durable_unique ON #{p}.gen_durable (unique_guard)
-      WHERE unique_guard IS NOT NULL
+    CREATE UNIQUE INDEX gen_durable_correlation ON #{p}.gen_durable (correlation_guard)
+      WHERE correlation_guard IS NOT NULL
     """)
 
     execute("""

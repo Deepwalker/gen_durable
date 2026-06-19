@@ -12,7 +12,7 @@ defmodule GenDurable.Executor do
   (only the signals whose name is in the set it parked on) and the whole inbox as
   `ctx.all`. On a progressing outcome the engine deletes exactly the `ctx.awaited`
   ids the step received — latecomers and never-awaited signals survive; a terminal
-  outcome clears the whole inbox (cleanup); `:replay`/`:await` delete nothing.
+  outcome clears the whole inbox (cleanup); `:retry`/`:await` delete nothing.
   Deletion happens in SQL, by id.
   """
 
@@ -81,14 +81,14 @@ defmodule GenDurable.Executor do
   end
 
   # `consumed` is the awaited-signal ids to delete on a progressing outcome; terminal
-  # outcomes delete the whole inbox regardless (cleanup), :replay/:await delete nothing.
+  # outcomes delete the whole inbox regardless (cleanup), :retry/:await delete nothing.
   defp apply_outcome(repo, state_module, id, outcome, consumed) do
     case outcome do
       {:next, step, state} ->
         Queries.complete_next(repo, id, step, State.to_db(state_module, state), consumed)
 
-      {:replay, state, delay} ->
-        Queries.complete_replay(repo, id, State.to_db(state_module, state), delay)
+      {:retry, state, delay} ->
+        Queries.complete_retry(repo, id, State.to_db(state_module, state), delay)
 
       {:await, names, next_step, state} ->
         Queries.complete_await(repo, id, State.to_db(state_module, state), names, next_step)

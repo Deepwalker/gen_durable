@@ -6,6 +6,7 @@ defmodule GenDurable.QueriesTest do
 
   @worker "test-worker"
   @ttl 60_000
+  @live_scope ~w(runnable executing awaiting_signal awaiting_children)
 
   setup do
     Repo.query!("TRUNCATE gen_durable, signals RESTART IDENTITY CASCADE")
@@ -22,8 +23,8 @@ defmodule GenDurable.QueriesTest do
         queue: "default",
         priority: 0,
         partition_key: nil,
-        unique_key: nil,
-        unique_scope: [],
+        correlation_key: nil,
+        correlation_scope: [],
         eligible_at: nil
       },
       overrides
@@ -114,11 +115,11 @@ defmodule GenDurable.QueriesTest do
     assert Jason.decode!(state) == %{"n" => 1}
   end
 
-  test "complete_replay bumps attempt and delays eligibility" do
+  test "complete_retry bumps attempt and delays eligibility" do
     {:ok, id} = Queries.insert(Repo, params())
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
-    :ok = Queries.complete_replay(Repo, id, ~s({"n":0}), 50_000)
+    :ok = Queries.complete_retry(Repo, id, ~s({"n":0}), 50_000)
 
     %{rows: [[status, attempt, future]]} =
       Repo.query!(
@@ -131,14 +132,14 @@ defmodule GenDurable.QueriesTest do
     assert future == true
   end
 
-  test "complete_replay keeps awaits and consumes nothing (redo sees the same inputs)" do
+  test "complete_retry keeps awaits and consumes nothing (redo sees the same inputs)" do
     {:ok, id} = Queries.insert(Repo, params())
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
     :ok = Queries.complete_await(Repo, id, ~s({}), ["go"], "woke")
     :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
-    :ok = Queries.complete_replay(Repo, id, ~s({}), 0)
+    :ok = Queries.complete_retry(Repo, id, ~s({}), 0)
 
     %{rows: [[status, awaits]]} =
       Repo.query!("SELECT status::text, awaits FROM gen_durable WHERE id = $1", [id])
@@ -273,6 +274,74 @@ defmodule GenDurable.QueriesTest do
     end
   end
 
+  describe "correlation_key addressing" do
+    test "signal by correlation_key wakes the instance occupying it" do
+      {:ok, id} =
+        Queries.insert(
+          Repo,
+          params(%{correlation_key: "order:7", correlation_scope: @live_scope})
+        )
+
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_await(Repo, id, ~s({}), ["go"], "woke")
+
+      assert :ok = Queries.deliver_signal(Repo, "order:7", "go", ~s({"v":1}), nil)
+
+      %{rows: [[status]]} =
+        Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
+
+      assert status == "runnable"
+      assert [%{name: "go", payload: %{"v" => 1}}] = Queries.load_signals(Repo, id)
+    end
+
+    test "signal by an unknown correlation_key returns {:error, :no_target}" do
+      assert {:error, :no_target} = Queries.deliver_signal(Repo, "nope", "go", ~s({}), nil)
+    end
+
+    test "a :live key is freed on termination; not a target, reusable for a new instance" do
+      {:ok, old} =
+        Queries.insert(
+          Repo,
+          params(%{correlation_key: "order:9", correlation_scope: @live_scope})
+        )
+
+      :ok = Queries.complete_done(Repo, old, ~s({}))
+
+      # terminal ⇒ key no longer occupied ⇒ no target
+      assert {:error, :no_target} = Queries.deliver_signal(Repo, "order:9", "go", ~s({}), nil)
+
+      # the key is free again for a new live instance
+      {:ok, fresh} =
+        Queries.insert(
+          Repo,
+          params(%{correlation_key: "order:9", correlation_scope: @live_scope})
+        )
+
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_await(Repo, fresh, ~s({}), ["go"], "woke")
+      assert :ok = Queries.deliver_signal(Repo, "order:9", "go", ~s({}), nil)
+
+      %{rows: [[status]]} =
+        Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [fresh])
+
+      assert status == "runnable"
+    end
+
+    test "a duplicate correlation_key under the active policy is rejected as :duplicate" do
+      assert {:ok, _} =
+               Queries.insert(
+                 Repo,
+                 params(%{correlation_key: "order:1", correlation_scope: @live_scope})
+               )
+
+      assert {:error, :duplicate} =
+               Queries.insert(
+                 Repo,
+                 params(%{correlation_key: "order:1", correlation_scope: @live_scope})
+               )
+    end
+  end
+
   describe "gc" do
     test "deletes terminal rows past retention; keeps fresh terminal and non-terminal" do
       {:ok, old_done} = Queries.insert(Repo, params())
@@ -339,43 +408,57 @@ defmodule GenDurable.QueriesTest do
 
   describe "uniqueness" do
     test "duplicate within occupied scope is rejected; NULL key never conflicts" do
-      key = <<1, 2, 3>>
+      key = "k1"
       scope = ["runnable", "executing"]
 
-      assert {:ok, _} = Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
+      assert {:ok, _} =
+               Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
 
       assert {:error, :duplicate} =
-               Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
+               Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
 
-      # No unique_key => no dedup.
+      # No correlation_key => no dedup.
       assert {:ok, _} = Queries.insert(Repo, params())
       assert {:ok, _} = Queries.insert(Repo, params())
     end
 
-    test "leaving the occupied scope frees the key for re-insertion" do
-      key = <<9>>
+    test "leaving the occupied scope frees the key for re-insertion (:live)" do
+      key = "k9"
       scope = ["runnable", "executing"]
 
-      {:ok, id} = Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
+      {:ok, id} = Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
       # Move to a status outside the scope.
       :ok = Queries.complete_done(Repo, id, ~s({}))
 
-      assert {:ok, _} = Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
+      assert {:ok, _} =
+               Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
+    end
+
+    test "a :global scope keeps the key occupied after termination (no reuse)" do
+      key = "g1"
+      scope = ~w(runnable executing awaiting_signal awaiting_children done failed)
+
+      {:ok, id} = Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
+      :ok = Queries.complete_done(Repo, id, ~s({}))
+
+      # terminal, but 'done' is still in scope ⇒ key stays occupied ⇒ reuse rejected
+      assert {:error, :duplicate} =
+               Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
     end
 
     test "batch insert dedups within the batch and against existing rows" do
-      key = <<7>>
+      key = "k7"
       scope = ["runnable"]
 
-      {:ok, _} = Queries.insert(Repo, params(%{unique_key: key, unique_scope: scope}))
+      {:ok, _} = Queries.insert(Repo, params(%{correlation_key: key, correlation_scope: scope}))
 
       rows = [
-        params(%{unique_key: key, unique_scope: scope}),
-        params(%{unique_key: <<8>>, unique_scope: scope}),
-        params(%{unique_key: <<8>>, unique_scope: scope})
+        params(%{correlation_key: key, correlation_scope: scope}),
+        params(%{correlation_key: "k8", correlation_scope: scope}),
+        params(%{correlation_key: "k8", correlation_scope: scope})
       ]
 
-      # <<7>> collides with the existing row; <<8>> collides within the batch.
+      # "k7" collides with the existing row; "k8" collides within the batch.
       assert length(Queries.insert_all(Repo, rows)) == 1
     end
   end

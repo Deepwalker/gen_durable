@@ -6,7 +6,7 @@ defmodule GenDurable.OutcomeTest do
   test "validates and normalizes each outcome" do
     assert {:ok, {:next, "ship", %{n: 1}}} = Outcome.validate({:next, :ship, %{n: 1}})
     assert {:ok, {:next, "ship", :st}} = Outcome.validate({:next, "ship", :st})
-    assert {:ok, {:replay, :st, 500}} = Outcome.validate({:replay, :st, 500})
+    assert {:ok, {:retry, :st, 500}} = Outcome.validate({:retry, :st, 500})
     # await: a single name or a list, both normalize to a list of strings
     assert {:ok, {:await, ["go"], "woke", :st}} = Outcome.validate({:await, :go, :woke, :st})
 
@@ -18,7 +18,7 @@ defmodule GenDurable.OutcomeTest do
   end
 
   test "rejects malformed outcomes" do
-    assert {:error, {:bad_outcome, _}} = Outcome.validate({:replay, :st, -1})
+    assert {:error, {:bad_outcome, _}} = Outcome.validate({:retry, :st, -1})
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:done, "not a map"})
     # the old 3-tuple await is no longer a valid outcome
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, :go, :st})

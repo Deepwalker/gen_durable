@@ -1,6 +1,12 @@
 defmodule GenDurable do
   @moduledoc """
-  Durable FSM engine on top of Postgres + GenServer.
+  Postgres-backed durable execution: an FSM whose state is committed to Postgres
+  before each step proceeds, so instances survive process and node death and resume
+  where they left off.
+
+  An FSM is a database row, not a process — there is no GenServer per instance; each
+  step runs as an ephemeral task. The runtime backbone (scheduler, reaper, GC) is a
+  small set of GenServers that pick runnable rows and dispatch them.
 
   Start the engine in a host supervision tree:
 
@@ -9,10 +15,13 @@ defmodule GenDurable do
   FSMs are resolved from the row (the `fsm` column defaults to the module name);
   pass `:fsms` only for a custom `:name` or to keep an old `:version` running.
 
-  Then enqueue instances and deliver signals:
+  Then enqueue instances and deliver signals — address a signal by the returned
+  internal id, or by the `:correlation_key` you set at insert:
 
-      {:ok, id} = GenDurable.insert(Checkout, state: %{order: 42}, partition_key: "order:42")
-      :ok = GenDurable.signal(id, "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
+      {:ok, _id} =
+        GenDurable.insert(Checkout, state: %{order: 42}, correlation_key: "order:42")
+
+      :ok = GenDurable.signal("order:42", "payment_confirmed", %{amount: 100}, dedup_key: "evt-7")
 
   ## Telemetry
 
@@ -20,7 +29,7 @@ defmodule GenDurable do
 
     * `[:gen_durable, :step, :stop]` — a step finished. Measurements `%{duration}`
       (native units); metadata `%{id, fsm, step, kind}` where `kind` is the outcome
-      (`:next` · `:replay` · `:await` · `:schedule_childs` · `:done` · `:stop`).
+      (`:next` · `:retry` · `:await` · `:schedule_childs` · `:done` · `:stop`).
     * `[:gen_durable, :pick, :stop]` — a picker batch ran. Measurements
       `%{count, demand}`; metadata `%{queue, worker}`. Watch `count` vs `demand` to
       see how full picks are.
@@ -59,9 +68,16 @@ defmodule GenDurable do
   @doc """
   Enqueue one FSM instance. Options: `:state` (alias `:args`, the job-form name),
   `:step` (default the FSM's `:initial`), `:queue`, `:priority`, `:partition_key`,
-  `:unique_key`, `:unique_scope`, and scheduling — `:eligible_at` (a `DateTime`), or
+  `:correlation_key`, `:unique`, and scheduling — `:eligible_at` (a `DateTime`), or
   the sugar `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
   Returns `{:ok, id}` or `{:error, :duplicate}`.
+
+  `:correlation_key` is the instance's business identity — both the key you can later
+  `signal/4` by (instead of the internal id) and a uniqueness guard. `:unique` is its
+  policy: `:live` (default) keeps it unique among non-terminal instances (a terminal one
+  frees the key for reuse); `:global` keeps it unique across all statuses (never reused).
+  A duplicate under the active policy is rejected as `{:error, :duplicate}`. With no
+  `:correlation_key` the instance is neither addressable nor deduplicated.
   """
   def insert(fsm_module, opts \\ []) do
     repo = opts[:repo] || config().repo
@@ -81,13 +97,19 @@ defmodule GenDurable do
   @doc """
   Deliver a durable signal to an instance (spec §5). Wakes the instance only on
   a name match. `:dedup_key` (default `nil`) makes redelivery idempotent.
+
+  `target` is either the internal id (an integer) or a `:correlation_key` (a string) set
+  at insert. Addressing by `correlation_key` resolves to the single instance currently
+  occupying it (per its `:unique` policy); if none exists it returns `{:error, :no_target}`
+  (a freed/terminal key can no longer be woken, and a signal is not held for an instance
+  that does not exist yet). Returns `:ok` otherwise.
   """
-  def signal(target_id, name, payload \\ %{}, opts \\ []) do
+  def signal(target, name, payload \\ %{}, opts \\ []) do
     repo = opts[:repo] || config().repo
 
     Queries.deliver_signal(
       repo,
-      target_id,
+      target,
       to_string(name),
       Jason.encode!(payload),
       opts[:dedup_key]
@@ -108,11 +130,25 @@ defmodule GenDurable do
       queue: opts[:queue] || fsm_module.__gd_queue__(),
       priority: opts[:priority] || 0,
       partition_key: opts[:partition_key],
-      unique_key: opts[:unique_key],
-      unique_scope: Enum.map(opts[:unique_scope] || [], &to_string/1),
+      correlation_key: opts[:correlation_key],
+      correlation_scope: correlation_scope(opts[:unique] || :live),
       eligible_at: resolve_eligible_at(opts)
     }
   end
+
+  # Statuses in which a correlation_key is "occupied" — the :unique policy expands to a
+  # status set the engine enforces uniqueness over (and addresses signals within):
+  #   :live   — the non-terminal statuses; a terminal instance frees the key for reuse.
+  #   :global — every status; the key is never reusable (until GC removes the row).
+  @live_statuses ~w(runnable executing awaiting_signal awaiting_children)
+  @all_statuses @live_statuses ++ ~w(done failed)
+
+  defp correlation_scope(:live), do: @live_statuses
+  defp correlation_scope(:global), do: @all_statuses
+
+  defp correlation_scope(other),
+    do:
+      raise(ArgumentError, "invalid :unique policy #{inspect(other)} (expected :live or :global)")
 
   # Scheduling sugar. Precedence: explicit :eligible_at, then :schedule_at
   # (a DateTime), then :schedule_in (milliseconds from now). nil ⇒ now() in SQL.

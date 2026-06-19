@@ -6,13 +6,16 @@ defmodule GenDurable.MixProject do
   def project do
     [
       app: :gen_durable,
-      version: "0.1.4",
+      version: "0.1.5",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       name: "gen_durable",
-      description: "Postgres-backed durable FSM engine on top of GenServer.",
+      description:
+        "Postgres-backed durable execution for Elixir: declare an FSM, the engine " <>
+          "commits its state before each step proceeds, so instances survive process " <>
+          "and node death and resume where they left off.",
       source_url: @source_url,
       docs: docs(),
       package: package()

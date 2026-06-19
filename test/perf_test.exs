@@ -35,8 +35,8 @@ defmodule GenDurable.PerfTest do
         queue: "default",
         priority: 0,
         partition_key: nil,
-        unique_key: nil,
-        unique_scope: [],
+        correlation_key: nil,
+        correlation_scope: [],
         eligible_at: nil
       },
       overrides
@@ -83,9 +83,9 @@ defmodule GenDurable.PerfTest do
     assert hd(sql) =~ "WITH consumed"
   end
 
-  test "complete_replay is a single statement" do
+  test "complete_retry is a single statement" do
     id = setup_executing()
-    assert length(statements(fn -> Queries.complete_replay(Repo, id, ~s({}), 0) end)) == 1
+    assert length(statements(fn -> Queries.complete_retry(Repo, id, ~s({}), 0) end)) == 1
   end
 
   test "complete_await is a single statement" do

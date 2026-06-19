@@ -53,7 +53,7 @@ defmodule GenDurable.FSM do
 
         @impl true
         def handle(reason, ctx) do
-          if ctx.attempt < 5, do: {:replay, ctx.state, backoff(ctx.attempt)}, else: {:stop, reason}
+          if ctx.attempt < 5, do: {:retry, ctx.state, backoff(ctx.attempt)}, else: {:stop, reason}
         end
       end
 
@@ -219,7 +219,7 @@ defmodule GenDurable.FSM do
   @doc false
   def __retry__(reason, ctx, max_attempts, backoff_fun) do
     if ctx.attempt + 1 < max_attempts do
-      {:replay, ctx.state, backoff_fun.(ctx.attempt)}
+      {:retry, ctx.state, backoff_fun.(ctx.attempt)}
     else
       {:stop, reason}
     end

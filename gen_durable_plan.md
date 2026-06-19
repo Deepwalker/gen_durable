@@ -3,7 +3,10 @@
 Status: draft v1. Companion to `gen_durable_spec.md` (normative). This document is the **how**;
 the spec is the **what**. Where this plan and the spec disagree, the spec wins — fix this plan.
 
-The engine is an Elixir library: a Postgres-backed durable FSM runtime on top of GenServer.
+The engine is an Elixir library: a Postgres-backed durable-execution runtime. An FSM is a
+row, not a process — durability lives in the database, not in a GenServer. The runtime
+backbone (scheduler, reaper, GC) is a small set of GenServers that pick runnable rows and
+run each step as an ephemeral task.
 The one guarantee we are building toward: *on step completion, the new state is committed to the
 database before execution proceeds* (spec §1). Everything below serves that sentence.
 
@@ -118,7 +121,7 @@ defmodule Checkout do
 
   @impl true
   def handle(reason, ctx) do
-    if ctx.attempt < 5, do: {:replay, ctx.state, backoff(ctx.attempt)}, else: {:stop, reason}
+    if ctx.attempt < 5, do: {:retry, ctx.state, backoff(ctx.attempt)}, else: {:stop, reason}
   end
 end
 
@@ -127,7 +130,7 @@ end
   state: %{order: 42},
   partition_key: "order:42",
   priority: 0,
-  unique_key: <<...>>, unique_scope: ["runnable", "executing", "awaiting_signal"])
+  correlation_key: "order:42", unique: :live)   # signal address + uniqueness (default :live)
 
 # Batch (single statement, dedup via the partial unique index)
 GenDurable.insert_all(Checkout, [ %{...}, %{...} ])
@@ -137,7 +140,7 @@ GenDurable.signal(id, "payment_confirmed", %{"amount" => 100}, dedup_key: "evt-7
 ```
 
 `ctx.state` is a **`%Checkout.State{}` struct** (loaded from jsonb before the call); `step/2`/`handle/2`
-return a struct of the same type in `:next`/`:replay`/`:await`, which the engine dumps back to jsonb.
+return a struct of the same type in `:next`/`:retry`/`:await`, which the engine dumps back to jsonb.
 `result` in `:done` stays a plain string-keyed map (terminal payload, never re-loaded into step code).
 
 `ctx` for `step/2`: `%Context{id, fsm, fsm_version, step, attempt, state, signal, signals, childs}`
@@ -145,7 +148,7 @@ return a struct of the same type in `:next`/`:replay`/`:await`, which the engine
 `ctx` for `handle/2`: same minus `signal`/`signals`/`childs`.
 
 Outcomes returned by `step/2` and `handle/2` are exactly the spec §3 table:
-`{:next, step, state}` · `{:replay, state, delay_ms}` · `{:await, name, next_step, state}` ·
+`{:next, step, state}` · `{:retry, state, delay_ms}` · `{:await, name, next_step, state}` ·
 `{:done, result}` · `{:stop, reason}`. `Outcome` validates the shape before it touches SQL.
 
 ---
@@ -176,21 +179,20 @@ end
 Tables created: `gen_durable`, `signals`, the `durable_status` enum, the three indexes
 (`gen_durable_pick`, `gen_durable_lease`, `gen_durable_unique`) plus `signals_target`.
 
-### Spec deviation D1 — `unique_scope` must be `durable_status[]`, not `text[]`
+### Spec deviation D1 — `correlation_scope` must be `durable_status[]`, not `text[]`
 
-Spec §7/§9 define `unique_scope text[]` and the generated column as
-`status::text = any(unique_scope)`. **Postgres rejects this**: a `generated always as (...) stored`
-expression must be IMMUTABLE, but the enum→text cast (`enum_out`) is only STABLE (enum labels can be
-renamed). Result: `ERROR 42P17 generation expression is not immutable`.
+(Originally about `unique_scope`; same mechanism, now the merged `correlation_scope` — see F18.)
+A `text[]` scope with the generated column as `status::text = any(scope)` **is rejected by Postgres**:
+a `generated always as (...) stored` expression must be IMMUTABLE, but the enum→text cast (`enum_out`)
+is only STABLE (enum labels can be renamed). Result: `ERROR 42P17 generation expression is not immutable`.
 
-Fix applied in `GenDurable.Migration` (v1): store `unique_scope` as `durable_status[]` and compare
-`status = any(unique_scope)` (enum = enum, `enum_eq` is IMMUTABLE — the cast disappears). The §7
-semantics are unchanged. Downstream impact: inserts pass scope as `$scope::durable_status[]`, and the
-engine reads scope as enum-label strings. **The normative spec §7/§9 should be patched to match.**
+Fix applied in `GenDurable.Migration` (v1): store `correlation_scope` as `durable_status[]` and compare
+`status = any(correlation_scope)` (enum = enum, `enum_eq` is IMMUTABLE — the cast disappears). Downstream:
+inserts pass scope as `$scope::durable_status[]`, and the engine reads scope as enum-label strings.
 
-Notes to verify during implementation:
-- `unique_guard` is `generated always as (...) stored`; the partial unique index is on it.
-- Batch insert uses `ON CONFLICT (unique_guard) WHERE unique_guard is not null DO NOTHING` — the
+Notes:
+- `correlation_guard` is `generated always as (...) stored`; the partial unique index is on it.
+- Insert uses `ON CONFLICT (correlation_guard) WHERE correlation_guard is not null DO NOTHING` — the
   inference predicate must match the partial index predicate exactly, or PG won't pick the index.
 - `signals` has `unique (target_id, dedup_key)`; `dedup_key NULL` ⇒ no dedup (NULLs don't conflict).
 
@@ -200,10 +202,10 @@ Notes to verify during implementation:
 
 ### 5.1 Queries (`queries.ex`)
 One function per spec §10 block, all parameterized, all raw SQL:
-`pick/3`, `heartbeat/2`, `reap/0`, `complete_next/…`, `complete_replay/…`, `complete_await/…`,
+`pick/3`, `heartbeat/2`, `reap/0`, `complete_next/…`, `complete_retry/…`, `complete_await/…`,
 `complete_done/…`, `complete_stop/…`, `deliver_signal/…`, `insert/…`, `insert_all/…`.
 `:next`/`:schedule_childs` run a by-id signal `DELETE` (the received `ctx.awaited` ids) **and** the
-outcome `UPDATE` in one statement; `:done`/`:stop` delete the whole inbox; `:replay`/`:await` consume
+outcome `UPDATE` in one statement; `:done`/`:stop` delete the whole inbox; `:retry`/`:await` consume
 nothing. `complete_await` parks on a name set (`awaits text[]`) and guards a pre-arrived signal.
 
 ### 5.2 Executor (`executor.ex`)
@@ -262,7 +264,7 @@ re-executed step already sees the signal in its inbox (spec §5).
 
 **Status: M0–M10 all ✅ DONE.** 33 tests green (Elixir 1.18 / OTP 27 + Postgres 17 in the
 devcontainer). The whole engine — typed/map state, `:next` loop, `await`/`signal`, `handle`→
-`:replay`→`:stop`, reaper crash-recovery, uniqueness, and `partition_key` serialization — runs
+`:retry`→`:stop`, reaper crash-recovery, uniqueness, and `partition_key` serialization — runs
 end-to-end. See module map in §2; tests in `test/`.
 
 Each milestone ends in something testable. Dependencies are roughly linear; signals (M7) and
@@ -284,7 +286,7 @@ uniqueness (M8) can proceed in parallel once persistence (M3) lands.
   batched lease heartbeat. Test: Counter/MapCounter drive to `:done`.
 - **M5 — Reaper. ✅** `reaper.ex`. Test: `Reborn` kills the worker mid-step → reaper resets →
   `attempt+1` → succeeds; `handle/2` not invoked.
-- **M6 — `:replay` & backoff plumbing. ✅** `attempt` reset on `:next`, `+1` on `:replay`,
+- **M6 — `:retry` & backoff plumbing. ✅** `attempt` reset on `:next`, `+1` on `:retry`,
   `eligible_at` honored (see `queries_test` + `Crasher`).
 - **M7 — await + signals. ✅** `:await` parks; `signal/4` delivers durably (insert-before-flip);
   re-executed step sees the signal and the engine deletes it in the outcome txn. Test: `Awaiter`.
@@ -453,7 +455,7 @@ delivers signals and never silently sweeps by name. `{:await, name | [names], ne
 and `ctx.all` (the full inbox); `ctx.signal` (singular) is gone. Consume is now **by received id**: a
 progressing `:next`/`:schedule_childs` deletes exactly the `ctx.awaited` ids the step saw (so a same-name
 signal that arrived after the snapshot, or a never-awaited one, survives — no silent loss), which also
-enables **pack accumulation** via re-await (consumes nothing until you progress). `:replay` consumes
+enables **pack accumulation** via re-await (consumes nothing until you progress). `:retry` consumes
 nothing and **keeps** `awaits` (redo sees the same inputs — fixes the old name-sweep that dropped it). A
 **terminal** `:done`/`:stop` deletes the **whole** inbox (cleanup of a finished instance). Delivery flips
 on `$name = ANY(awaits)`. No migration — DDL changed in place (`awaits text[]`). Spec §2/§3/§5/§9/§10,
@@ -475,6 +477,28 @@ active (`awaiting_children`/runnable/executing) so the join can still read it vi
 backs the sweep. `gc_interval: nil` omits the process entirely. Telemetry `[:gen_durable, :gc, :swept]`.
 Spec §8, README config, Supervisor/GenDurable docs updated; unit tests (retention / parent-join guard /
 batch bound) + engine tests (delete-after-terminate + :swept, and disable). 76 tests green.
+
+### F17 — `:replay` renamed to `:retry` ✅ DONE
+The same-step outcome is now `{:retry, state, delay_ms}` (was `:replay`). `:replay` read like
+event-sourcing replay; `:retry` says what it does — redo this step with `attempt += 1` after `delay_ms`.
+Pure rename, no behaviour change: outcome tag, `Queries.complete_retry`, generated job retry, telemetry
+`kind`, and all four docs. No compat shim (pre-MVP, no migrations).
+
+### F18 — `correlation_key`: one business key = addressing + uniqueness ✅ DONE
+A signal can target an instance by a **business key** (e.g. `"order:42"`) set at insert, not just the
+internal `id` — so the caller no longer maps its own key to the engine's id. Crucially this is the
+**same** key as the uniqueness guard: rather than a separate `external_id` (address) and `unique_key`
+(dedup), there is one `correlation_key`, the durable-execution model (Temporal Workflow ID, DBOS
+workflow ID). `unique_key`/`unique_scope`/`unique_guard` and the never-shipped `external_id` were
+**merged** into `correlation_key` (text) + `correlation_scope` (durable_status[]) + `correlation_guard`
+(generated). One partial unique index `gen_durable_correlation (correlation_guard)` does double duty —
+uniqueness **and** the address lookup (`correlation_guard = $key`). The public surface is a `:unique`
+policy that expands to a scope: `:live` (default — occupied in non-terminal statuses, freed on
+termination) and `:global` (occupied always, never reused). `signal/4` accepts an integer id (trusts the
+FK) or a string correlation_key (resolved via the guard, else `{:error, :no_target}` — no durable
+pending-signal, no waking a freed/terminal key). A duplicate under the active policy is `{:error,
+:duplicate}` (uniform — the old external_id hard-raise is gone). Spec §5/§7/§9/§10/§11, README, moduledocs
+updated; unit + engine tests. 85 tests green.
 
 ### Open follow-ups (post-v1, not blocking)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
@@ -498,7 +522,7 @@ fights advisory locks and multi-connection flows — run engine tests against a 
 - **await/signal:** loss-free delivery (signal always wakes), duplicate-tolerant (dedup_key), and the
   "insert before flip" ordering so the woken step sees its signal.
 - **Uniqueness:** concurrent `insert_all` from multiple connections dedups; leaving an occupied
-  status frees the key for re-insertion; `unique_key IS NULL` never conflicts.
+  status frees the key for re-insertion; `correlation_key IS NULL` never conflicts.
 - **partition_key:** spawn many machines sharing a key; assert steps never overlap and preserve order;
   assert cross-key parallelism; assert lock auto-release on simulated connection drop.
 - **Property test (optional):** random interleavings of pick/heartbeat/reap/outcome preserve "state
@@ -516,7 +540,7 @@ fights advisory locks and multi-connection flows — run engine tests against a 
 5. **Registry:** explicit `{name, version} => module` config; old versions coexist as registered modules.
 6. **Signals:** durable inbox per instance; await parks on a name **set** (`awaits text[]`). Consume is
    by **received id** on `:next`/`:schedule_childs` (latecomers/non-awaited survive), the **whole inbox**
-   on `:done`/`:stop` (cleanup), nothing on `:replay`/`:await`. Delivery keeps `awaits` and guards a
+   on `:done`/`:stop` (cleanup), nothing on `:retry`/`:await`. Delivery keeps `awaits` and guards a
    pre-arrived signal against lost wake-up.
 
 ## 9. Risks / watch-items
@@ -526,5 +550,5 @@ fights advisory locks and multi-connection flows — run engine tests against a 
 - **ON CONFLICT inference on the generated column** must match the partial index predicate exactly.
 - **Heartbeat vs lease race:** if heartbeat starves (slow DB), a live step can be reaped and run
   twice. The TTL margin and the at-least-once contract make this safe, but tune the margin.
-- **`handle/2` re-entrancy:** a caught exception calls `handle/2`, which may `:replay`; ensure the
+- **`handle/2` re-entrancy:** a caught exception calls `handle/2`, which may `:retry`; ensure the
   re-run path is identical to a fresh run (no leftover lease/lock state).

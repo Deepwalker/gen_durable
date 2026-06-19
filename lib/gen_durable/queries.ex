@@ -168,7 +168,7 @@ defmodule GenDurable.Queries do
   #     survive. Empty list ⇒ no-op.
   #   * terminal (:done / :stop) — the whole inbox (`target_id = $id`): the instance
   #     is finished, so nothing will read its signals again (cleanup).
-  #   * :replay / :await consume nothing (the step is redone / still waiting).
+  #   * :retry / :await consume nothing (the step is redone / still waiting).
 
   # The join-barrier decrement (spec §11), used as the main statement of the
   # terminal outcomes after the `consumed` + `terminal` CTEs. No-op when the row
@@ -206,9 +206,9 @@ defmodule GenDurable.Queries do
     :ok
   end
 
-  # :replay redoes the same step, so it consumes nothing and KEEPS `awaits` — the
+  # :retry redoes the same step, so it consumes nothing and KEEPS `awaits` — the
   # redo must see the same awaited signals it was handed.
-  def complete_replay(repo, id, state_json, delay_ms) do
+  def complete_retry(repo, id, state_json, delay_ms) do
     repo.query!(
       """
       UPDATE gen_durable
@@ -316,9 +316,9 @@ defmodule GenDurable.Queries do
       "WITH consumed AS (DELETE FROM signals WHERE target_id = $1 AND id = ANY($4::bigint[])), " <>
         "ins AS (INSERT INTO gen_durable " <>
         "(fsm, fsm_version, step, state, queue, priority, partition_key, " <>
-        "unique_key, unique_scope, eligible_at, parent_id) VALUES " <>
+        "eligible_at, correlation_key, correlation_scope, parent_id) VALUES " <>
         Enum.join(placeholders, ", ") <>
-        " ON CONFLICT (unique_guard) WHERE unique_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
+        " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
         "cnt AS (SELECT count(*) AS n FROM ins) " <>
         "UPDATE gen_durable SET step = $2, state = $3::jsonb, " <>
         "children_pending = (SELECT n FROM cnt), " <>
@@ -337,8 +337,8 @@ defmodule GenDurable.Queries do
   # Child placeholders share $1 (the parent id) as the parent_id column.
   defp child_row_placeholders(base) do
     "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}::jsonb, $#{base + 5}, " <>
-      "$#{base + 6}, $#{base + 7}, $#{base + 8}, $#{base + 9}::text[]::durable_status[], " <>
-      "COALESCE($#{base + 10}::timestamptz, now()), $1)"
+      "$#{base + 6}, $#{base + 7}, COALESCE($#{base + 8}::timestamptz, now()), " <>
+      "$#{base + 9}, $#{base + 10}::text[]::durable_status[], $1)"
   end
 
   # --- signals ---------------------------------------------------------------
@@ -378,39 +378,65 @@ defmodule GenDurable.Queries do
     end)
   end
 
-  def deliver_signal(repo, target_id, name, payload_json, dedup_key) do
+  # `target` is either an internal id (integer) or a correlation_key (string). The signal
+  # row is inserted before the wake-flip so the woken step already sees it (spec §5).
+  # Returns `:ok`, or `{:error, :no_target}` when a correlation_key resolves to no
+  # occupied instance.
+  def deliver_signal(repo, target, name, payload_json, dedup_key) do
     repo.transaction(fn ->
-      repo.query!(
-        """
-        INSERT INTO signals (target_id, name, payload, dedup_key)
-        VALUES ($1, $2, $3::jsonb, $4)
-        ON CONFLICT (target_id, dedup_key) DO NOTHING
-        """,
-        [target_id, name, payload_json, dedup_key]
-      )
+      case resolve_target(repo, target) do
+        nil ->
+          repo.rollback(:no_target)
 
-      repo.query!(
-        """
-        UPDATE gen_durable
-        SET status = 'runnable', eligible_at = now(), updated_at = now()
-        WHERE id = $1 AND status = 'awaiting_signal' AND $2 = ANY(awaits)
-        """,
-        [target_id, name]
-      )
+        id ->
+          repo.query!(
+            """
+            INSERT INTO signals (target_id, name, payload, dedup_key)
+            VALUES ($1, $2, $3::jsonb, $4)
+            ON CONFLICT (target_id, dedup_key) DO NOTHING
+            """,
+            [id, name, payload_json, dedup_key]
+          )
+
+          repo.query!(
+            """
+            UPDATE gen_durable
+            SET status = 'runnable', eligible_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'awaiting_signal' AND $2 = ANY(awaits)
+            """,
+            [id, name]
+          )
+      end
     end)
+    |> case do
+      {:ok, _} -> :ok
+      {:error, :no_target} -> {:error, :no_target}
+    end
+  end
 
-    :ok
+  # An integer target is the id itself (the FK enforces existence). A string is a
+  # correlation_key — resolved via `correlation_guard` (the partial unique index) to
+  # the single occupied instance carrying it, or nil if none: an instance whose key is
+  # no longer occupied (a terminal :live row) can no longer be woken, and we do not
+  # durably hold a signal for an instance that does not exist yet.
+  defp resolve_target(_repo, id) when is_integer(id), do: id
+
+  defp resolve_target(repo, key) when is_binary(key) do
+    case repo.query!("SELECT id FROM gen_durable WHERE correlation_guard = $1", [key]) do
+      %{rows: [[id]]} -> id
+      %{rows: []} -> nil
+    end
   end
 
   # --- insert / batch insert -------------------------------------------------
 
-  @insert_cols "fsm, fsm_version, step, state, queue, priority, partition_key, unique_key, unique_scope, eligible_at"
+  @insert_cols "fsm, fsm_version, step, state, queue, priority, partition_key, eligible_at, correlation_key, correlation_scope"
 
   def insert(repo, p) do
     sql =
       "INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
         row_placeholders(0) <>
-        " ON CONFLICT (unique_guard) WHERE unique_guard IS NOT NULL DO NOTHING RETURNING id"
+        " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
     case repo.query!(sql, row_args(p)) do
       %{rows: [[id]]} -> {:ok, id}
@@ -425,7 +451,7 @@ defmodule GenDurable.Queries do
     sql =
       "INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
         Enum.join(placeholders, ", ") <>
-        " ON CONFLICT (unique_guard) WHERE unique_guard IS NOT NULL DO NOTHING RETURNING id"
+        " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
     %{rows: out} = repo.query!(sql, Enum.flat_map(rows, &row_args/1))
     List.flatten(out)
@@ -433,8 +459,8 @@ defmodule GenDurable.Queries do
 
   defp row_placeholders(base) do
     "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}::jsonb, $#{base + 5}, " <>
-      "$#{base + 6}, $#{base + 7}, $#{base + 8}, $#{base + 9}::text[]::durable_status[], " <>
-      "COALESCE($#{base + 10}::timestamptz, now()))"
+      "$#{base + 6}, $#{base + 7}, COALESCE($#{base + 8}::timestamptz, now()), " <>
+      "$#{base + 9}, $#{base + 10}::text[]::durable_status[])"
   end
 
   defp row_args(p) do
@@ -446,9 +472,9 @@ defmodule GenDurable.Queries do
       p.queue,
       p.priority,
       p.partition_key,
-      p.unique_key,
-      p.unique_scope,
-      p.eligible_at
+      p.eligible_at,
+      p.correlation_key,
+      p.correlation_scope
     ]
   end
 

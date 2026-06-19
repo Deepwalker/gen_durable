@@ -59,12 +59,12 @@ defmodule GenDurable.Test.Selector do
   end
 end
 
-defmodule GenDurable.Test.AwaitReplay do
+defmodule GenDurable.Test.AwaitRetry do
   @moduledoc """
-  Awaits, then `:replay`s the woken step once before finishing. Proves a replay
+  Awaits, then `:retry`s the woken step once before finishing. Proves a retry
   keeps `awaits` and re-sees `ctx.awaited` — if the redo lost them, `hd([])` raises.
   """
-  use GenDurable.FSM, name: "await_replay", version: 1, initial: "wait"
+  use GenDurable.FSM, name: "await_retry", version: 1, initial: "wait"
 
   @impl true
   def step("wait", ctx), do: {:await, "go", "woke", ctx.state}
@@ -73,7 +73,7 @@ defmodule GenDurable.Test.AwaitReplay do
     sig = hd(ctx.awaited)
 
     if ctx.attempt < 1,
-      do: {:replay, ctx.state, 0},
+      do: {:retry, ctx.state, 0},
       else: {:done, %{"v" => sig.payload["v"], "attempt" => ctx.attempt}}
   end
 end
@@ -100,7 +100,7 @@ defmodule GenDurable.Test.Collector do
 end
 
 defmodule GenDurable.Test.Crasher do
-  @moduledoc "Raises; handle/2 replays a few times then stops."
+  @moduledoc "Raises; handle/2 retries a few times then stops."
   use GenDurable.FSM, name: "crasher", version: 1, initial: "boom"
 
   @impl true
@@ -108,7 +108,7 @@ defmodule GenDurable.Test.Crasher do
 
   @impl true
   def handle(_reason, ctx) do
-    if ctx.attempt < 2, do: {:replay, ctx.state, 0}, else: {:stop, "gave up"}
+    if ctx.attempt < 2, do: {:retry, ctx.state, 0}, else: {:stop, "gave up"}
   end
 end
 
@@ -276,7 +276,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.Awaiter,
       GenDurable.Test.Selector,
       GenDurable.Test.Collector,
-      GenDurable.Test.AwaitReplay,
+      GenDurable.Test.AwaitRetry,
       GenDurable.Test.Crasher,
       GenDurable.Test.Reborn,
       GenDurable.Test.PartitionInc,
