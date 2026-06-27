@@ -27,11 +27,11 @@ items marked **CONFIRM** are worth a yes/no before we lean on them.
 | FSM versioning | **Explicit registry** `{fsm_name, fsm_version} => module` in config/start (**DECIDED**) | Spec §8: old instances finish on their `fsm_version`. Old versions (`Checkout.V1`, `Checkout.V2`) coexist as explicitly-registered modules; we resolve module per row, never assume "latest", no compile-time magic. |
 | Defaults (timings) | lease 60s · heartbeat 20s · poll 1s · reaper 30s ("Balanced", **DECIDED**) | All config-overridable. Margin: `heartbeat × 3 = lease`. |
 | Signal consume | **Name-scoped (spec §5)** — on a progressing outcome the engine deletes the inbox signals whose `name = awaits`, then clears `awaits` (**DECIDED → option (b)**) | Non-matching signals survive until their own await. Delivery keeps `awaits`; `:await` also guards against a pre-arrived signal (no lost wake-up). Supersedes the earlier snapshot-delete idea. |
-| Step ↔ connection | one DB connection is **held for the whole step** when `partition_key` is set | Session-level `pg_try_advisory_lock` must live on a connection that survives the step, which runs *outside* any transaction. This ties a connection to each in-flight partitioned step — call it out in capacity planning. |
+| Step ↔ connection | one DB connection is **held for the whole step** when `concurrency_key` is set | Session-level `pg_try_advisory_lock` must live on a connection that survives the step, which runs *outside* any transaction. This ties a connection to each in-flight concurrency-keyed step — call it out in capacity planning. |
 
 ### The advisory-lock subtlety (read this before Phase 9)
 
-`partition_key` serialization (spec §6, Pick) uses a **session-level** advisory lock, not
+`concurrency_key` serialization (spec §6, Pick) uses a **session-level** advisory lock, not
 `pg_advisory_xact_lock`, because the step body runs outside a transaction. Consequences:
 
 - The lock must be taken on, and held by, the *same connection* for the lock's lifetime, then
@@ -61,7 +61,7 @@ GenDurable.Application (supervisor)
 Data flow of one step:
 
 1. **Scheduler** picks `runnable` rows (short txn, `FOR UPDATE SKIP LOCKED`) → `executing` + lease.
-2. If `partition_key` set, **Executor** takes the advisory lock; on conflict, return row to `runnable`.
+2. If `concurrency_key` set, **Executor** takes the advisory lock; on conflict, return row to `runnable`.
 3. **Executor** loads pending signals (if relevant), resolves the module, calls `step/2` under `try`.
 4. Outcome (or `handle/2` outcome on exception) is written in **one transaction**, deleting consumed
    signals in that same transaction (spec §5).
@@ -128,7 +128,7 @@ end
 # Enqueue — `state:` is cast into Checkout.State
 {:ok, id} = GenDurable.insert(Checkout,
   state: %{order: 42},
-  partition_key: "order:42",
+  concurrency_key: "order:42",
   priority: 0,
   correlation_key: "order:42")   # signal address + uniqueness (scope defaults to the live statuses)
 
@@ -210,7 +210,7 @@ nothing. `complete_await` parks on a name set (`awaits text[]`) and guards a pre
 
 ### 5.2 Executor (`executor.ex`)
 Given a picked row map, run the step to a committed outcome:
-1. If `partition_key`, `pg_try_advisory_lock(hashtext(partition_key))` on the step connection; on
+1. If `concurrency_key`, `pg_try_advisory_lock(hashtext(concurrency_key))` on the step connection; on
    `false`, reset row to `runnable` (drop lease) and stop — another worker owns the key.
 2. Load pending signals for `id` into `ctx.all`; the awaited subset (names ∈ `awaits`) into
    `ctx.awaited`. Deletion on the outcome is by the received `ctx.awaited` ids.
@@ -264,7 +264,7 @@ re-executed step already sees the signal in its inbox (spec §5).
 
 **Status: M0–M10 all ✅ DONE.** 33 tests green (Elixir 1.18 / OTP 27 + Postgres 17 in the
 devcontainer). The whole engine — typed/map state, `:next` loop, `await`/`signal`, `handle`→
-`:retry`→`:stop`, reaper crash-recovery, uniqueness, and `partition_key` serialization — runs
+`:retry`→`:stop`, reaper crash-recovery, uniqueness, and `concurrency_key` serialization — runs
 end-to-end. See module map in §2; tests in `test/`.
 
 Each milestone ends in something testable. Dependencies are roughly linear; signals (M7) and
@@ -292,8 +292,8 @@ uniqueness (M8) can proceed in parallel once persistence (M3) lands.
   re-executed step sees the signal and the engine deletes it in the outcome txn. Test: `Awaiter`.
 - **M8 — Uniqueness + batch insert. ✅** `unique_guard` dedup, per-job scope, single-statement
   `insert_all`. Test: dedup vs existing rows and within the batch; scope-exit frees the key.
-- **M9 — partition_key serialization. ✅** Session advisory lock on a checked-out connection held for
-  the step; contended keys returned to `runnable`; auto-release on worker death. Test: `PartitionInc`
+- **M9 — concurrency_key serialization. ✅** Session advisory lock on a checked-out connection held for
+  the step; contended keys returned to `runnable`; auto-release on worker death. Test: `ConcurrencyInc`
   — N instances sharing a key, no lost updates.
 - **M10 — Hardening. ✅** Telemetry (`[:gen_durable, :step, :stop]`, `[:gen_durable, :reaper,
   :reaped]`), config surface (`GenDurable.Supervisor` opts), README, `--warnings-as-errors` clean.
@@ -318,7 +318,7 @@ enum value `awaiting_children`, columns `parent_id` / `children_pending`, index 
 - **F1 / signals (option b) — resolved.** Name-scoped delete + `awaits` kept on delivery + `:await`
   pre-arrival guard (no lost wake-up). Non-matching signals survive (spec §5). Tests in `queries_test`.
 - **F2 / test coverage — added.** Priority ordering, per-queue routing, `schedule_in` eligibility,
-  heartbeat keeps a long lease (no spurious reap), cross-key partition parallelism. (`engine_test`)
+  heartbeat keeps a long lease (no spurious reap), cross-key parallelism. (`engine_test`)
 - **F3 / scheduling sugar — added.** `insert/2` accepts `:schedule_in` (ms from now) / `:schedule_at`
   (`DateTime`); precedence `:eligible_at` > `:schedule_at` > `:schedule_in`.
 
@@ -335,18 +335,18 @@ buffered past a 300ms lease and still completes with `attempt == 0`. 43 tests gr
 - **Follow-up (deferred):** per-queue (vs engine-wide) knobs; graceful drain that resets the buffer
   on shutdown instead of waiting out the lease.
 
-### F6 — Picker-side partition_key dedup ✅ DONE
+### F6 — Picker-side concurrency_key dedup ✅ DONE
 The picker (`Queries.pick`) no longer claims work it can't run, killing the claim→`try_lock`→
 `reset_to_runnable` churn that `prefetch` amplifies on hot keys. Two guards in one statement:
-- **`NOT EXISTS`** — exclude a runnable row whose `partition_key` is already `executing` (so a sibling
-  isn't claimed only to bounce off the advisory lock). `partition_key IS NULL` short-circuits the
-  guard, so non-partitioned work pays nothing. Backed by a new partial index
-  `gen_durable_partition_active (partition_key) WHERE status='executing'` (folded into v1).
+- **`NOT EXISTS`** — exclude a runnable row whose `concurrency_key` is already `executing` (so a sibling
+  isn't claimed only to bounce off the advisory lock). `concurrency_key IS NULL` short-circuits the
+  guard, so non-keyed work pays nothing. Backed by a new partial index
+  `gen_durable_concurrency_active (concurrency_key) WHERE status='executing'` (folded into v1).
 - **intra-batch dedup** — at most one row per key per batch (the most urgent); NULL keys fall back to
   `id` so each is its own group and is never collapsed. (Final form in F8 — a window function over the
   locked set; the original `DISTINCT ON` needed a second re-lock pass.)
 The advisory lock stays the correctness guard (cross-node / unlock-gap races still possible); dedup is
-the optimization that makes contention rare. New telemetry `[:gen_durable, :partition, :contended]`
+the optimization that makes contention rare. New telemetry `[:gen_durable, :concurrency, :contended]`
 fires on the residual bounce. Deterministic picker tests in `queries_test`; 46 tests green.
 ### F7 — Picker performance: queue equality + bounded dedup window ✅ DONE
 Two fixes, measured in `PERFORMANCE.md` (real EXPLAIN on 1M rows, Postgres 17):
@@ -366,19 +366,19 @@ round-trip throughput model, and the F4 round-trip-reduction backlog. 46 tests g
 
 ### F8 — Picker: one nested loop (window dedup over the locked set) ✅ DONE
 The picker is now the canonical Postgres claim — one `SELECT … FOR UPDATE SKIP LOCKED LIMIT`, then one
-`UPDATE` — with the partition dedup folded in as `row_number() OVER (PARTITION BY coalesce(key, id))`
+`UPDATE` — with the concurrency_key dedup folded in as `row_number() OVER (PARTITION BY coalesce(key, id))`
 over the **locked** set, so there is **exactly one nested loop** (the `UPDATE` join). The previous
 `DISTINCT ON` form dedup'd *before* locking and so needed a second re-lock pass (a second nested loop
 that scaled per-row with the batch). Per-key losers (`rn > 1`) are locked-but-not-updated → stay
 `runnable`, lock released at commit, no advisory bounce. Measured (median of 5, VACUUM'd, 1M rows):
 batch 5000 **70 ms → 57 ms (−19%)**, batch 1000 17.3 → 16.1; no new index. Also folded in: the
-`gen_durable_partition_active` index scoped to `partition_key IS NOT NULL` (the guard never probes
-null keys, so non-partitioned claims skip that index write).
+`gen_durable_concurrency_active` index scoped to `concurrency_key IS NOT NULL` (the guard never probes
+null keys, so non-keyed claims skip that index write).
 - **Rejected by measurement** (in PERFORMANCE.md §2.5–2.6): forcing the nested loop off → full-table
   Seq Scan, ~10× slower (the join *is* optimal); a `ctid`-join cut buffer hits ~28% but not wall-clock;
   a correlated-subquery single-scan dedup needed a new index that taxed writes. The cost floor is the
   per-row *claim write* (~11–16 µs/row: heap + partial-index moves + WAL), not the query shape.
-- 46 tests green (partition serialization, dedup units, cross-key parallelism all hold under M).
+- 46 tests green (concurrency_key serialization, dedup units, cross-key parallelism all hold under M).
 
 ### F9 — Outcome collapsed to one round-trip ✅ DONE
 Each `complete_*` was a `repo.transaction(BEGIN + consume DELETE + outcome UPDATE [+ notify_parent] +
@@ -403,7 +403,7 @@ by default, prints the old-vs-new wall-clock — consistently faster). 53 tests 
 - **Telemetry:** added `[:gen_durable, :pick, :stop]` (count/demand per pick), `[:gen_durable,
   :scheduler, :saturation]` (per-poll gauge: in_flight/buffer/concurrency/prefetch — the feeder-tuning
   signal), and `[:gen_durable, :scheduler, :drain]`. Documented all events (with the existing
-  `step.stop` / `partition.contended` / `reaper.reaped`) in the `GenDurable` moduledoc. Test asserts
+  `step.stop` / `concurrency.contended` / `reaper.reaped`) in the `GenDurable` moduledoc. Test asserts
   pick + saturation fire. 55 tests green (1 bench excluded).
 
 ### F11 — `:fsms` is now optional (dynamic FSM resolution) ✅ DONE
@@ -508,7 +508,7 @@ makes a finished instance still resolve as a signal target, see spec §7 note.)
 - **F4 (remaining) — gate `signals` + `childs` loads:** every step still does two `target/parent`
   SELECTs; gate them on `use GenDurable.FSM, awaits: true, childs: true` → a plain `:next` step goes
   from ~3 round-trips to ~1. (The outcome-collapse half of F4 is done — see F9.)
-- partition_key busy-spin on a hot key (picker-sharding, §6) — v2.
+- concurrency_key busy-spin on a hot key (picker-sharding, §6) — v2.
 - per-queue (vs engine-wide) feeder knobs; property/multi-node tests — v2.
 
 ---
@@ -527,7 +527,7 @@ fights advisory locks and multi-connection flows — run engine tests against a 
   "insert before flip" ordering so the woken step sees its signal.
 - **Uniqueness:** concurrent `insert_all` from multiple connections dedups; leaving an occupied
   status frees the key for re-insertion; `correlation_key IS NULL` never conflicts.
-- **partition_key:** spawn many machines sharing a key; assert steps never overlap and preserve order;
+- **concurrency_key:** spawn many machines sharing a key; assert steps never overlap and preserve order;
   assert cross-key parallelism; assert lock auto-release on simulated connection drop.
 - **Property test (optional):** random interleavings of pick/heartbeat/reap/outcome preserve "state
   committed before proceed" and never lose a signal.
@@ -549,7 +549,7 @@ fights advisory locks and multi-connection flows — run engine tests against a 
 
 ## 9. Risks / watch-items
 
-- **Connection pressure from partitioned steps** (§0): each in-flight partitioned step holds a
+- **Connection pressure from concurrency-keyed steps** (§0): each in-flight concurrency-keyed step holds a
   connection for its whole duration. Pool sizing must account for it.
 - **ON CONFLICT inference on the generated column** must match the partial index predicate exactly.
 - **Heartbeat vs lease race:** if heartbeat starves (slow DB), a live step can be reaped and run

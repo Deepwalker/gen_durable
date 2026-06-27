@@ -162,7 +162,7 @@ off cross-node fairness, priority freshness, and crash blast radius. See
 `GenDurable.Scheduler` for the trade-offs.
 
 Per-instance options to `insert/2` / `insert_all/3`: `:state`, `:step`, `:queue`,
-`:priority`, `:partition_key`, `:correlation_key`, `:correlation_scope`, and scheduling
+`:priority`, `:concurrency_key`, `:correlation_key`, `:correlation_scope`, and scheduling
 sugar `:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`) / `:schedule_in` (ms).
 `:correlation_key` is the instance's business identity — both the key you can later
 `signal/4` by (instead of the internal id) **and** a uniqueness guard. `:correlation_scope`

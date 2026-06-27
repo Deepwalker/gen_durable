@@ -59,9 +59,9 @@ The picker is dumb: it selects `runnable` rows whose `eligible_at` has arrived, 
 
 - **lease + reaper** — the worker holds a lease `lease_expires_at` and extends it with a heartbeat; the reaper returns `executing` rows with an expired lease to `runnable` (crash recovery, see §4.3).
 - **queue** — logical load separation; a worker pool subscribes to its queues, local concurrency = pool size.
-- **partition_key** — per-key serialization: the worker holds a session-level `pg_try_advisory_lock(hashtext(partition_key))` for the duration of the step; the picker skips locked keys. Parallelism across keys + strict ordering within a key. Worker death → connection dropped → advisory released automatically.
+- **concurrency_key** — per-key serialization: the worker holds a session-level `pg_try_advisory_lock(hashtext(concurrency_key))` for the duration of the step; the picker skips locked keys. Parallelism across keys + strict ordering within a key. Worker death → connection dropped → advisory released automatically.
 
-Plain `SKIP LOCKED` already provides concurrent executors with no coordination. Picker sharding (`hashtext(partition_key) % N`) is only worth it once head-of-queue contention shows up in a profile; it requires membership/rebalancing and works against the dumb-picker principle.
+Plain `SKIP LOCKED` already provides concurrent executors with no coordination. Picker sharding (`hashtext(concurrency_key) % N`) is only worth it once head-of-queue contention shows up in a profile; it requires membership/rebalancing and works against the dumb-picker principle.
 
 ## 7. Correlation key: identity = addressing + uniqueness
 
@@ -112,7 +112,7 @@ create table gen_durable (
   -- scheduling
   queue         text     not null default 'default',
   priority      smallint not null default 0,        -- lower = earlier
-  partition_key text,                               -- serialization key (advisory lock)
+  concurrency_key text,                               -- serialization key (advisory lock)
   eligible_at   timestamptz not null default now(),
   attempt       int      not null default 0,        -- attempts of the CURRENT step; reset on :next
   last_error    text,
@@ -188,10 +188,10 @@ update gen_durable g
 set status = 'executing', locked_by = $worker,
     lease_expires_at = now() + $lease_ttl, updated_at = now()
 from picked where g.id = picked.id
-returning g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.partition_key;
+returning g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key;
 ```
 
-Then, if `partition_key` is not NULL: `pg_try_advisory_lock(hashtext(partition_key))`; on failure, return the row to `runnable` (drop the lease) and skip it.
+Then, if `concurrency_key` is not NULL: `pg_try_advisory_lock(hashtext(concurrency_key))`; on failure, return the row to `runnable` (drop the lease) and skip it.
 
 ### Lease heartbeat
 
@@ -242,7 +242,7 @@ where id = $id;
 -- :schedule_childs  (one transaction; consume received ids, spawn the batch, then park on the join barrier)
 with ins as (
   insert into gen_durable
-    (fsm, step, state, queue, priority, partition_key,
+    (fsm, step, state, queue, priority, concurrency_key,
      eligible_at, correlation_key, correlation_scope, parent_id)
   values
     (...), (...)                                      -- one row per child, parent_id = $id
@@ -306,7 +306,7 @@ where id = $id and status = 'awaiting_signal' and $name = any(awaits);
 
 ```sql
 insert into gen_durable
-  (fsm, step, state, queue, priority, partition_key, eligible_at, correlation_key, correlation_scope)
+  (fsm, step, state, queue, priority, concurrency_key, eligible_at, correlation_key, correlation_scope)
 values
   (...), (...), (...)
 on conflict (correlation_guard) where correlation_guard is not null
@@ -322,7 +322,7 @@ One index catches duplicates both against existing rows and within the batch its
 
 `schedule_childs` is one outcome that does two things atomically: it spawns a batch of child instances and parks the parent on a **join barrier** that releases only when every child has reached a terminal status (`done` **or** `failed`). It is the engine's answer to "fan work out, then wait for all of it." Schema version 2 (`awaiting_children`, `parent_id`, `children_pending`, `gen_durable_parent`) backs it.
 
-**Shape.** `{:schedule_childs, next_step, children, state}`. `children` is a list of child specs, each an ordinary insert: `fsm`, `version`, `step`, `state`, `queue`, `priority`, `partition_key`, `correlation_key`, `:unique`, `eligible_at`. The engine stamps every child's `parent_id` with the parent's id. It is shaped like `:next` — the parent advances to `next_step` — but the transition is gated behind the barrier, so the parent re-runs at `next_step` (never at the spawning step), and there is no "re-run re-spawns" ambiguity.
+**Shape.** `{:schedule_childs, next_step, children, state}`. `children` is a list of child specs, each an ordinary insert: `fsm`, `version`, `step`, `state`, `queue`, `priority`, `concurrency_key`, `correlation_key`, `:unique`, `eligible_at`. The engine stamps every child's `parent_id` with the parent's id. It is shaped like `:next` — the parent advances to `next_step` — but the transition is gated behind the barrier, so the parent re-runs at `next_step` (never at the spawning step), and there is no "re-run re-spawns" ambiguity.
 
 **Atomic spawn + park.** The whole thing is the parent's step-completion transaction (§10): the children are inserted **and** the parent flips to `awaiting_children` in one commit. Children become visible (`runnable`) only once that commits — a child can never finish and try to release a barrier that does not yet exist. `children_pending` is set to the number of children **actually inserted** (per-child uniqueness may drop some); if zero are inserted the barrier is pre-satisfied and the parent goes straight to `next_step`, `runnable`.
 

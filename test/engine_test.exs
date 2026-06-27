@@ -196,23 +196,23 @@ defmodule GenDurable.EngineTest do
     assert row.attempt >= 1
   end
 
-  test "partition_key serializes steps sharing a key (no lost updates)" do
+  test "concurrency_key serializes steps sharing a key (no lost updates)" do
     start_supervised!(%{
-      id: :partition_agent,
-      start: {Agent, :start_link, [fn -> 0 end, [name: GenDurable.Test.PartitionAgent]]}
+      id: :concurrency_agent,
+      start: {Agent, :start_link, [fn -> 0 end, [name: GenDurable.Test.ConcurrencyAgent]]}
     })
 
     start_engine()
 
     ids =
       for _ <- 1..4 do
-        {:ok, id} = GenDurable.insert(GenDurable.Test.PartitionInc, partition_key: "k")
+        {:ok, id} = GenDurable.insert(GenDurable.Test.ConcurrencyInc, concurrency_key: "k")
         id
       end
 
     for id <- ids, do: wait_status(id, "done")
 
-    assert Agent.get(GenDurable.Test.PartitionAgent, & &1) == 4
+    assert Agent.get(GenDurable.Test.ConcurrencyAgent, & &1) == 4
   end
 
   test "schedule_childs fans out and joins on all children (spec §11)" do
@@ -322,12 +322,12 @@ defmodule GenDurable.EngineTest do
     assert Enum.all?(rows, &(Jason.decode!(&1.result) == %{"slept" => 200}))
   end
 
-  test "different partition_keys run in parallel (overlapping steps)" do
+  test "different concurrency_keys run in parallel (overlapping steps)" do
     start_supervised!(agent_spec(GenDurable.Test.OverlapAgent, fn -> %{} end))
     start_engine(queues: [default: 4])
 
-    {:ok, a} = GenDurable.insert(GenDurable.Test.Overlap, partition_key: "ka")
-    {:ok, b} = GenDurable.insert(GenDurable.Test.Overlap, partition_key: "kb")
+    {:ok, a} = GenDurable.insert(GenDurable.Test.Overlap, concurrency_key: "ka")
+    {:ok, b} = GenDurable.insert(GenDurable.Test.Overlap, concurrency_key: "kb")
 
     wait_status(a, "done")
     wait_status(b, "done")

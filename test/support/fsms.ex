@@ -121,13 +121,13 @@ defmodule GenDurable.Test.Reborn do
   def step("go", _ctx), do: {:done, %{"recovered" => true}}
 end
 
-defmodule GenDurable.Test.PartitionInc do
+defmodule GenDurable.Test.ConcurrencyInc do
   @moduledoc "Read-sleep-write against a shared Agent to expose lost updates."
-  use GenDurable.FSM, name: "partition_inc", version: 1, initial: "inc"
+  use GenDurable.FSM, name: "concurrency_inc", version: 1, initial: "inc"
 
   @impl true
   def step("inc", _ctx) do
-    agent = GenDurable.Test.PartitionAgent
+    agent = GenDurable.Test.ConcurrencyAgent
     v = Agent.get(agent, & &1)
     Process.sleep(25)
     Agent.update(agent, fn _ -> v + 1 end)
@@ -279,7 +279,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.AwaitRetry,
       GenDurable.Test.Crasher,
       GenDurable.Test.Reborn,
-      GenDurable.Test.PartitionInc,
+      GenDurable.Test.ConcurrencyInc,
       GenDurable.Test.Plain,
       GenDurable.Test.Child,
       GenDurable.Test.Parent,

@@ -34,7 +34,7 @@ defmodule GenDurable.PerfTest do
         state_json: ~s({"n":0}),
         queue: "default",
         priority: 0,
-        partition_key: nil,
+        concurrency_key: nil,
         correlation_key: nil,
         correlation_scope: [],
         eligible_at: nil

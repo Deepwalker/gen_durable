@@ -38,9 +38,9 @@ defmodule GenDurable do
       for tuning the feeder knobs.
     * `[:gen_durable, :scheduler, :drain]` — graceful shutdown of a queue.
       Measurements `%{released, in_flight}`; metadata `%{queue}`.
-    * `[:gen_durable, :partition, :contended]` — a partition advisory lock was
-      contended (a row was handed back). Measurements `%{count}`; metadata
-      `%{id, fsm, partition_key}`.
+    * `[:gen_durable, :concurrency, :contended]` — a concurrency_key advisory lock
+      was contended (a row was handed back). Measurements `%{count}`; metadata
+      `%{id, fsm, concurrency_key}`.
     * `[:gen_durable, :reaper, :reaped]` — expired leases reclaimed. Measurements
       `%{count}`; metadata `%{ids}`.
     * `[:gen_durable, :gc, :swept]` — terminal rows deleted by a GC sweep.
@@ -67,7 +67,7 @@ defmodule GenDurable do
 
   @doc """
   Enqueue one FSM instance. Options: `:state` (alias `:args`, the job-form name),
-  `:step` (default the FSM's `:initial`), `:queue`, `:priority`, `:partition_key`,
+  `:step` (default the FSM's `:initial`), `:queue`, `:priority`, `:concurrency_key`,
   `:correlation_key`, `:correlation_scope`, and scheduling — `:eligible_at` (a `DateTime`),
   or the sugar `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
   Returns `{:ok, id}` or `{:error, :duplicate}`.
@@ -131,7 +131,7 @@ defmodule GenDurable do
       state_json: State.cast(state_module, opts[:state] || opts[:args] || %{}),
       queue: opts[:queue] || fsm_module.__gd_queue__(),
       priority: opts[:priority] || 0,
-      partition_key: opts[:partition_key],
+      concurrency_key: opts[:concurrency_key],
       correlation_key: opts[:correlation_key],
       correlation_scope: correlation_scope(opts),
       eligible_at: resolve_eligible_at(opts)

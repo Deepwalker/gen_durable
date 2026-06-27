@@ -80,7 +80,7 @@ defmodule GenDurable.Migration do
 
       queue         text     not null default 'default',
       priority      smallint not null default 0,
-      partition_key text,
+      concurrency_key text,
       eligible_at   timestamptz not null default now(),
       attempt       int  not null default 0,
       last_error    text,
@@ -121,12 +121,12 @@ defmodule GenDurable.Migration do
     """)
 
     # Supports the picker's "skip a key already being processed" guard
-    # (partition_key dedup): NOT EXISTS over executing rows by partition_key.
+    # (concurrency_key dedup): NOT EXISTS over executing rows by concurrency_key.
     # Scoped to non-null keys: the guard only ever probes real keys, so a
-    # non-partitioned claim (the common case) never writes to this index.
+    # non-keyed claim (the common case) never writes to this index.
     execute("""
-    CREATE INDEX gen_durable_partition_active ON #{p}.gen_durable (partition_key)
-      WHERE status = 'executing' AND partition_key IS NOT NULL
+    CREATE INDEX gen_durable_concurrency_active ON #{p}.gen_durable (concurrency_key)
+      WHERE status = 'executing' AND concurrency_key IS NOT NULL
     """)
 
     # correlation_key: one partial unique index does double duty — it enforces

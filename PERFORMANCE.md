@@ -53,7 +53,7 @@ outcome from 4 hops to 1 matters more than any single statement's plan.
 
 The picker runs on every poll and every completion-driven refill, so it is the query
 that most has to stay cheap as the table grows. It does three things in one statement:
-claim a batch atomically, serialize partitions, and dedup partition keys (spec §6).
+claim a batch atomically, serialize concurrency keys, and dedup concurrency keys (spec §6).
 
 ### 2.1 The decisive detail: `queue = $1`, never `ANY`
 
@@ -66,7 +66,7 @@ and falls back to **scanning the entire runnable set and top-N sorting it**:
 ```
 -- queue = ANY('{default}')  ❌
 ->  Index Scan using gen_durable_pick on gen_durable g_2 (rows=280000)   ← whole runnable set
-      Filter: ((partition_key IS NULL) OR (NOT ...))
+      Filter: ((concurrency_key IS NULL) OR (NOT ...))
 ->  Sort  Sort Method: top-N heapsort
 Execution Time: 613.578 ms
 ```
@@ -84,7 +84,7 @@ Execution Time: 0.725 ms
 ### 2.2 Full plan of the picker (`batch = 50`)
 
 The picker is the canonical Postgres claim — one `SELECT … FOR UPDATE SKIP LOCKED LIMIT`,
-then one `UPDATE` — with the partition dedup folded in as a window function over the
+then one `UPDATE` — with the concurrency_key dedup folded in as a window function over the
 locked set, so there is **exactly one nested loop** (the `UPDATE` join):
 
 ```
@@ -92,12 +92,12 @@ Update on gen_durable g (actual time=0.400..0.983 rows=50 loops=1)
   Buffers: shared hit=868
   CTE locked
     ->  WindowAgg (rows=50)                                     ← dedup: row_number() per key
-          ->  Sort  Sort Key: COALESCE(partition_key, id::text), priority, eligible_at  (27kB)
+          ->  Sort  Sort Key: COALESCE(concurrency_key, id::text), priority, eligible_at  (27kB)
                 ->  Limit (rows=50)
                       ->  LockRows (rows=50)                    ← FOR UPDATE SKIP LOCKED, in-scan
                             ->  Index Scan using gen_durable_pick (rows=50)
                                   Index Cond: ((queue = 'default') AND (eligible_at <= now()))
-                                  Filter: ((partition_key IS NULL) OR (NOT (… hashed SubPlan 2)))
+                                  Filter: ((concurrency_key IS NULL) OR (NOT (… hashed SubPlan 2)))
                                   SubPlan 2
                                     ->  Index Scan using gen_durable_lease (never executed)
   ->  Nested Loop (rows=50)                                     ← the one, optimal join
@@ -116,12 +116,12 @@ What to read here:
   (`DISTINCT ON` → re-lock → update) had a second nested loop that scaled per-row with
   the batch; folding the dedup into a window function removed it (measured −19% at
   batch 5000, §2.4).
-- **`SubPlan 2` (the partition `NOT EXISTS`) was `never executed`** here because the top
-  50 rows were non-partitioned (`partition_key IS NULL` short-circuits the guard). A
-  non-partitioned queue pays **nothing** for the partition machinery. When partitioned
-  rows *are* in the window, the guard probes `gen_durable_partition_active` — a partial
-  index over only the executing rows with a **non-null** `partition_key`, so a
-  non-partitioned claim never even writes to it.
+- **`SubPlan 2` (the concurrency_key `NOT EXISTS`) was `never executed`** here because the top
+  50 rows were non-keyed (`concurrency_key IS NULL` short-circuits the guard). A
+  non-keyed queue pays **nothing** for the concurrency machinery. When concurrency-keyed
+  rows *are* in the window, the guard probes `gen_durable_concurrency_active` — a partial
+  index over only the executing rows with a **non-null** `concurrency_key`, so a
+  non-keyed claim never even writes to it.
 - **The single `Nested Loop` is the `UPDATE` join, and it is optimal** — outer = `batch`
   rows, inner = one primary-key point lookup each (`loops=50, rows=1`). That is O(batch)
   point updates, the textbook-best way to update N rows by id; see §2.5 for the proof
@@ -151,7 +151,7 @@ The fixed cost (planning + the `NOT EXISTS` hash build over the executing set) a
 away with bigger batches; the **~11–16 µs/row marginal cost does not**. That floor is the
 actual work of *claiming*: flipping each row `runnable → executing` is a heap write plus
 moving the row out of the `runnable` partial index and into the two `executing` partial
-indexes (`lease`, `partition_active`) — plus WAL for all of it. **You cannot claim a row
+indexes (`lease`, `concurrency_active`) — plus WAL for all of it. **You cannot claim a row
 without writing it**, so ~11–16 µs/row is close to the floor for this schema.
 
 Two consequences worth designing around:
@@ -192,7 +192,7 @@ Restructurings prototyped against the seeded dataset and **rejected by measureme
 recorded so they are not re-attempted blind:
 
 - **Single-scan dedup** (correlated `NOT EXISTS` "I am the most-urgent runnable of my key"
-  + `FOR UPDATE` in the scan, backed by a new `(partition_key, priority, eligible_at)`
+  + `FOR UPDATE` in the scan, backed by a new `(concurrency_key, priority, eligible_at)`
   partial index). A wash on wall-clock and **worse at batch 5000** — the new partial index
   adds write amplification to every claim *and* every return-to-`runnable`. The window
   function over the locked set (the shipped picker) gets the same dedup with no new index.
@@ -351,7 +351,7 @@ bulk (700k `done`/`failed`) sits in none of the partial indexes.
 | Query | Index | Kind |
 |---|---|---|
 | `pick` scan | `gen_durable_pick (queue, priority, eligible_at) WHERE status='runnable'` | partial, ordered |
-| `pick` partition guard | `gen_durable_partition_active (partition_key) WHERE status='executing' AND partition_key IS NOT NULL` | partial, index-only probe |
+| `pick` concurrency guard | `gen_durable_concurrency_active (concurrency_key) WHERE status='executing' AND concurrency_key IS NOT NULL` | partial, index-only probe |
 | `pick` lock / outcomes / signal | `gen_durable_pkey (id)` | primary key |
 | `reap` | `gen_durable_lease (lease_expires_at) WHERE status='executing'` | partial |
 | `insert` dedup | `gen_durable_unique (unique_guard) WHERE unique_guard IS NOT NULL` | partial unique |
@@ -397,17 +397,17 @@ magnitude. The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 
 
 ### Known limits / pathologies (honest list)
 
-1. **A single hot partition key with a large runnable backlog.** While that key is
+1. **A single hot concurrency key with a large runnable backlog.** While that key is
    `executing`, the picker's `NOT EXISTS` excludes each of its runnable siblings — one
    cheap index probe each — but if those siblings dominate the top of the queue by
    priority, the scan walks past many of them per pick. The window `LIMIT` bounds the
    *output*, not how far it skips. Mitigation (future): picker sharding by `hashtext(key)`
    so one key maps to one scheduler, or a per-key "next eligible" side structure. A single
    key monopolizing a queue is itself a modeling smell.
-2. **Partitioned steps pin a connection.** `partition_key` serialization holds a session
+2. **Concurrency-keyed steps pin a connection.** `concurrency_key` serialization holds a session
    advisory lock on a checked-out connection for the *whole* step (user code included), so
-   in-flight partitioned steps consume pool connections 1:1. Size the pool for peak
-   partitioned concurrency. Non-partitioned steps grab/release per statement.
+   in-flight concurrency-keyed steps consume pool connections 1:1. Size the pool for peak
+   concurrency-keyed concurrency. Non-concurrency-keyed steps grab/release per statement.
 3. **`load_signals` + `load_childs` run on every step**, even for FSMs that never await or
    spawn. Two wasted round-trips for the common machine; gate them behind
    `use GenDurable.FSM, awaits: true, childs: true`. The last remaining F4 step.
@@ -433,7 +433,7 @@ The dataset and every `EXPLAIN` above were produced in the devcontainer Postgres
 regenerate: bring up the stack (`make up`), then in `docker compose … exec db psql -U
 postgres`, create a scratch database, apply the v1 DDL from
 `lib/gen_durable/migration.ex` verbatim, seed with `generate_series` (700k terminal /
-200k runnable non-partitioned / 80k distinct-key / 15k hot-key / 5k executing / 50k
+200k runnable non-keyed / 80k distinct-key / 15k hot-key / 5k executing / 50k
 signals), `ANALYZE`, and run `EXPLAIN (ANALYZE, BUFFERS)` on each statement from
 `lib/gen_durable/queries.ex`. Wrap mutating statements in `BEGIN; … ; ROLLBACK;` so the
 plan executes without changing the dataset. Run each twice and read the second (warm).

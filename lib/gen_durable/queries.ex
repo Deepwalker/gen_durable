@@ -4,14 +4,14 @@ defmodule GenDurable.Queries do
 
   All functions take the `repo` explicitly. The `complete_*` functions run the
   outcome `UPDATE` and the consumed-signal `DELETE` in one transaction.
-  `partition_key` serialization (advisory lock) helpers live here too; the
+  `concurrency_key` serialization (advisory lock) helpers live here too; the
   caller is responsible for holding a single connection (`Repo.checkout/1`) for
   the lock's lifetime.
   """
 
   # --- picker ----------------------------------------------------------------
 
-  # partition_key dedup (spec §6): never claim more than one row per partition_key
+  # concurrency_key dedup (spec §6): never claim more than one row per concurrency_key
   # in a batch, and never claim a key that is already being processed — without the
   # wasted claim→try_lock→reset churn that prefetch would amplify on hot keys.
   #
@@ -24,7 +24,7 @@ defmodule GenDurable.Queries do
   #            the order so the LIMIT stops early instead of scanning + sorting
   #            the whole runnable set (see PERFORMANCE.md). Rows whose key is
   #            already `executing` are excluded (NOT EXISTS); NULL keys never
-  #            serialize, so they short-circuit the guard and a non-partitioned
+  #            serialize, so they short-circuit the guard and a non-keyed
   #            queue pays nothing for it. `row_number()` over the *locked* set
   #            marks the most-urgent row per key (NULL keys fall back to id, so
   #            each is its own group and is never collapsed).
@@ -43,15 +43,15 @@ defmodule GenDurable.Queries do
   @pick_sql """
   WITH locked AS (
     SELECT id,
-           row_number() OVER (PARTITION BY coalesce(partition_key, id::text)
+           row_number() OVER (PARTITION BY coalesce(concurrency_key, id::text)
                               ORDER BY priority, eligible_at) AS rn
     FROM (
-      SELECT id, partition_key, priority, eligible_at
+      SELECT id, concurrency_key, priority, eligible_at
       FROM gen_durable g
       WHERE g.status = 'runnable' AND g.eligible_at <= now() AND g.queue = $1
-        AND (g.partition_key IS NULL OR NOT EXISTS (
+        AND (g.concurrency_key IS NULL OR NOT EXISTS (
           SELECT 1 FROM gen_durable e
-          WHERE e.partition_key = g.partition_key AND e.status = 'executing'
+          WHERE e.concurrency_key = g.concurrency_key AND e.status = 'executing'
         ))
       ORDER BY g.priority, g.eligible_at
       FOR UPDATE SKIP LOCKED
@@ -63,7 +63,7 @@ defmodule GenDurable.Queries do
       lease_expires_at = now() + $4::int * interval '1 millisecond', updated_at = now()
   FROM locked l
   WHERE g.id = l.id AND l.rn = 1
-  RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.partition_key, g.awaits
+  RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key, g.awaits
   """
 
   def pick(repo, queue, batch, worker, lease_ttl_ms) do
@@ -71,7 +71,7 @@ defmodule GenDurable.Queries do
     Enum.map(rows, &to_job/1)
   end
 
-  defp to_job([id, fsm, fsm_version, step, state, attempt, partition_key, awaits]) do
+  defp to_job([id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits]) do
     %{
       id: id,
       fsm: fsm,
@@ -79,7 +79,7 @@ defmodule GenDurable.Queries do
       step: step,
       state: state,
       attempt: attempt,
-      partition_key: partition_key,
+      concurrency_key: concurrency_key,
       awaits: awaits
     }
   end
@@ -315,7 +315,7 @@ defmodule GenDurable.Queries do
     sql =
       "WITH consumed AS (DELETE FROM signals WHERE target_id = $1 AND id = ANY($4::bigint[])), " <>
         "ins AS (INSERT INTO gen_durable " <>
-        "(fsm, fsm_version, step, state, queue, priority, partition_key, " <>
+        "(fsm, fsm_version, step, state, queue, priority, concurrency_key, " <>
         "eligible_at, correlation_key, correlation_scope, parent_id) VALUES " <>
         Enum.join(placeholders, ", ") <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
@@ -430,7 +430,7 @@ defmodule GenDurable.Queries do
 
   # --- insert / batch insert -------------------------------------------------
 
-  @insert_cols "fsm, fsm_version, step, state, queue, priority, partition_key, eligible_at, correlation_key, correlation_scope"
+  @insert_cols "fsm, fsm_version, step, state, queue, priority, concurrency_key, eligible_at, correlation_key, correlation_scope"
 
   def insert(repo, p) do
     sql =
@@ -471,14 +471,14 @@ defmodule GenDurable.Queries do
       p.state_json,
       p.queue,
       p.priority,
-      p.partition_key,
+      p.concurrency_key,
       p.eligible_at,
       p.correlation_key,
       p.correlation_scope
     ]
   end
 
-  # --- partition_key serialization (advisory lock) ---------------------------
+  # --- concurrency_key serialization (advisory lock) ---------------------------
 
   def advisory_try_lock(repo, key) do
     %{rows: [[locked]]} = repo.query!("SELECT pg_try_advisory_lock(hashtext($1))", [key])

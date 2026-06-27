@@ -33,7 +33,7 @@ defmodule GenDurable.Scheduler do
   the reaper — so deeper buffers mean a larger crash blip, bounded by the (short)
   TTL, not by the buffer depth.
 
-  `partition_key` serialization (spec §6) is handled per-job at execution time: a
+  `concurrency_key` serialization (spec §6) is handled per-job at execution time: a
   session-level advisory lock is taken on a checked-out connection held for the
   whole step, and released after the outcome commits. If the lock is contended,
   the row is returned to `runnable` and skipped.
@@ -187,7 +187,7 @@ defmodule GenDurable.Scheduler do
     state = %{
       state
       | buffer: rest,
-        in_flight: Map.put(state.in_flight, task.ref, {job.id, job.partition_key})
+        in_flight: Map.put(state.in_flight, task.ref, {job.id, job.concurrency_key})
     }
 
     drain(state)
@@ -213,10 +213,10 @@ defmodule GenDurable.Scheduler do
     %{state | cur_poll: cur}
   end
 
-  # Run the step, serializing on partition_key when present.
-  defp execute_job(config, %{partition_key: nil} = job), do: Executor.run(config, job)
+  # Run the step, serializing on concurrency_key when present.
+  defp execute_job(config, %{concurrency_key: nil} = job), do: Executor.run(config, job)
 
-  defp execute_job(config, %{partition_key: key} = job) do
+  defp execute_job(config, %{concurrency_key: key} = job) do
     repo = config.repo
 
     repo.checkout(fn ->
@@ -228,12 +228,12 @@ defmodule GenDurable.Scheduler do
         end
       else
         # Another worker holds this key; hand the row back. With the picker's
-        # partition dedup this should be rare (only a cross-node or unlock-gap
+        # concurrency_key dedup this should be rare (only a cross-node or unlock-gap
         # race), so it is worth a telemetry signal.
         :telemetry.execute(
-          [:gen_durable, :partition, :contended],
+          [:gen_durable, :concurrency, :contended],
           %{count: 1},
-          %{id: job.id, fsm: job.fsm, partition_key: key}
+          %{id: job.id, fsm: job.fsm, concurrency_key: key}
         )
 
         Queries.reset_to_runnable(repo, job.id)
