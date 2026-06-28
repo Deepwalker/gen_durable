@@ -37,6 +37,8 @@ defmodule GenDurable.PerfTest do
         concurrency_key: nil,
         correlation_key: nil,
         correlation_scope: [],
+        rate_limit: nil,
+        weight: 1,
         eligible_at: nil
       },
       overrides
@@ -77,10 +79,10 @@ defmodule GenDurable.PerfTest do
 
   test "complete_next is a single statement (one round-trip)" do
     id = setup_executing()
-    sql = statements(fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), []) end)
+    sql = statements(fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [], nil, 1) end)
 
     assert length(sql) == 1
-    assert hd(sql) =~ "WITH consumed"
+    assert hd(sql) =~ "consumed AS"
   end
 
   test "complete_retry is a single statement" do
@@ -127,7 +129,7 @@ defmodule GenDurable.PerfTest do
     id = setup_executing()
     iters = 500
 
-    new = bench(iters, fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), []) end)
+    new = bench(iters, fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [], nil, 1) end)
     old = bench(iters, fn -> complete_next_tx(id, "tick", ~s({"n":1})) end)
 
     IO.puts("\n  complete_next over #{iters} iters (median µs/call):")

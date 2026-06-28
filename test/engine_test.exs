@@ -460,4 +460,14 @@ defmodule GenDurable.EngineTest do
     Process.sleep(100)
     assert row_count(id) == 1
   end
+
+  test "a :next naming an unconfigured rate_limit emits :rate_limit :unknown (spec §12)" do
+    attach_telemetry([[:gen_durable, :rate_limit, :unknown]])
+    start_engine()
+    {:ok, _id} = GenDurable.insert(GenDurable.Test.RateUnknown)
+
+    assert_receive {:telemetry, [:gen_durable, :rate_limit, :unknown], %{count: 1},
+                    %{name: "ghost", step: "go"}},
+                   2_000
+  end
 end

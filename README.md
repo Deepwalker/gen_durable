@@ -150,9 +150,23 @@ The engine is started as `{GenDurable, opts}`. Full reference lives in the
 | `:min_demand` | `1` | batch gate: skip picking unless at least this many slots are free |
 | `:max_poll_interval` | `5_000` | idle-backoff ceiling: an empty pick on an idle queue doubles the poll interval up to here, then snaps back when work appears |
 | `:drain_timeout` | `5_000` | on shutdown, ms each queue waits for in-flight steps to finish before giving up to the reaper (buffered, un-started rows are released immediately) |
+| `:rate_limits` | `[]` | named token-bucket rate limits, e.g. `[stripe: [allowed: 100, period: {1, :minute}]]` (`burst` defaults to `allowed`); a step opts in via `rate_limit:` (see below) |
 
 Timings are in milliseconds; keep `heartbeat_interval × 3 ≲ lease_ttl` for margin
 (the "Balanced" defaults satisfy this).
+
+**Rate limiting** (spec §12) throttles a *specific step* to N starts per period. Configure
+named limits with `:rate_limits`, then a step opts in by returning the key for its next step:
+
+```elixir
+def step("prepare", ctx), do: {:next, "charge", ctx.state, rate_limit: {:stripe, ctx.state.tenant}}
+def step("charge",  ctx), do: # ≤ the "stripe" budget per tenant; runs the API call
+```
+
+`weight: n` (default 1) lets one step consume more than one unit (`weight ≤ burst` is your
+responsibility — split the step otherwise). It is a token bucket: `period`+`allowed` set the
+sustained rate, `burst` the instantaneous slack. `NULL` (no `rate_limit:`) is the common case
+and costs nothing.
 
 `:prefetch`, `:min_demand`, and `:max_poll_interval` are the **feeder aggressiveness**
 knobs. Defaults are conservative (fair across nodes, low idle DB chatter). Raising
@@ -162,8 +176,9 @@ off cross-node fairness, priority freshness, and crash blast radius. See
 `GenDurable.Scheduler` for the trade-offs.
 
 Per-instance options to `insert/2` / `insert_all/3`: `:state`, `:step`, `:queue`,
-`:priority`, `:concurrency_key`, `:correlation_key`, `:correlation_scope`, and scheduling
-sugar `:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`) / `:schedule_in` (ms).
+`:priority`, `:concurrency_key`, `:correlation_key`, `:correlation_scope`, `:rate_limit`,
+`:weight`, and scheduling sugar `:eligible_at` (a `DateTime`) / `:schedule_at` (a `DateTime`)
+/ `:schedule_in` (ms).
 `:correlation_key` is the instance's business identity — both the key you can later
 `signal/4` by (instead of the internal id) **and** a uniqueness guard. `:correlation_scope`
 is the statuses in which the key is "occupied" (uniqueness + addressing apply); it defaults

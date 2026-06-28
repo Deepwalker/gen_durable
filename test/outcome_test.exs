@@ -4,8 +4,20 @@ defmodule GenDurable.OutcomeTest do
   alias GenDurable.Outcome
 
   test "validates and normalizes each outcome" do
-    assert {:ok, {:next, "ship", %{n: 1}}} = Outcome.validate({:next, :ship, %{n: 1}})
-    assert {:ok, {:next, "ship", :st}} = Outcome.validate({:next, "ship", :st})
+    # :next normalizes to a 4-tuple carrying the per-transition opts map (spec §12)
+    assert {:ok, {:next, "ship", %{n: 1}, %{rate_limit: nil, weight: 1}}} =
+             Outcome.validate({:next, :ship, %{n: 1}})
+
+    assert {:ok, {:next, "ship", :st, %{rate_limit: nil, weight: 1}}} =
+             Outcome.validate({:next, "ship", :st})
+
+    # :next with opts: rate_limit name | {name, partition} and weight
+    assert {:ok, {:next, "charge", :st, %{rate_limit: "stripe", weight: 1}}} =
+             Outcome.validate({:next, "charge", :st, rate_limit: :stripe})
+
+    assert {:ok, {:next, "charge", :st, %{rate_limit: "stripe:42", weight: 50}}} =
+             Outcome.validate({:next, "charge", :st, rate_limit: {:stripe, 42}, weight: 50})
+
     assert {:ok, {:retry, :st, 500}} = Outcome.validate({:retry, :st, 500})
     # await: a single name or a list, both normalize to a list of strings
     assert {:ok, {:await, ["go"], "woke", :st}} = Outcome.validate({:await, :go, :woke, :st})
@@ -24,6 +36,8 @@ defmodule GenDurable.OutcomeTest do
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, :go, :st})
     # await with an empty name set is invalid
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, [], "woke", :st})
+    # :next with a bad weight (non-positive) is invalid
+    assert {:error, {:bad_outcome, _}} = Outcome.validate({:next, "x", :st, weight: 0})
     assert {:error, {:bad_outcome, _}} = Outcome.validate(:nonsense)
   end
 

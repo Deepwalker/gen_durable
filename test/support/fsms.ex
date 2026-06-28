@@ -268,10 +268,20 @@ defmodule GenDurable.Test.JobCancel do
   def perform(_args, _ctx), do: {:cancel, "nope"}
 end
 
+defmodule GenDurable.Test.RateUnknown do
+  @moduledoc "First step names an unconfigured rate_limit → :unknown telemetry (then it stalls)."
+  use GenDurable.FSM, name: "rate_unknown", version: 1, initial: "go"
+
+  @impl true
+  def step("go", %{state: s}), do: {:next, "fin", s, rate_limit: :ghost}
+  def step("fin", _ctx), do: {:done, %{}}
+end
+
 defmodule GenDurable.Test.FSMs do
   def all do
     [
       GenDurable.Test.Counter,
+      GenDurable.Test.RateUnknown,
       GenDurable.Test.MapCounter,
       GenDurable.Test.Awaiter,
       GenDurable.Test.Selector,

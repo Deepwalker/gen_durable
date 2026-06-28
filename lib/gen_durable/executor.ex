@@ -50,6 +50,7 @@ defmodule GenDurable.Executor do
     started = System.monotonic_time()
     {outcome, consumed} = invoke(module, ctx)
     apply_outcome(repo, state_module, job.id, outcome, consumed)
+    warn_unknown_rate_limit(config, job, outcome)
 
     :telemetry.execute(
       [:gen_durable, :step, :stop],
@@ -59,6 +60,24 @@ defmodule GenDurable.Executor do
 
     outcome
   end
+
+  # A `:next` naming a rate-limit whose name has no configured policy (spec §12): the row
+  # would stall (no bucket). Emit telemetry so it is observable, not silent.
+  defp warn_unknown_rate_limit(config, job, {:next, _step, _state, %{rate_limit: rl}})
+       when is_binary(rl) do
+    name = rl |> String.split(":", parts: 2) |> hd()
+    names = Map.get(config, :rate_limit_names, MapSet.new())
+
+    unless MapSet.member?(names, name) do
+      :telemetry.execute(
+        [:gen_durable, :rate_limit, :unknown],
+        %{count: 1},
+        %{key: rl, name: name, fsm: job.fsm, step: job.step}
+      )
+    end
+  end
+
+  defp warn_unknown_rate_limit(_config, _job, _outcome), do: :ok
 
   # step/2, falling back to handle/2 on a caught exception. Returns the validated
   # outcome plus the signal ids to consume on a progressing outcome (the awaited
@@ -84,8 +103,16 @@ defmodule GenDurable.Executor do
   # outcomes delete the whole inbox regardless (cleanup), :retry/:await delete nothing.
   defp apply_outcome(repo, state_module, id, outcome, consumed) do
     case outcome do
-      {:next, step, state} ->
-        Queries.complete_next(repo, id, step, State.to_db(state_module, state), consumed)
+      {:next, step, state, opts} ->
+        Queries.complete_next(
+          repo,
+          id,
+          step,
+          State.to_db(state_module, state),
+          consumed,
+          opts.rate_limit,
+          opts.weight
+        )
 
       {:retry, state, delay} ->
         Queries.complete_retry(repo, id, State.to_db(state_module, state), delay)

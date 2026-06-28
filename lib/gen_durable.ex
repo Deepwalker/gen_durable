@@ -45,6 +45,12 @@ defmodule GenDurable do
       `%{count}`; metadata `%{ids}`.
     * `[:gen_durable, :gc, :swept]` — terminal rows deleted by a GC sweep.
       Measurements `%{count}`; metadata `%{}`.
+    * `[:gen_durable, :rate_limit, :throttled]` — a rate-limit bucket granted fewer rows
+      than wanted in a pick (spec §12). Measurements `%{wanted, granted}`; metadata
+      `%{key, queue}`. The signal that a limit is biting.
+    * `[:gen_durable, :rate_limit, :unknown]` — a step named a `rate_limit` whose name has
+      no configured policy (the row would stall). Measurements `%{count}`; metadata
+      `%{key, name, fsm, step}`.
 
   See `gen_durable_spec.md` (normative) and `gen_durable_plan.md` (roadmap).
   """
@@ -134,9 +140,16 @@ defmodule GenDurable do
       concurrency_key: opts[:concurrency_key],
       correlation_key: opts[:correlation_key],
       correlation_scope: correlation_scope(opts),
+      rate_limit: rate_limit_key(opts[:rate_limit]),
+      weight: opts[:weight] || 1,
       eligible_at: resolve_eligible_at(opts)
     }
   end
+
+  # Resolve an insert-time `:rate_limit` key (spec §12): nil | name | {name, partition}.
+  defp rate_limit_key(nil), do: nil
+  defp rate_limit_key(name) when is_binary(name) or is_atom(name), do: to_string(name)
+  defp rate_limit_key({name, partition}), do: "#{name}:#{partition}"
 
   # The statuses in which a correlation_key is "occupied": the engine enforces uniqueness
   # over them and resolves the signal address within them. Supplied directly as

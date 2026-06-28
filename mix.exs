@@ -6,7 +6,7 @@ defmodule GenDurable.MixProject do
   def project do
     [
       app: :gen_durable,
-      version: "0.1.7",
+      version: "0.1.8",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -26,7 +26,7 @@ defmodule GenDurable.MixProject do
     [
       licenses: ["BSD-3-Clause"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md LICENSE PERFORMANCE.md .formatter.exs
+      files: ~w(lib mix.exs README.md LICENSE CHANGELOG.md PERFORMANCE.md .formatter.exs
                 gen_durable_spec.md gen_durable_plan.md)
     ]
   end
@@ -36,6 +36,7 @@ defmodule GenDurable.MixProject do
       main: "readme",
       extras: [
         "README.md",
+        "CHANGELOG.md": [title: "Changelog"],
         "PERFORMANCE.md": [title: "Performance"],
         "gen_durable_spec.md": [title: "Specification"],
         "gen_durable_plan.md": [title: "Implementation plan"]

@@ -85,6 +85,12 @@ defmodule GenDurable.Migration do
       attempt       int  not null default 0,
       last_error    text,
 
+      -- rate limiting (spec §12): rate_limit is the bucket key for the CURRENT step
+      -- (NULL ⇒ not rate-limited), weight is how many budget units this step's execution
+      -- consumes (default 1). Both rewritten on every transition; kept on :retry.
+      rate_limit    text,
+      weight        double precision not null default 1,
+
       locked_by        text,
       lease_expires_at timestamptz,
 
@@ -162,9 +168,30 @@ defmodule GenDurable.Migration do
     """)
 
     execute("CREATE INDEX signals_target ON #{p}.signals (target_id, name)")
+
+    # rate limiting (spec §12). Configs are seeded at engine start from the `rate_limits:`
+    # option; the picker joins them. Buckets are token-bucket counters, one row per distinct
+    # key, ensured (full) by the transition that assigns the key.
+    execute("""
+    CREATE TABLE #{p}.gen_durable_rate_configs (
+      name  text primary key,
+      rate  double precision not null,   -- tokens per second (allowed / period)
+      burst double precision not null    -- bucket capacity
+    )
+    """)
+
+    execute("""
+    CREATE TABLE #{p}.gen_durable_rate_buckets (
+      key         text primary key,
+      tokens      double precision not null,
+      last_refill timestamptz not null default clock_timestamp()
+    )
+    """)
   end
 
   defp change(1, :down, p) do
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_rate_buckets")
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_rate_configs")
     execute("DROP TABLE IF EXISTS #{p}.signals")
     execute("DROP TABLE IF EXISTS #{p}.gen_durable")
     execute("DROP TYPE IF EXISTS #{p}.durable_status")

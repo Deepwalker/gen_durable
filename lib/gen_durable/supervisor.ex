@@ -25,6 +25,10 @@ defmodule GenDurable.Supervisor do
     * `:drain_timeout` — on shutdown, how long (ms) each queue waits for its
       in-flight steps to finish before giving up to the reaper (default `5_000`).
       Buffered (un-started) rows are released immediately regardless.
+    * `:rate_limits` — named token-bucket rate limits (spec §12, default `[]`), e.g.
+      `[stripe: [allowed: 100, period: {1, :minute}], emails: [allowed: 5, period: 60, burst: 10]]`.
+      `allowed`/`period` set the sustained rate; `burst` (default `allowed`) the capacity.
+      A step opts into a limit by returning `rate_limit: :stripe` (or `{:stripe, key}`).
 
   `:prefetch`, `:min_demand`, and `:max_poll_interval` are the feeder
   aggressiveness knobs and apply to every queue; see `GenDurable.Scheduler` for
@@ -46,7 +50,8 @@ defmodule GenDurable.Supervisor do
     prefetch: 0,
     min_demand: 1,
     max_poll_interval: 5_000,
-    drain_timeout: 5_000
+    drain_timeout: 5_000,
+    rate_limits: []
   ]
 
   def start_link(opts) do
@@ -58,8 +63,18 @@ defmodule GenDurable.Supervisor do
     opts = Keyword.merge(@defaults, opts)
     repo = Keyword.fetch!(opts, :repo)
 
-    config = %{repo: repo, lease_ttl_ms: Keyword.fetch!(opts, :lease_ttl)}
+    rate_configs = parse_rate_limits(Keyword.fetch!(opts, :rate_limits))
+
+    config = %{
+      repo: repo,
+      lease_ttl_ms: Keyword.fetch!(opts, :lease_ttl),
+      rate_limit_names: MapSet.new(rate_configs, & &1.name)
+    }
+
     :persistent_term.put({GenDurable, :config}, config)
+
+    # Seed the rate-limit policy table (spec §12) so the picker can join it. No-op when empty.
+    :ok = GenDurable.Queries.upsert_rate_configs(repo, rate_configs)
 
     task_sup = GenDurable.TaskSupervisor
 
@@ -121,4 +136,27 @@ defmodule GenDurable.Supervisor do
   end
 
   defp worker_id(queue), do: "#{queue}@#{node()}-#{System.unique_integer([:positive])}"
+
+  # `[stripe: [allowed: 100, period: {1, :minute}], …]` → `[%{name, rate, burst}]`.
+  # rate = allowed / period_seconds (the sustained throughput); burst defaults to allowed.
+  defp parse_rate_limits(rate_limits) do
+    for {name, cfg} <- rate_limits do
+      allowed = Keyword.fetch!(cfg, :allowed)
+      period = period_seconds(Keyword.fetch!(cfg, :period))
+
+      %{
+        name: to_string(name),
+        rate: allowed / period,
+        burst: Keyword.get(cfg, :burst, allowed) * 1.0
+      }
+    end
+  end
+
+  defp period_seconds(n) when is_integer(n) and n > 0, do: n
+  defp period_seconds({n, unit}) when is_integer(n) and n > 0, do: n * unit_seconds(unit)
+
+  defp unit_seconds(u) when u in [:second, :seconds], do: 1
+  defp unit_seconds(u) when u in [:minute, :minutes], do: 60
+  defp unit_seconds(u) when u in [:hour, :hours], do: 3600
+  defp unit_seconds(u) when u in [:day, :days], do: 86_400
 end

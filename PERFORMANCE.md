@@ -210,6 +210,48 @@ take the median of several runs before believing a delta.
 
 ---
 
+## 2b. Rate limiting folds into the picker for free on the common path
+
+Token-bucket rate limiting (spec §12) is a set of CTEs appended to the §2 pick. The design
+goal was **zero cost when unused** and **bounded cost when used**. Measured.
+
+**Common path (no rate-limited rows).** EXPLAIN of the pick on a 5000-row runnable queue,
+all `rate_limit IS NULL`:
+
+```
+Update on gen_durable g (rows=50)
+  CTE cand     -> Index Scan using gen_durable_pick (rows=50)   ← unchanged candidate select
+  CTE winners  -> WindowAgg -> Sort (rows=50, 27kB quicksort)   ← the only added work
+  CTE locked   -> LockRows (rows=0); rate_buckets index "never executed"
+  CTE avail/granted/writeback -> rows=0 / never executed
+  final        -> Nested Loop -> Index Scan gen_durable_pkey (the PK flip, as before)
+Execution Time: 0.85 ms
+```
+
+The candidate scan still rides `gen_durable_pick`, the flip is still the PK update — the
+rate-bucket joins do **nothing** (`never executed`, zero rows). The only addition is a window
+sort to compute the cumulative weight, over the **≤batch** winners (50 rows, ~27 kB,
+sub-millisecond) — bounded by batch, not table size.
+
+**Under contention.** A bucket is a single counter row locked with `FOR UPDATE`; concurrent
+pickers serialize on it. Measured drain of 20k jobs, 8 concurrent pickers, infinite budget
+(so we measure lock cost, not throttling):
+
+| path | throughput | vs lockless |
+|---|---|---|
+| no rate limit (lockless) | 17 700 jobs/s | 1.00× |
+| one hot bucket, blocking `FOR UPDATE` | 11 100 jobs/s | 0.63× |
+| 100 buckets (partitioned) | 15 000 jobs/s | 0.85× |
+
+11k grants/s through a **single** counter is far above any rate limit you would configure (the
+limit itself throttles lower), so the lock is never the bottleneck for a bucket you have capped.
+Grants are **batched** (one lock acquisition per pick-cycle, not per job), and partitioned
+buckets spread contention to near-baseline. `SKIP LOCKED` on the bucket measured *slower* for a
+single hot bucket (spin-retry with no alternative work), so the picker uses blocking
+`FOR UPDATE`. Numbers are on a local Postgres 17 (devcontainer); read the ratios, not absolutes.
+
+---
+
 ## 3. The outcome and point queries (all O(1) by primary key)
 
 Every outcome and every signal/insert touches rows **by primary key or a covering index** —

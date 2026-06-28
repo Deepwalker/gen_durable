@@ -333,3 +333,30 @@ One index catches duplicates both against existing rows and within the batch its
 **Failures.** The barrier waits for *termination*, not success: a child that ends `failed` still releases its slot. The parent sees `status: "failed"` + `last_error` in `ctx.childs` and decides (proceed, `:stop`, compensate). The engine does not auto-propagate child failure.
 
 **Not covered.** No cancel/cascade — terminating or failing a parent does not touch its children, and vice-versa. No quorum / `k`-of-`n` barrier — the join is all-or-nothing; quorum is the user's to build with `await` + per-child signals. No barrier deadline — a child that hangs forever hangs the parent; bound it inside the child (e.g. `:retry` with a timeout). Nesting is free: a child may itself `schedule_childs`, each level an independent barrier.
+
+## 12. Rate limiting (token bucket, per step)
+
+Concurrency (§6) bounds how many steps run *at once*; rate limiting bounds how many *start per unit time* — a different axis (concurrency 10 with 10 ms steps is ~1000 starts/s). The limit attaches to a **step**, not a queue: a queue holds many FSMs with many steps, and the limited resource (an external quota) is touched by one specific step. A rate-limited bucket is, by definition, low-throughput.
+
+**Model.** A **token bucket** per key, with two knobs: `rate = allowed/period` (sustained) and `burst` (capacity, default `allowed`). A row carries a `rate_limit` key (text, NULL ⇒ not limited — short-circuits everything) and a `weight` (default 1, the budget units its execution consumes). The key's **name** (before the first `:`) selects the configured `{rate, burst}`; an optional **partition** (the rest) gives a bucket per distinct full key. So `"stripe"` is one global bucket; `"stripe:42"` is one per tenant, both drawing the `stripe` policy.
+
+**Outcome API.** A step declares the key/weight for its **next** step (computed in code that already ran — never for its own gating, which is too late): `{:next, step, state, rate_limit: :stripe}` or `{:next, step, state, rate_limit: {:stripe, key}, weight: 50}`. `insert/2` accepts the same `:rate_limit`/`:weight`. The `rate_limit`/`weight` columns are rewritten on every transition (`:next`/`:schedule_childs`/`:await` clear them; **`:retry` keeps** them — a limited step that retries is still limited).
+
+**Config.** Engine option `rate_limits: [stripe: [allowed: 100, period: {1,:minute}], …]`, seeded into `gen_durable_rate_configs` at start; `period` is seconds or `{n, :second|:minute|:hour|:day}`.
+
+**Enforcement (the picker).** Folded into the §10 pick, one statement: the concurrency winners get a per-bucket cumulative weight `cw` (urgency order: `priority, eligible_at, id`); the bucket rows are locked (`FOR UPDATE OF b` — the cross-node serialization point), refilled to `avail` via `clock_timestamp()` (real elapsed, so budget accrued while waiting on the lock is not lost); a winner runs iff `cw <= avail`. Because `cw` is monotonic, a head that does not fit grants nothing for that bucket — tokens accumulate for it (**strict order with free reservation**, no skip-ahead). The bucket is debited by the weight actually taken (`max(cw)` among granted). A token is taken **at claim**; there is **no refund** (a re-picked crash takes another — every execution counts). First appearance: the transition/insert that assigns a key **ensures the bucket** (full) so the picker's lock never races a missing row.
+
+```sql
+alter table gen_durable add column rate_limit text;                           -- NULL ⇒ not limited
+alter table gen_durable add column weight double precision not null default 1;
+create table gen_durable_rate_configs (name text primary key, rate double precision not null, burst double precision not null);
+create table gen_durable_rate_buckets (key text primary key, tokens double precision not null, last_refill timestamptz not null default clock_timestamp());
+```
+
+**Weights and the `weight ≤ burst` rule.** `weight > burst` can never fit (`avail` caps at `burst`), so the row is never granted **and, under strict order, freezes the whole bucket behind it forever.** This is **the caller's responsibility — not validated** (consistent with the engine's "primitives, you own correctness" stance, cf. step idempotency). The cure for a too-fat step is to **split it**: N units of limited work = N steps (or a `schedule_childs` fan-out) of `weight 1`, which removes fat heads, head-of-line blocking, and the freeze risk. Weights exist only for genuinely unsplittable chunky steps.
+
+**Telemetry.** `[:gen_durable, :rate_limit, :throttled]` (a bucket granted fewer than wanted in a pick; `%{wanted, granted}` / `%{key, queue}`) and `[:gen_durable, :rate_limit, :unknown]` (a step named a key with no config; the row would stall; `%{key, name, fsm, step}`). `rate_limit`/`weight` are written by `insert`, `insert_all`, and `schedule_childs` children alike, each ensuring its bucket.
+
+**Unconfigured keys.** A key whose name has no config row resolves to no bucket ⇒ the row stalls (with `:unknown` telemetry above). This is the chosen behaviour: there is no boot-time name validation and no `on_unknown` (`:run`/`:stop`/`:defer`) policy — keep keys configured.
+
+**Performance (measured).** Common path (no rate limits) is unchanged: the candidate select still uses the `gen_durable_pick` index scan and the PK-update; the rate-bucket CTEs are `never executed` (zero rows) — the only added cost is a ≤`batch`-row window sort for `cw` (sub-ms, bounded by batch, not table size). Under contention, a single hot bucket sustains ~11k grants/s through its locked counter (×1.6 the lockless baseline) — far above any limit you would set; partitioned buckets spread contention to near-baseline. See PERFORMANCE.md.

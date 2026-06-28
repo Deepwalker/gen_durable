@@ -25,6 +25,8 @@ defmodule GenDurable.QueriesTest do
         concurrency_key: nil,
         correlation_key: nil,
         correlation_scope: [],
+        rate_limit: nil,
+        weight: 1,
         eligible_at: nil
       },
       overrides
@@ -42,6 +44,19 @@ defmodule GenDurable.QueriesTest do
       [List.wrap(ids)]
     )
   end
+
+  defp seed(rate, burst),
+    do: Queries.upsert_rate_configs(Repo, [%{name: "api", rate: rate * 1.0, burst: burst * 1.0}])
+
+  defp tokens(key) do
+    %{rows: [[t]]} =
+      Repo.query!("SELECT tokens FROM gen_durable_rate_buckets WHERE key = $1", [key])
+
+    t
+  end
+
+  @doc false
+  def __fwd__(_event, measure, meta, pid), do: send(pid, {:telemetry, measure, meta})
 
   test "insert then pick flips to executing and returns the job" do
     {:ok, id} = Queries.insert(Repo, params())
@@ -104,7 +119,7 @@ defmodule GenDurable.QueriesTest do
     {:ok, id} = Queries.insert(Repo, params())
     [_job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
-    :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [])
+    :ok = Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [], nil, 1)
 
     %{rows: [[status, step, attempt, state]]} =
       Repo.query!("SELECT status::text, step, attempt, state FROM gen_durable WHERE id = $1", [id])
@@ -254,7 +269,7 @@ defmodule GenDurable.QueriesTest do
 
       go = Enum.find(Queries.load_signals(Repo, id), &(&1.name == "go"))
       # progress, consuming exactly the awaited "go" id
-      :ok = Queries.complete_next(Repo, id, "tick", ~s({}), [go.id])
+      :ok = Queries.complete_next(Repo, id, "tick", ~s({}), [go.id], nil, 1)
 
       assert [%{name: "other"}] = Queries.load_signals(Repo, id)
 
@@ -460,6 +475,102 @@ defmodule GenDurable.QueriesTest do
 
       # "k7" collides with the existing row; "k8" collides within the batch.
       assert length(Queries.insert_all(Repo, rows)) == 1
+    end
+  end
+
+  describe "rate limiting (spec §12)" do
+    setup do
+      Repo.query!("TRUNCATE gen_durable_rate_buckets, gen_durable_rate_configs")
+      :ok
+    end
+
+    test "insert ensures a full bucket; pick grants up to budget, debits, then throttles" do
+      :ok = seed(0, 5)
+      for _ <- 1..10, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))
+      # the ensure CTE created the bucket full at burst
+      assert tokens("api") == 5.0
+
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 5
+      assert tokens("api") == 0.0
+      # rate 0 ⇒ no refill ⇒ the rest stay parked
+      assert Queries.pick(Repo, "default", 10, @worker, @ttl) == []
+    end
+
+    test "weight: a step consuming N units takes N from the budget" do
+      :ok = seed(0, 5)
+      for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api", weight: 2}))
+      # cumulative weight 2,4,6,8 vs avail 5 ⇒ only the first two fit
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 2
+      assert tokens("api") == 1.0
+    end
+
+    test "NULL rate_limit bypasses the limiter entirely" do
+      :ok = seed(0, 0)
+      for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params())
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 3
+    end
+
+    test "refill restores budget over elapsed time" do
+      :ok = seed(100, 1)
+      for _ <- 1..5, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))
+
+      # burst 1 ⇒ first pick grants 1, bucket ~0
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+
+      # rate 100/s ⇒ ~30 ms later ≥1 token refilled ⇒ another grant
+      Process.sleep(30)
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) >= 1
+    end
+
+    test "insert_all ensures buckets and rate-limits the whole batch" do
+      :ok = seed(0, 2)
+
+      ids =
+        Queries.insert_all(Repo, [
+          params(%{rate_limit: "api"}),
+          params(%{rate_limit: "api"}),
+          params(%{rate_limit: "api"})
+        ])
+
+      assert length(ids) == 3
+      assert tokens("api") == 2.0
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 2
+    end
+
+    test "schedule_childs ensures buckets for rate-limited children" do
+      :ok = seed(0, 1)
+      {:ok, parent} = Queries.insert(Repo, params())
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+      children = [
+        params(%{fsm: "child", rate_limit: "api"}),
+        params(%{fsm: "child", rate_limit: "api"})
+      ]
+
+      :ok = Queries.complete_schedule_childs(Repo, parent, "join", ~s({}), children, [])
+
+      assert tokens("api") == 1.0
+      # both children are runnable; the bucket (burst 1) lets one through
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+    end
+
+    test "a throttled bucket emits [:gen_durable, :rate_limit, :throttled]" do
+      :ok = seed(0, 2)
+      for _ <- 1..5, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))
+
+      handler = "throttle-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:gen_durable, :rate_limit, :throttled],
+        &__MODULE__.__fwd__/4,
+        self()
+      )
+
+      Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :telemetry.detach(handler)
+
+      assert_received {:telemetry, %{wanted: 5, granted: 2}, %{key: "api", queue: "default"}}
     end
   end
 end
