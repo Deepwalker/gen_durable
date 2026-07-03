@@ -5,6 +5,64 @@ All notable changes to `gen_durable` are documented here. The format follows
 **no backward-compatibility guarantees** — there is one schema version and migrations are
 edited in place until the MVP settles.
 
+## 0.2.0
+
+A design-review hardening release: two correctness races closed, outcome commits made
+ownership-safe, the engine made multi-instance, and the per-step round-trip count cut to ~1.
+Findings and their resolutions are tracked in `ISSUES.md`.
+
+### Fixed
+- **Lost-wakeup race** between parking (`:await`) and signal delivery under READ COMMITTED:
+  a signal racing the park could strand a parked instance with its wake-up already in the
+  inbox. Delivery now always takes the instance row lock (the flip condition moved into the
+  statement, not its WHERE), and parking rechecks the inbox under the same lock — `:await`
+  is now deliberately a two-statement transaction.
+- **Cross-pick deadlock on rate buckets**: bucket rows are locked in key order; every
+  multi-row bucket writer (ensure CTEs, config upsert) got deterministic ordering too.
+- **Stale-worker overwrite**: every outcome now commits only while the worker still owns
+  the claim (`locked_by` + `executing` guard). An orphaned task (its scheduler crashed;
+  the row was reclaimed) gets its late commit **dropped** — observable as
+  `[:gen_durable, :outcome, :stale]` — instead of rewinding step/state, silencing the new
+  claimant's heartbeat, or double-firing terminal side effects (inbox purge, parent join
+  decrement).
+- **Double-encoded jsonb**: `state`/`result`/signal payloads were stored as jsonb *scalar
+  strings* (invisible to `->>` and jsonb indexes). All JSON parameters are now parsed
+  server-side (`::text::jsonb`) and stored as objects; rows in the old format still decode.
+- **Batch-size ceiling**: `insert_all` and `schedule_childs` children ride in as `unnest`
+  parallel arrays — the old per-row placeholders hit the wire protocol's 65535-parameter
+  cap at ~5400 rows.
+- An uncaught `throw` in a step routes to `handle/2` as `{:throw, value}` instead of
+  crashing the task and waiting out a full lease.
+
+### Changed (behavior)
+- `GenDurable.signal/4` returns `{:error, :no_target}` for a terminal or nonexistent
+  target — for integer ids too (previously `:ok` with a durably stored orphan signal, or
+  an FK violation for a missing id).
+- The default supervisor registration is now `GenDurable` (was `GenDurable.Supervisor`);
+  the `child_spec` id follows.
+- Worker ids are now `<instance>:<queue>@<vm>-<uniq>` (opaque, stored in `locked_by`).
+
+### Added
+- **Multi-instance engines**: give each a `:name` (default `GenDurable`) and route API
+  calls with `name:` — config, task supervisor, and FSM registry are per-instance; a
+  duplicate name fails with `:already_started`.
+- **Startup reclaim**: a starting scheduler releases claims left by a dead predecessor
+  (same instance+queue+VM) instead of letting them wait out the lease
+  (`[:gen_durable, :scheduler, :reclaimed]`).
+- **Rate-bucket GC**: the GC sweep prunes buckets idle past their refill horizon and
+  buckets whose named limit was removed (`[:gen_durable, :gc, :swept]` gained a `buckets`
+  measurement) — partitioned keys no longer grow the bucket table without bound.
+
+### Performance
+- **~1 round-trip per step**: the pick batch-loads signal inboxes and children for its
+  whole claim set (3 statements per batch), removing the two per-step loads; the inbox
+  snapshot is taken at pick time (consumption stays exact — it deletes the ids the step
+  actually saw).
+- **`deliver_signal` is one statement** (was a transaction of up to 5 round trips).
+- **Prepared-statement caching** for every query (`cache_statement:`): parse + plan once
+  per connection. Hosts behind a transaction-pooling proxy set `prepare: :unnamed`.
+- Advisory locks hash concurrency keys with `hashtextextended` (64-bit).
+
 ## 0.1.8
 
 ### Added

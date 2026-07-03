@@ -423,13 +423,17 @@ Let `R` = round-trips/step, `L` = client↔Postgres round-trip latency, `U` = us
 
 | | round-trips `R` | per-step DB latency at `L`=0.2 ms (local) | at `L`=1 ms (cloud) |
 |---|---|---|---|
-| today (2 loads + 4-stmt outcome txn) | ~6 | ~1.2 ms | ~6 ms |
-| F4 (gate loads, single-CTE outcome) | ~1–2 | ~0.2–0.4 ms | ~1–2 ms |
+| pre-F4 (2 per-step loads + 4-stmt outcome txn) | ~6 | ~1.2 ms | ~6 ms |
+| current (batch-enriched pick, single-CTE outcome) | ~1 | ~0.2 ms | ~1 ms |
 
-So a trivial-step workload at `C = 50`, local, today: `50 / 1.2 ms ≈ 40k steps/s`,
-DB permitting; F4 would roughly triple-to-quintuple that. These are model figures from
-the measured per-query costs, not an end-to-end benchmark — treat them as order-of-
-magnitude. The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 14 µs/row`).
+The per-step loads are gone entirely: the pick batch-loads signal inboxes and children
+for its whole claim set (3 statements per *batch*, asserted in `test/perf_test.exs`), so a
+plain `:next` step pays one round-trip — its outcome. The exception is `:await`, a
+deliberate 4-round-trip transaction (park + recheck; it buys the lost-wakeup fix, and
+parking is externally-paced anyway). A trivial-step workload at `C = 50`, local:
+`50 / 0.2 ms ≈ 250k steps/s` as a model ceiling — these are model figures from the
+measured per-query costs, not an end-to-end benchmark; treat them as order-of-magnitude.
+The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 14 µs/row`).
 
 ### Tuning levers (feeder knobs — see `GenDurable.Scheduler`)
 
@@ -453,9 +457,16 @@ magnitude. The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 
    advisory lock on a checked-out connection for the *whole* step (user code included), so
    in-flight concurrency-keyed steps consume pool connections 1:1. Size the pool for peak
    concurrency-keyed concurrency. Non-concurrency-keyed steps grab/release per statement.
-3. **`load_signals` + `load_childs` run on every step**, even for FSMs that never await or
-   spawn. Two wasted round-trips for the common machine; gate them behind
-   `use GenDurable.FSM, awaits: true, childs: true`. The last remaining F4 step.
+3. **A far-future scheduled backlog on a more-urgent priority.** The pick index is
+   `(queue, priority, eligible_at)`: within one priority group, eligible rows sort before
+   future ones, so delayed work on the *same* priority costs nothing. But to reach
+   priority `p+1`, the scan must walk through (and filter out) every future-eligible row
+   of priority `p`. Pathology: a large delayed backlog on an urgent priority plus live
+   work on a less urgent one — every pick re-scans that backlog. If you schedule delayed
+   work at scale, keep it on one priority (ideally the least urgent). The structural cure
+   — a separate `scheduled` status promoted to `runnable` by a sweeper (Oban's Stager
+   shape) — adds a background process and buys nothing until a real workload hits this,
+   so it stays unbuilt.
 
 ---
 
@@ -464,11 +475,17 @@ magnitude. The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 
 1. ✅ **Collapse the outcome transaction into one CTE statement** — done (F4): a 4–5-stmt
    `BEGIN … COMMIT` became one data-modifying CTE, ~4 round-trips → 1, the biggest single
    win on the hot path. Asserted single-statement in `test/perf_test.exs`.
-2. **Gate `load_signals` / `load_childs` on FSM capability flags** — ~2 round-trips → 0
-   for plain machines. Takes a plain `:next` step from ~3 round-trips to ~1.
-3. **Picker sharding by key hash** — removes the hot-key skip cost (limit #1).
-
-Together (1)+(2) take a plain `:next` step from ~6 round-trips to ~1–2.
+2. ✅ **Kill the per-step `load_signals` / `load_childs`** — done, and better than the
+   capability-flag gating originally planned: the pick batch-enriches its whole claim set
+   (2 statements per batch, zero per step), so even awaiting/spawning machines pay
+   nothing per step. A plain `:next` step is now ~1 round-trip. Asserted in
+   `test/perf_test.exs`.
+3. ✅ **Statement caching** — done: every static statement goes through the
+   connection-level prepared-statement cache (`cache_statement:`), so Postgres parses and
+   plans each query once per connection. `deliver_signal` also collapsed from a
+   5-round-trip transaction to one statement.
+4. **Picker sharding by key hash** — removes the hot-key skip cost (limit #1). Unbuilt:
+   waiting for a workload where one concurrency key dominates a queue.
 
 ---
 

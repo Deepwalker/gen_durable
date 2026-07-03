@@ -6,7 +6,7 @@ defmodule GenDurable.MixProject do
   def project do
     [
       app: :gen_durable,
-      version: "0.1.8",
+      version: "0.2.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,

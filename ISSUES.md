@@ -151,7 +151,13 @@ Original finding: with partitioned keys (`{:api, user_id}` → one bucket per
 user) the bucket table accumulated a row per partition ever seen and was never
 cleaned.
 
-### 7. Conditional pick-index pathology: far-future schedules across priorities
+### 7. Conditional pick-index pathology: far-future schedules across priorities — DOCUMENTED
+
+**Status: documented** in PERFORMANCE.md §6 ("Known limits / pathologies" #3),
+with the triggering condition and the workload guidance (keep delayed
+scheduling on one priority). The structural cure (a `scheduled` status plus a
+promoter sweep) stays unbuilt until a real workload hits it — as recommended
+below.
 
 Index `(queue, priority, eligible_at) WHERE runnable`: within one priority
 group, eligible rows sort before future ones — fine. But to reach priority 1
