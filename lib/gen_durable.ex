@@ -42,6 +42,9 @@ defmodule GenDurable do
       for tuning the feeder knobs.
     * `[:gen_durable, :scheduler, :drain]` — graceful shutdown of a queue.
       Measurements `%{released, in_flight}`; metadata `%{queue}`.
+    * `[:gen_durable, :scheduler, :reclaimed]` — at scheduler startup, claims of a
+      dead predecessor (same instance+queue+VM) were released early instead of
+      waiting out the lease. Measurements `%{count}`; metadata `%{queue}`.
     * `[:gen_durable, :concurrency, :contended]` — a concurrency_key advisory lock
       was contended (a row was handed back). Measurements `%{count}`; metadata
       `%{id, fsm, concurrency_key}`.
@@ -50,9 +53,9 @@ defmodule GenDurable do
       ran); the outcome was dropped and the current claimant redoes the step.
       Measurements `%{count}`; metadata `%{id, fsm, step, kind}`.
     * `[:gen_durable, :reaper, :reaped]` — expired leases reclaimed. Measurements
-      `%{count}`; metadata `%{ids}`.
-    * `[:gen_durable, :gc, :swept]` — terminal rows deleted by a GC sweep.
-      Measurements `%{count}`; metadata `%{}`.
+      `%{count}`; metadata `%{}`.
+    * `[:gen_durable, :gc, :swept]` — a GC sweep deleted something. Measurements
+      `%{count, buckets}` (terminal rows and stale rate buckets); metadata `%{}`.
     * `[:gen_durable, :rate_limit, :throttled]` — a rate-limit bucket granted fewer rows
       than wanted in a pick. Measurements `%{wanted, granted}`; metadata
       `%{key, queue}`. The signal that a limit is biting.

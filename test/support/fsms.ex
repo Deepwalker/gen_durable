@@ -112,6 +112,17 @@ defmodule GenDurable.Test.Crasher do
   end
 end
 
+defmodule GenDurable.Test.Thrower do
+  @moduledoc "Throws; handle/2 receives {:throw, value} and stops with it."
+  use GenDurable.FSM, name: "thrower", version: 1, initial: "hurl"
+
+  @impl true
+  def step("hurl", _ctx), do: throw(:bail)
+
+  @impl true
+  def handle({:throw, value}, _ctx), do: {:stop, "threw #{inspect(value)}"}
+end
+
 defmodule GenDurable.Test.Reborn do
   @moduledoc "Crashes the worker (no outcome) on the first attempt, then succeeds."
   use GenDurable.FSM, name: "reborn", version: 1, initial: "go"
@@ -288,6 +299,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.Collector,
       GenDurable.Test.AwaitRetry,
       GenDurable.Test.Crasher,
+      GenDurable.Test.Thrower,
       GenDurable.Test.Reborn,
       GenDurable.Test.ConcurrencyInc,
       GenDurable.Test.Plain,

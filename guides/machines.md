@@ -70,8 +70,10 @@ def handle(reason, ctx) do
 end
 ```
 
-A worker **crash** (no return at all) is different: the [reaper](operations.md#reaper)
-recovers it and re-runs the step from scratch — `handle/2` is *not* called.
+An uncaught `throw` routes there too, as `{:throw, value}` — it is a controlled non-local
+return, not a crash. A worker **crash** (a bare `exit`, a kill — no return at all) is
+different: the [reaper](operations.md#reaper) recovers it and re-runs the step from
+scratch — `handle/2` is *not* called.
 
 ## Options
 

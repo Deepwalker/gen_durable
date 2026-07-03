@@ -103,7 +103,6 @@ defmodule GenDurable.Supervisor do
           concurrency: concurrency,
           prefetch: Keyword.fetch!(opts, :prefetch),
           min_demand: Keyword.fetch!(opts, :min_demand),
-          worker: worker_id(queue),
           poll_interval: Keyword.fetch!(opts, :poll_interval),
           max_poll_interval: Keyword.fetch!(opts, :max_poll_interval),
           heartbeat_interval: Keyword.fetch!(opts, :heartbeat_interval),
@@ -146,8 +145,6 @@ defmodule GenDurable.Supervisor do
         ]
     end
   end
-
-  defp worker_id(queue), do: "#{queue}@#{node()}-#{System.unique_integer([:positive])}"
 
   # `[stripe: [allowed: 100, period: {1, :minute}], …]` → `[%{name, rate, burst}]`.
   # rate = allowed / period_seconds (the sustained throughput); burst defaults to allowed.

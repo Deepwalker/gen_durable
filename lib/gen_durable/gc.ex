@@ -36,9 +36,10 @@ defmodule GenDurable.GC do
   @impl true
   def handle_info(:gc, state) do
     swept = Queries.gc(state.repo, state.retention_ms, state.batch)
+    buckets = Queries.gc_buckets(state.repo)
 
-    if swept > 0 do
-      :telemetry.execute([:gen_durable, :gc, :swept], %{count: swept}, %{})
+    if swept > 0 or buckets > 0 do
+      :telemetry.execute([:gen_durable, :gc, :swept], %{count: swept, buckets: buckets}, %{})
     end
 
     # Filled the batch ⇒ a backlog likely remains ⇒ sweep again at once.

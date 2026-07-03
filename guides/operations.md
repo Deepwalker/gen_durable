@@ -50,6 +50,10 @@ so nothing extended the lease, and the row was reclaimed while it ran) gets its 
 dropped rather than committed over the new claimant's work. The drop is observable as
 `[:gen_durable, :outcome, :stale]`; the current claimant redoes the step.
 
+A restarted scheduler also **reclaims its dead predecessor's claims at startup**
+(`[:gen_durable, :scheduler, :reclaimed]`): rows claimed by an earlier incarnation of the same
+instance+queue on the same VM go straight back to `runnable` instead of waiting out the lease.
+
 ## Garbage collection
 
 Terminal (`done`/`failed`) rows are deleted by a built-in GC sweep, so finished work doesn't
@@ -60,6 +64,12 @@ accumulate forever. The delete scales with the batch, not the table size.
 - `:gc_batch` (default `10_000`) — max rows per sweep; it re-sweeps at once when a sweep fills.
 
 A terminal child whose parent is still mid-join is spared until the parent finishes.
+
+The sweep also prunes stale [rate-limit buckets](rate_limiting.md): a bucket idle long enough
+to have fully refilled (and any bucket whose named limit was removed from the config) is
+deleted — it is recreated full on next use, which is exactly the state it would have refilled
+to. Partitioned keys (`{name, partition}`) mint a bucket per partition ever seen, so without
+this the bucket table would grow without bound.
 
 ## Configuration reference
 

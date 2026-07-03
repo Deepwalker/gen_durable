@@ -193,6 +193,45 @@ defmodule GenDurable.EngineTest do
     assert row.attempt == 2
   end
 
+  test "an uncaught throw routes to handle/2 as {:throw, value} (no lease wait)" do
+    # lease_ttl 60s: if the throw took the crash path, the test would sit out
+    # the full lease — reaching "failed" promptly proves handle/2 caught it.
+    start_engine(lease_ttl: 60_000)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Thrower)
+
+    row = wait_status(id, "failed")
+    assert row.last_error == "threw :bail"
+    assert row.attempt == 0
+  end
+
+  test "startup reclaim frees a dead incarnation's claims without waiting out the lease" do
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain, repo: Repo)
+
+    # Simulate a claim left by a dead scheduler of the same instance+queue+VM:
+    # same claim prefix, different incarnation suffix, lease far in the future —
+    # so within this test only the startup reclaim can free the row.
+    stale = GenDurable.Scheduler.claim_prefix(GenDurable, "default") <> "0"
+
+    Repo.query!(
+      """
+      UPDATE gen_durable
+      SET status = 'executing', locked_by = $2, lease_expires_at = now() + interval '1 hour'
+      WHERE id = $1
+      """,
+      [id, stale]
+    )
+
+    attach_telemetry([[:gen_durable, :scheduler, :reclaimed]])
+    start_engine()
+
+    assert_receive {:telemetry, [:gen_durable, :scheduler, :reclaimed], %{count: 1},
+                    %{queue: "default"}},
+                   2_000
+
+    row = wait_status(id, "done")
+    assert row.result == %{}
+  end
+
   test "worker crash with no outcome is recovered by the reaper (attempt + 1)" do
     start_engine(lease_ttl: 500, heartbeat_interval: 250, reap_interval: 100)
     {:ok, id} = GenDurable.insert(GenDurable.Test.Reborn)

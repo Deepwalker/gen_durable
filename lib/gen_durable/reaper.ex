@@ -24,10 +24,10 @@ defmodule GenDurable.Reaper do
   def handle_info(:reap, state) do
     reaped = Queries.reap(state.repo)
 
+    # count only — after a mass crash the id list can be huge, and telemetry
+    # metadata should stay cheap to carry.
     if reaped != [] do
-      :telemetry.execute([:gen_durable, :reaper, :reaped], %{count: length(reaped)}, %{
-        ids: reaped
-      })
+      :telemetry.execute([:gen_durable, :reaper, :reaped], %{count: length(reaped)}, %{})
     end
 
     schedule(state.interval)

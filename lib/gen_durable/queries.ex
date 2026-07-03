@@ -371,6 +371,35 @@ defmodule GenDurable.Queries do
     end
   end
 
+  # Sweep stale rate buckets — the GC side of partitioned limits
+  # (`{name, partition}` mints a bucket row per partition ever seen). A bucket
+  # is deletable when recreating it equals its natural state: `ensure` recreates
+  # buckets FULL, so one idle longer than burst/rate seconds (fully refilled by
+  # now anyway) loses nothing. rate = 0 never qualifies (it never refills, so
+  # delete-and-recreate would grant a fresh burst), and a bucket whose config
+  # was removed is unusable (both the pick and `ensure` join configs) — swept
+  # unconditionally. Racing a concurrent pick is safe: the DELETE waits on the
+  # bucket row lock and re-checks `last_refill` (EPQ) — a just-debited bucket
+  # carries a fresh timestamp and is skipped.
+  def gc_buckets(repo) do
+    %{num_rows: n} =
+      q!(
+        repo,
+        "gc_buckets",
+        """
+        DELETE FROM gen_durable_rate_buckets b
+        WHERE NOT EXISTS (SELECT 1 FROM gen_durable_rate_configs cfg
+                          WHERE cfg.name = split_part(b.key, ':', 1))
+           OR EXISTS (SELECT 1 FROM gen_durable_rate_configs cfg
+                      WHERE cfg.name = split_part(b.key, ':', 1) AND cfg.rate > 0
+                        AND b.last_refill < now() - make_interval(secs => cfg.burst / cfg.rate))
+        """,
+        []
+      )
+
+    n
+  end
+
   # --- step outcomes -----------------------------------------
   #
   # Each outcome is a SINGLE statement, not a transaction (one round-trip instead
@@ -836,15 +865,18 @@ defmodule GenDurable.Queries do
 
   # --- concurrency_key serialization (advisory lock) ---------------------------
 
+  # hashtextextended (64-bit) over hashtext (32-bit): an advisory-key collision
+  # falsely serializes two distinct concurrency keys, and the bigint keyspace
+  # makes that negligible.
   def advisory_try_lock(repo, key) do
     %{rows: [[locked]]} =
-      q!(repo, "advisory_lock", "SELECT pg_try_advisory_lock(hashtext($1))", [key])
+      q!(repo, "advisory_lock", "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", [key])
 
     locked
   end
 
   def advisory_unlock(repo, key) do
-    q!(repo, "advisory_unlock", "SELECT pg_advisory_unlock(hashtext($1))", [key])
+    q!(repo, "advisory_unlock", "SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key])
     :ok
   end
 
@@ -861,6 +893,28 @@ defmodule GenDurable.Queries do
     )
 
     :ok
+  end
+
+  # Startup reclaim: release rows still claimed by a dead predecessor of this
+  # scheduler — same claim prefix (instance+queue+VM, see Scheduler.claim_prefix/2),
+  # any incarnation suffix. Prefix-compared with `left(...)` rather than LIKE, so
+  # queue/instance names containing `%`/`_` need no escaping. Scans the (small)
+  # executing set via the partial lease index; runs once per scheduler boot.
+  def reclaim_orphans(repo, queue, prefix) do
+    %{num_rows: n} =
+      q!(
+        repo,
+        "reclaim_orphans",
+        """
+        UPDATE gen_durable
+        SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
+        WHERE queue = $1 AND status = 'executing'
+          AND left(locked_by, char_length($2)) = $2
+        """,
+        [queue, prefix]
+      )
+
+    n
   end
 
   # Release our still-claimed rows back to runnable on graceful shutdown, so the

@@ -47,10 +47,48 @@ defmodule GenDurable.Scheduler do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
+  @doc false
+  # The stable claim-identity prefix for this instance+queue on this VM; a
+  # worker id is the prefix plus a per-incarnation unique suffix. Startup
+  # reclaim matches the prefix to recognize a dead predecessor's claims, so the
+  # prefix must be unique per LIVE VM: the node name when distributed, else
+  # hostname + OS pid (two non-distributed VMs would otherwise both be
+  # "nonode@nohost" and reclaim each other's live claims).
+  def claim_prefix(name, queue), do: "#{inspect(name)}:#{queue}@#{vm_id()}-"
+
+  defp vm_id do
+    if Node.alive?() do
+      Atom.to_string(node())
+    else
+      {:ok, host} = :inet.gethostname()
+      "#{host}##{System.pid()}"
+    end
+  end
+
   @impl true
   def init(opts) do
     # Trap exits so a supervisor shutdown runs terminate/2 (graceful drain).
     Process.flag(:trap_exit, true)
+
+    prefix = claim_prefix(opts.config.name, opts.queue)
+    worker = prefix <> Integer.to_string(System.unique_integer([:positive]))
+
+    # Startup reclaim: rows still claimed by a DEAD incarnation of this
+    # instance+queue+VM (same prefix, older unique suffix) go straight back to
+    # runnable instead of waiting out lease_ttl. A prior incarnation is
+    # certainly dead — the prefix pins the VM (see claim_prefix/2) and, within
+    # a VM, the supervisor serializes scheduler lifetimes. Its orphaned tasks
+    # may still be running; the outcome ownership guard drops their late
+    # commits, so an early re-run is safe (at-least-once).
+    reclaimed = Queries.reclaim_orphans(opts.config.repo, opts.queue, prefix)
+
+    if reclaimed > 0 do
+      :telemetry.execute(
+        [:gen_durable, :scheduler, :reclaimed],
+        %{count: reclaimed},
+        %{queue: opts.queue}
+      )
+    end
 
     state = %{
       config: opts.config,
@@ -58,7 +96,7 @@ defmodule GenDurable.Scheduler do
       concurrency: opts.concurrency,
       prefetch: opts.prefetch,
       min_demand: opts.min_demand,
-      worker: opts.worker,
+      worker: worker,
       poll_interval: opts.poll_interval,
       max_poll_interval: opts.max_poll_interval,
       cur_poll: opts.poll_interval,

@@ -5,9 +5,10 @@ defmodule GenDurable.Executor do
   Resolves the FSM module, loads the jsonb state into the FSM's struct, and
   calls `step/2` under `try`. The signal-inbox and children snapshots ride in
   the job itself — batch-loaded by the pick, not fetched per step. A raised
-  exception routes to `handle/2`; if `handle/2` itself raises, the instance
-  fails. A worker *crash* (no return at all) is **not** handled here — it is the
-  reaper's job, the at-least-once safety floor.
+  exception routes to `handle/2`, and so does an uncaught `throw` (as
+  `{:throw, value}`); if `handle/2` itself raises, the instance fails. A worker
+  *crash* (a bare `exit`, a kill — no return at all) is **not** handled here —
+  it is the reaper's job, the at-least-once safety floor.
 
   Signal consumption: a step sees the awaited subset as `ctx.awaited`
   (only the signals whose name is in the set it parked on) and the whole inbox as
@@ -84,24 +85,31 @@ defmodule GenDurable.Executor do
 
   defp warn_unknown_rate_limit(_config, _job, _outcome), do: :ok
 
-  # step/2, falling back to handle/2 on a caught exception. Returns the validated
-  # outcome plus the signal ids to consume on a progressing outcome (the awaited
-  # snapshot the step received; none on the handle path, since the step failed).
+  # step/2, falling back to handle/2 on a caught exception or an uncaught
+  # `throw` (delivered as `{:throw, value}` — a throw is a controlled non-local
+  # return, not a crash; without the catch it would kill the Task and cost a
+  # full lease_ttl through the reaper). A bare `exit` is deliberately NOT caught:
+  # it is a process-level event and takes the crash path (reaper, at-least-once
+  # floor). Returns the validated outcome plus the signal ids to consume on a
+  # progressing outcome (the awaited snapshot the step received; none on the
+  # handle path, since the step failed).
   defp invoke(module, ctx) do
     outcome = Outcome.validate!(module.step(ctx.step, ctx))
     {outcome, Enum.map(ctx.awaited, & &1.id)}
   rescue
-    reason ->
-      handle_ctx = %{ctx | awaited: [], all: [], childs: []}
+    reason -> {handle(module, ctx, reason), []}
+  catch
+    :throw, value -> {handle(module, ctx, {:throw, value}), []}
+  end
 
-      outcome =
-        try do
-          Outcome.validate!(module.handle(reason, handle_ctx))
-        rescue
-          e2 -> {:stop, e2}
-        end
+  defp handle(module, ctx, reason) do
+    handle_ctx = %{ctx | awaited: [], all: [], childs: []}
 
-      {outcome, []}
+    try do
+      Outcome.validate!(module.handle(reason, handle_ctx))
+    rescue
+      e2 -> {:stop, e2}
+    end
   end
 
   # `consumed` is the awaited-signal ids to delete on a progressing outcome; terminal

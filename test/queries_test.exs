@@ -746,6 +746,28 @@ defmodule GenDurable.QueriesTest do
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
     end
 
+    test "gc_buckets sweeps refilled-idle and orphaned buckets, keeps the rest" do
+      # rate 10/s, burst 5 ⇒ fully refilled after 0.5s idle
+      :ok = seed(10, 5)
+      # zero-rate: never refills, so deleting would grant a fresh burst — never swept
+      :ok = Queries.upsert_rate_configs(Repo, [%{name: "frozen", rate: 0.0, burst: 5.0}])
+
+      Repo.query!("""
+      INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) VALUES
+        ('api:idle',  0, now() - interval '10 seconds'),
+        ('api:fresh', 0, now()),
+        ('ghost:1',   0, now() - interval '10 seconds'),
+        ('frozen:1',  0, now() - interval '1 hour')
+      """)
+
+      # api:idle (refilled by now) and ghost:1 (config removed) go; the fresh
+      # and the zero-rate buckets stay.
+      assert Queries.gc_buckets(Repo) == 2
+
+      %{rows: rows} = Repo.query!("SELECT key FROM gen_durable_rate_buckets ORDER BY key")
+      assert List.flatten(rows) == ["api:fresh", "frozen:1"]
+    end
+
     test "a throttled bucket emits [:gen_durable, :rate_limit, :throttled]" do
       :ok = seed(0, 2)
       for _ <- 1..5, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))

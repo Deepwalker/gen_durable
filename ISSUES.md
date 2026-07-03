@@ -136,16 +136,20 @@ terminal id now returns `{:error, :no_target}` instead of silently storing
 garbage, and a missing id returns `:no_target` instead of raising an FK
 violation (closes the "signaling a terminal instance" minor item).
 
-### 6. `gen_durable_rate_buckets` grows without bound
+### 6. `gen_durable_rate_buckets` grows without bound — FIXED
 
-With partitioned keys (`{:api, user_id}` → one bucket per user) the bucket
-table accumulates a row per partition ever seen and is never cleaned
-(migration.ex:184). A safe sweep exists thanks to the "ensure creates the
-bucket full" invariant: a bucket untouched longer than `burst/rate` seconds
-would refill to full anyway, so deleting it is equivalent to recreating it.
-`DELETE WHERE last_refill < now() - (burst/rate) * interval '1 second'` — the
-race with a concurrent writeback is closed by the EPQ predicate recheck after
-the lock wait. Could ride on the existing GC process.
+**Status: fixed.** `Queries.gc_buckets/1` rides on the GC process: a bucket
+idle longer than `burst/rate` seconds is deleted (recreation-full equals its
+refilled state, so nothing is lost), a zero-rate bucket is never swept (it
+never refills — deleting would grant a fresh burst), and a bucket whose named
+config was removed is swept unconditionally (unusable: both the pick and
+`ensure` join configs). The race with a concurrent pick's writeback is closed
+by the EPQ recheck after the lock wait (fresh `last_refill` ⇒ skipped). The
+`[:gen_durable, :gc, :swept]` event gained a `buckets` measurement.
+
+Original finding: with partitioned keys (`{:api, user_id}` → one bucket per
+user) the bucket table accumulated a row per partition ever seen and was never
+cleaned.
 
 ### 7. Conditional pick-index pathology: far-future schedules across priorities
 
@@ -190,31 +194,42 @@ Original finding: the config key was fixed (`{GenDurable, :config}`) and
 second instance either crashed on a name clash or silently routed
 `GenDurable.insert/signal` to the other instance's repo.
 
-### 9. A scheduler crash strands claimed rows for a full lease_ttl
+### 9. A scheduler crash strands claimed rows for a full lease_ttl — FIXED
 
-`worker_id` is unique per incarnation (supervisor.ex:138) and graceful drain
-releases the buffer — but a **crash**-restart (including the item-2 deadlock)
-leaves buffer + in-flight waiting for the reaper, up to 60s by default. The
-scheduler could release its own node's orphans at init: `release ... WHERE
-queue = $1 AND locked_by LIKE '<queue>@<node()>-%' AND status = 'executing'` —
-the previous incarnation is certainly dead. Caveat: two GenDurable instances
-sharing a queue name on one node would release each other's rows — one more
-reason to do item 8 first.
+**Status: fixed.** Worker ids are now built by the scheduler as
+`<instance>:<queue>@<vm>-<uniq>` (`Scheduler.claim_prefix/2`), and at init the
+scheduler releases every row whose `locked_by` carries its prefix — claims of
+a dead predecessor go straight back to `runnable` instead of waiting out the
+lease. Observable as `[:gen_durable, :scheduler, :reclaimed]`. The prefix pins
+the VM: the node name when distributed, else hostname + OS pid — two
+non-distributed VMs would otherwise both be `nonode@nohost` and reclaim each
+other's live claims. Safe on top of item 11: a predecessor's orphaned tasks
+may still be running, and their late commits are dropped by the ownership
+guard (early re-run is plain at-least-once). Prefix matching uses
+`left(locked_by, ...)` rather than LIKE, so names containing `%`/`_` need no
+escaping.
 
-### 10. `throw`/`exit` in a step bypasses `handle/2` and costs a lease_ttl
+Original finding: a crash-restart (including the item-2 deadlock) left
+buffer + in-flight rows waiting for the reaper, up to 60s by default.
 
-`invoke` uses `rescue` (executor.ex:88) — exceptions only. A user `throw` or
-`exit` crashes the Task → treated as a worker crash → the row waits out the
-lease (60s) plus an attempt bump. For a real crash that is the correct floor,
-but `throw` is a cheap controlled non-local return; a 60-second stall for it
-is unwarranted. `catch :throw` and route to `handle/2` (or straight to
-`:stop`); leaving bare `exit` to the reaper is a defensible choice.
+### 10. `throw`/`exit` in a step bypasses `handle/2` and costs a lease_ttl — FIXED
+
+**Status: fixed.** An uncaught `throw` is now caught and routed to `handle/2`
+as `{:throw, value}` — a controlled non-local return, not a crash, so it costs
+nothing beyond the handler's decision. A bare `exit` deliberately still takes
+the crash path (reaper, at-least-once floor): it is a process-level event.
+Documented in the machines guide and Executor moduledoc; covered by an engine
+test (a throwing FSM reaches `failed` promptly under a 60s lease).
+
+Original finding: `invoke` used `rescue` only — a user `throw` crashed the
+Task → treated as a worker crash → the row waited out the lease (60s) plus an
+attempt bump.
 
 ## Minor
 
-- **`hashtext` → `hashtextextended`** (queries.ex:614): 32-bit hash means a
-  collision falsely serializes two distinct concurrency keys;
-  `pg_try_advisory_lock` takes a bigint, so the fix is free.
+- **`hashtext` → `hashtextextended`** — FIXED: advisory locks now hash the
+  concurrency key with `hashtextextended` (64-bit); a collision only ever
+  falsely serialized two keys, and the bigint keyspace makes it negligible.
 - **Signaling a terminal instance** — FIXED with item 5: the single-statement
   deliver resolves live rows only, so a terminal or missing id returns
   `{:error, :no_target}` (previously `:ok` + garbage, or an FK violation).
@@ -228,9 +243,8 @@ is unwarranted. `catch :throw` and route to `handle/2` (or straight to
   written in the old format still decode (binary branch in `decode_json` /
   `State.from_db`), so the change is backward-compatible; old rows migrate to
   the object form the next time their state is rewritten by a transition.
-- **Reaper telemetry carries the full id list** (reaper.ex:26) — after a mass
-  crash that can be tens of thousands of elements; `count` suffices, ids
-  behind an option.
+- **Reaper telemetry carries the full id list** — FIXED: the
+  `[:gen_durable, :reaper, :reaped]` event now carries `count` only.
 - **`reap` has no LIMIT** — a mass reclaim in one UPDATE is a long transaction
   on very large sets. Rare event; low priority.
 
