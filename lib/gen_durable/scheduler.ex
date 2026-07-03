@@ -16,8 +16,10 @@ defmodule GenDurable.Scheduler do
       slots. `0` (default) means no over-fetch: identical to picking exactly the
       free slots. Raising it batches picks and absorbs completion bursts, at the
       cost of cross-node fairness and priority freshness (claimed rows are
-      invisible to other nodes). Buffered rows are **heartbeated**, so they never
-      go stale regardless of depth — depth is decoupled from `lease_ttl`.
+      invisible to other nodes), and buffered rows carry their pick-time inbox
+      snapshot (`ctx.all`/`ctx.childs` are batch-loaded with the pick). Buffered
+      rows are **heartbeated**, so their leases never go stale regardless of
+      depth — depth is decoupled from `lease_ttl`.
     * `min_demand` — batch gate: don't pick unless at least this many slots are
       free (so picks come fat, not one row at a time). Ignored when the queue is
       fully idle, to avoid starvation.

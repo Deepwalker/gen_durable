@@ -261,6 +261,19 @@ defmodule GenDurable.QueriesTest do
       assert step == "woke"
     end
 
+    test "a terminal or missing target refuses the signal as :no_target" do
+      {:ok, id} = Queries.insert(Repo, params())
+      :ok = claim(id)
+      :ok = Queries.complete_done(Repo, id, @worker, ~s({}))
+
+      # nothing will ever read a done row's inbox — refuse instead of storing garbage
+      assert {:error, :no_target} = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
+      assert Queries.load_signals(Repo, id) == []
+
+      # a missing id is :no_target too (previously an FK violation)
+      assert {:error, :no_target} = Queries.deliver_signal(Repo, id + 1_000, "go", ~s({}), nil)
+    end
+
     test "dedup_key makes redelivery idempotent; nil dedup allows duplicates" do
       {:ok, id} = Queries.insert(Repo, params())
 

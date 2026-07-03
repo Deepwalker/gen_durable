@@ -2,11 +2,12 @@ defmodule GenDurable.Executor do
   @moduledoc """
   Runs one picked instance to a committed outcome.
 
-  Resolves the FSM module, loads the jsonb state into the FSM's struct, snapshots
-  the signal inbox, calls `step/2` under `try`. A raised exception routes to
-  `handle/2`; if `handle/2` itself raises, the instance fails. A
-  worker *crash* (no return at all) is **not** handled here — it is the reaper's
-  job, the at-least-once safety floor.
+  Resolves the FSM module, loads the jsonb state into the FSM's struct, and
+  calls `step/2` under `try`. The signal-inbox and children snapshots ride in
+  the job itself — batch-loaded by the pick, not fetched per step. A raised
+  exception routes to `handle/2`; if `handle/2` itself raises, the instance
+  fails. A worker *crash* (no return at all) is **not** handled here — it is the
+  reaper's job, the at-least-once safety floor.
 
   Signal consumption: a step sees the awaited subset as `ctx.awaited`
   (only the signals whose name is in the set it parked on) and the whole inbox as
@@ -34,9 +35,7 @@ defmodule GenDurable.Executor do
     state_module = module.__gd_state__()
 
     state = State.from_db(state_module, job.state)
-    all = Queries.load_signals(repo, job.id)
-    childs = Queries.load_childs(repo, job.id)
-
+    all = job.signals
     awaits = job.awaits || []
 
     ctx = %Context{
@@ -50,7 +49,7 @@ defmodule GenDurable.Executor do
       # by these exact ids); all: the full inbox, for the raw case.
       awaited: Enum.filter(all, &(&1.name in awaits)),
       all: all,
-      childs: childs
+      childs: job.childs
     }
 
     started = System.monotonic_time()

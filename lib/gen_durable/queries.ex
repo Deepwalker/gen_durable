@@ -213,7 +213,7 @@ defmodule GenDurable.Queries do
       )
     end
 
-    Enum.map(jobs, &to_job(&1, worker))
+    enrich(repo, Enum.map(jobs, &to_job(&1, worker)))
   end
 
   # `worker` rides in the job: it is the claim's identity, and the outcome
@@ -233,6 +233,62 @@ defmodule GenDurable.Queries do
       awaits: awaits,
       worker: worker
     }
+  end
+
+  # Attach each claimed job's signal inbox and children — two statements per
+  # BATCH, not two per job (the per-step loads were pure round-trip tax: the
+  # probes usually return nothing, but each cost a network hop and a pool slot).
+  # The inbox snapshot is therefore taken at pick time, not execution start;
+  # consumption stays exact either way (a progressing outcome deletes the
+  # `ctx.awaited` ids the step actually saw — a signal landing after the pick
+  # just stays in the inbox for the next wake, same as one landing mid-step).
+  # With `prefetch > 0`, buffered jobs hold their snapshot until they run.
+  defp enrich(_repo, []), do: []
+
+  defp enrich(repo, jobs) do
+    ids = Enum.map(jobs, & &1.id)
+
+    %{rows: sig_rows} =
+      q!(
+        repo,
+        "batch_signals",
+        "SELECT target_id, id, name, payload FROM signals WHERE target_id = ANY($1) ORDER BY id",
+        [ids]
+      )
+
+    signals =
+      Enum.group_by(sig_rows, &hd/1, fn [_, id, name, payload] ->
+        %{id: id, name: name, payload: decode_json(payload)}
+      end)
+
+    %{rows: child_rows} =
+      q!(
+        repo,
+        "batch_childs",
+        """
+        SELECT parent_id, id, fsm, status::text, state, result, last_error
+        FROM gen_durable WHERE parent_id = ANY($1) ORDER BY id
+        """,
+        [ids]
+      )
+
+    childs =
+      Enum.group_by(child_rows, &hd/1, fn [_, id, fsm, status, state, result, last_error] ->
+        %{
+          id: id,
+          fsm: fsm,
+          status: status,
+          state: decode_json(state),
+          result: decode_json_or_nil(result),
+          last_error: last_error
+        }
+      end)
+
+    Enum.map(jobs, fn job ->
+      job
+      |> Map.put(:signals, Map.get(signals, job.id, []))
+      |> Map.put(:childs, Map.get(childs, job.id, []))
+    end)
   end
 
   # --- lease / reaper --------------------------------------------------------
@@ -627,99 +683,66 @@ defmodule GenDurable.Queries do
     end)
   end
 
-  # A parent's children, for ctx.childs on wake-up.
-  def load_childs(repo, parent_id) do
-    %{rows: rows} =
-      q!(
-        repo,
-        "load_childs",
-        """
-        SELECT id, fsm, status::text, state, result, last_error
-        FROM gen_durable WHERE parent_id = $1 ORDER BY id
-        """,
-        [parent_id]
-      )
+  # Deliver a signal in ONE statement (was BEGIN + resolve + INSERT + wake +
+  # COMMIT = up to 5 round trips on the user-facing hot path). `target` is either
+  # an internal id (integer) or a correlation_key (string, resolved via
+  # `correlation_guard` — the partial unique index — to the single occupied
+  # instance carrying it). Shape:
+  #   target — the addressed LIVE instance (terminal and missing ids resolve to
+  #            nothing: nobody will ever read their inbox, so the signal is
+  #            refused as :no_target instead of durably storing garbage; we also
+  #            never hold a signal for an instance that does not exist yet).
+  #   ins    — the inbox row; ON CONFLICT makes dedup_key redelivery idempotent.
+  #   wake   — the delivery side of the lost-wakeup fix. Joins target by id with
+  #            the flip condition in CASE, not WHERE, so it always locks the
+  #            row: racing a park (complete_await) it queues behind the park's
+  #            row lock and re-evaluates the CASE against the committed row
+  #            (READ COMMITTED follows the update chain), flipping the freshly-
+  #            parked row. A status-guarded WHERE would skip the not-yet-parked
+  #            row without locking or waiting — the lost wakeup.
+  # ins and wake commit atomically (one statement), so the park's recheck sees
+  # the signal exactly when the wake also happened. Returns :ok, or
+  # {:error, :no_target} when the target does not resolve to a live instance.
+  @signal_sql_body """
+  ),
+  ins AS (
+    INSERT INTO signals (target_id, name, payload, dedup_key)
+    SELECT id, $2, $3::text::jsonb, $4 FROM target
+    ON CONFLICT (target_id, dedup_key) DO NOTHING
+  ),
+  wake AS (
+    UPDATE gen_durable g
+    SET status = CASE WHEN g.status = 'awaiting_signal' AND $2 = ANY(g.awaits)
+                      THEN 'runnable'::durable_status ELSE g.status END,
+        eligible_at = CASE WHEN g.status = 'awaiting_signal' AND $2 = ANY(g.awaits)
+                           THEN now() ELSE g.eligible_at END,
+        updated_at = CASE WHEN g.status = 'awaiting_signal' AND $2 = ANY(g.awaits)
+                          THEN now() ELSE g.updated_at END
+    FROM target t
+    WHERE g.id = t.id
+  )
+  SELECT count(*) FROM target
+  """
 
-    Enum.map(rows, fn [id, fsm, status, state, result, last_error] ->
-      %{
-        id: id,
-        fsm: fsm,
-        status: status,
-        state: decode_json(state),
-        result: decode_json_or_nil(result),
-        last_error: last_error
-      }
-    end)
-  end
+  @signal_by_id """
+                WITH target AS (
+                  SELECT id FROM gen_durable WHERE id = $1 AND status NOT IN ('done', 'failed')
+                """ <> @signal_sql_body
 
-  # `target` is either an internal id (integer) or a correlation_key (string). The signal
-  # row is inserted before the wake-flip so the woken step already sees it.
-  # Returns `:ok`, or `{:error, :no_target}` when a correlation_key resolves to no
-  # occupied instance.
+  @signal_by_key """
+                 WITH target AS (
+                   SELECT id FROM gen_durable
+                   WHERE correlation_guard = $1 AND status NOT IN ('done', 'failed')
+                 """ <> @signal_sql_body
+
   def deliver_signal(repo, target, name, payload_json, dedup_key) do
-    repo.transaction(fn ->
-      case resolve_target(repo, target) do
-        nil ->
-          repo.rollback(:no_target)
+    {stmt, sql} =
+      if is_integer(target),
+        do: {"signal_by_id", @signal_by_id},
+        else: {"signal_by_key", @signal_by_key}
 
-        id ->
-          q!(
-            repo,
-            "signal_insert",
-            """
-            INSERT INTO signals (target_id, name, payload, dedup_key)
-            VALUES ($1, $2, $3::text::jsonb, $4)
-            ON CONFLICT (target_id, dedup_key) DO NOTHING
-            """,
-            [id, name, payload_json, dedup_key]
-          )
-
-          # Wake flip — the delivery side of the lost-wakeup fix. Matches by id
-          # alone (the flip condition lives in CASE, not WHERE) so it always
-          # locks a live row: racing a park (complete_await) it queues behind
-          # the park's row lock and re-evaluates the CASE against the committed
-          # row (READ COMMITTED follows the update chain), flipping the freshly-
-          # parked row. A status-guarded WHERE would skip the not-yet-parked row
-          # without locking or waiting — the lost wakeup. Terminal rows are
-          # excluded: outcomes are one-shot, so no park can be in flight for
-          # them, and skipping keeps them out of the wake path entirely.
-          q!(
-            repo,
-            "signal_wake",
-            """
-            UPDATE gen_durable
-            SET status = CASE WHEN status = 'awaiting_signal' AND $2 = ANY(awaits)
-                              THEN 'runnable'::durable_status ELSE status END,
-                eligible_at = CASE WHEN status = 'awaiting_signal' AND $2 = ANY(awaits)
-                                   THEN now() ELSE eligible_at END,
-                updated_at = CASE WHEN status = 'awaiting_signal' AND $2 = ANY(awaits)
-                                  THEN now() ELSE updated_at END
-            WHERE id = $1 AND status NOT IN ('done', 'failed')
-            """,
-            [id, name]
-          )
-      end
-    end)
-    |> case do
-      {:ok, _} -> :ok
-      {:error, :no_target} -> {:error, :no_target}
-    end
-  end
-
-  # An integer target is the id itself (the FK enforces existence). A string is a
-  # correlation_key — resolved via `correlation_guard` (the partial unique index) to
-  # the single occupied instance carrying it, or nil if none: an instance whose key is
-  # no longer occupied (its status left correlation_scope) can no longer be woken, and we
-  # do not durably hold a signal for an instance that does not exist yet.
-  defp resolve_target(_repo, id) when is_integer(id), do: id
-
-  defp resolve_target(repo, key) when is_binary(key) do
-    case q!(repo, "resolve_target", "SELECT id FROM gen_durable WHERE correlation_guard = $1", [
-           key
-         ]) do
-      %{rows: [[id]]} -> id
-      %{rows: []} -> nil
-    end
+    %{rows: [[n]]} = q!(repo, stmt, sql, [target, name, payload_json, dedup_key])
+    if n == 1, do: :ok, else: {:error, :no_target}
   end
 
   # --- insert / batch insert -------------------------------------------------

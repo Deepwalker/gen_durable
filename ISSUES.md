@@ -110,24 +110,31 @@ every execution of every query was parsed and planned server-side from
 scratch. For the pick (the largest CTE query, run on every poll of every queue
 on every node plus every completion-driven refill) this was a pure DB CPU tax.
 
-### 5. Two extra round trips per step; five per correlation-key signal
+### 5. Two extra round trips per step; five per correlation-key signal — FIXED
 
-`Executor.run` always runs `load_signals` + `load_childs` (executor.ex:31-32),
-even for plain jobs with no signals and no children. The cost is round-trip
-latency, not DB work. Options, in increasing invasiveness:
+**Status: fixed**, both halves.
 
-- Batch enrichment after the pick: one `WHERE target_id = ANY($ids)` for
-  signals and one for children per picked batch — 2 queries per batch instead
-  of 2×N. The inbox snapshot moves from execution start to pick time; with the
-  default `prefetch: 0` the gap is ~zero, and consumption stays correct
-  because it deletes the exact `ctx.awaited` ids the step received.
-- Or cheaper: return `children_pending` from the pick and skip `load_childs`
-  for childless rows; make `ctx.all`/`ctx.childs` lazy.
+*Per-step loads*: the pick now batch-enriches its claims — one
+`WHERE target_id = ANY($ids)` for signals and one `WHERE parent_id = ANY($ids)`
+for children per picked batch, attached to the job maps; `Executor.run` reads
+them instead of querying (2 statements per batch instead of 2×N; `load_childs`
+and the per-job loads are gone). The inbox snapshot moves from execution start
+to pick time; consumption stays exact (a progressing outcome deletes the
+`ctx.awaited` ids the step actually saw — a signal landing after the pick
+stays in the inbox for the next wake, same as one landing mid-step). With
+`prefetch > 0` buffered jobs hold their snapshot until they run (documented on
+the knob). Guarded by statement-count tests: a pick with claims is exactly 3
+statements, an empty pick is 1.
 
-`deliver_signal` by correlation_key is BEGIN + SELECT + INSERT + UPDATE +
-COMMIT = 5 round trips. It collapses into one statement with CTEs (resolve →
-insert → wake), with `RETURNING` distinguishing `:no_target`. The signal path
-is a user-facing hot path; do this together with the item-1 fix.
+*deliver_signal*: collapsed into ONE statement (was up to 5 round trips) —
+CTEs `target` (resolve id or correlation_guard, live rows only) → `ins`
+(inbox insert, dedup via ON CONFLICT) → `wake` (unconditional-lock CASE flip —
+the item-1 race fix is preserved: the flip condition lives in CASE, not
+WHERE, and ins+wake commit atomically). `SELECT count(*) FROM target`
+distinguishes `:no_target`. Behavior change riding along: signaling a
+terminal id now returns `{:error, :no_target}` instead of silently storing
+garbage, and a missing id returns `:no_target` instead of raising an FK
+violation (closes the "signaling a terminal instance" minor item).
 
 ### 6. `gen_durable_rate_buckets` grows without bound
 
@@ -208,9 +215,9 @@ is unwarranted. `catch :throw` and route to `handle/2` (or straight to
 - **`hashtext` → `hashtextextended`** (queries.ex:614): 32-bit hash means a
   collision falsely serializes two distinct concurrency keys;
   `pg_try_advisory_lock` takes a bigint, so the fix is free.
-- **Signaling a terminal instance** by integer id returns `:ok` and durably
-  accumulates garbage in a `done` row's inbox until GC; `{:error, :no_target}`
-  (as for correlation_key) would be honest.
+- **Signaling a terminal instance** — FIXED with item 5: the single-statement
+  deliver resolves live rows only, so a terminal or missing id returns
+  `{:error, :no_target}` (previously `:ok` + garbage, or an FK violation).
 - **`Jason.encode!` → `$::jsonb`** — FIXED: passing an Elixir *string* to a
   jsonb parameter made Postgrex JSON-encode the string, so `state`/`result`/
   signal payloads were stored as **jsonb scalar strings**, not objects

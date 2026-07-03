@@ -79,6 +79,28 @@ defmodule GenDurable.PerfTest do
     id
   end
 
+  test "a pick with claims is exactly three statements (pick + batched signal/children loads)" do
+    for _ <- 1..5, do: {:ok, _} = Queries.insert(Repo, params(%{}))
+
+    sql = statements(fn -> Queries.pick(Repo, "default", 10, "w", 60_000) end)
+
+    # enrichment is per BATCH, not per job — 3 statements for 5 jobs, not 1 + 2×5
+    assert length(sql) == 3
+  end
+
+  test "an empty pick is a single statement (no enrichment queries)" do
+    assert length(statements(fn -> Queries.pick(Repo, "default", 10, "w", 60_000) end)) == 1
+  end
+
+  test "deliver_signal is a single statement (resolve + insert + wake folded in)" do
+    id = setup_executing()
+
+    sql = statements(fn -> Queries.deliver_signal(Repo, id, "go", ~s({}), nil) end)
+
+    assert length(sql) == 1
+    assert hd(sql) =~ "WITH target"
+  end
+
   test "complete_next is a single statement (one round-trip)" do
     id = setup_executing()
 

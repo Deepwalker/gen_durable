@@ -117,9 +117,10 @@ defmodule GenDurable do
 
   `target` is either the internal id (an integer) or a `:correlation_key` (a string) set
   at insert. Addressing by `correlation_key` resolves to the single instance currently
-  occupying it (per its `:correlation_scope`); if none exists it returns `{:error, :no_target}`
-  (a freed/terminal key can no longer be woken, and a signal is not held for an instance
-  that does not exist yet). Returns `:ok` otherwise.
+  occupying it (per its `:correlation_scope`). A target that does not resolve to a **live**
+  instance — a freed or terminal key, a terminal id, an id that does not exist yet —
+  returns `{:error, :no_target}`: nothing would ever read that inbox, and a signal is
+  not held for an instance that does not exist. Returns `:ok` otherwise.
   """
   def signal(target, name, payload \\ %{}, opts \\ []) do
     Queries.deliver_signal(

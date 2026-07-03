@@ -24,7 +24,8 @@ arrives before, or concurrently with, the park is not lost (delivery inserts the
 then takes the instance's row lock to wake it; parking rechecks the inbox under the same lock,
 so neither side can slip between the other's check and commit), and
 `:dedup_key` makes redelivery idempotent. Delivery wakes the instance **only on a name match**;
-non-matching signals stay in the inbox for a later `await`.
+non-matching signals stay in the inbox for a later `await`. A signal addressed to a terminal
+or nonexistent instance is refused as `{:error, :no_target}` — nothing would ever read it.
 
 ## Consumption
 
