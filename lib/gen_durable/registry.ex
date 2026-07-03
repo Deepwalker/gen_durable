@@ -2,12 +2,16 @@ defmodule GenDurable.Registry do
   @moduledoc """
   Resolves `{fsm_name, fsm_version}` to an FSM module.
 
+  Per-instance, not global: the engine supervisor owns a protected ETS table
+  (`new/1` at boot) whose tid travels in the engine config, so separate engine
+  instances hold separate registries and there is no registry process at all.
+
   Two resolution paths:
 
     * **Explicit registry** — modules passed in `:fsms` are indexed by
-      `__gd_name__/0` + `__gd_version__/0` in a protected ETS table. Use this when
+      `__gd_name__/0` + `__gd_version__/0` in the table. Use this when
       a machine has a custom `:name` (the `fsm` column is then not a module name)
-      or to keep old `:version`s running (spec §8): old instances finish on their
+      or to keep old `:version`s running: old instances finish on their
       `fsm_version`, so the old module must stay registered.
     * **Dynamic fallback** — on a miss, the `fsm` name is interpreted as a module
       name (its default is `inspect(module)`) and accepted if that module is a
@@ -15,12 +19,8 @@ defmodule GenDurable.Registry do
       the default name and a single version needs **no** `:fsms` entry at all.
 
   Reads are an ETS lookup plus, only on a miss, a cheap module check — no
-  GenServer call on the hot path.
+  process call on the hot path.
   """
-
-  use GenServer
-
-  @table __MODULE__
 
   defmodule NotFound do
     defexception [:name, :version]
@@ -30,34 +30,35 @@ defmodule GenDurable.Registry do
       do: "no FSM registered for #{inspect(name)} v#{version}"
   end
 
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
+  @doc """
+  Create and seed the registry table from the `:fsms` modules. Owned by the
+  calling process (the engine supervisor), so it lives and dies with the
+  instance. Returns the table tid, carried in the engine config.
+  """
+  def new(fsms) do
+    table = :ets.new(__MODULE__, [:set, :protected, read_concurrency: true])
 
-  @impl true
-  def init(opts) do
-    table = :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-
-    for mod <- Keyword.get(opts, :fsms, []) do
+    for mod <- fsms do
       :ets.insert(table, {{mod.__gd_name__(), mod.__gd_version__()}, mod})
     end
 
-    {:ok, table}
+    table
   end
 
   @doc """
-  Look up the module for `{name, version}` — the explicit registry first, then a
-  dynamic resolution of `name` as a module. Raises `NotFound` if neither matches.
+  Look up the module for `{name, version}` in `table` — the explicit registry
+  first, then a dynamic resolution of `name` as a module. Raises `NotFound` if
+  neither matches.
   """
-  def fetch!(name, version) do
-    case :ets.lookup(@table, {name, version}) do
+  def fetch!(table, name, version) do
+    case :ets.lookup(table, {name, version}) do
       [{_, module}] -> module
       [] -> resolve(name, version) || raise NotFound, name: name, version: version
     end
   rescue
     ArgumentError ->
-      # ETS table absent — registry not started.
-      reraise "GenDurable.Registry is not running", __STACKTRACE__
+      # Table gone — the owning engine instance is not running.
+      reraise "the GenDurable registry table is gone (engine stopped?)", __STACKTRACE__
   end
 
   # Treat `name` as a module name (the default `__gd_name__`), accept it only if it

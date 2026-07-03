@@ -8,7 +8,7 @@ defmodule GenDurableTest do
       Repo.query(
         """
         INSERT INTO gen_durable (fsm, step, state)
-        VALUES ($1, $2, $3::jsonb)
+        VALUES ($1, $2, $3::text::jsonb)
         RETURNING id
         """,
         ["Checkout", "start", ~s({"order": 42})]
@@ -25,8 +25,8 @@ defmodule GenDurableTest do
     assert fsm == "Checkout"
     assert step == "start"
     assert status == "runnable"
-    # Ecto leaves json/jsonb undecoded at the driver level for raw queries.
-    assert Jason.decode!(state) == %{"order" => 42}
+    # jsonb objects decode to maps at the driver level.
+    assert state == %{"order" => 42}
     assert scope == []
   end
 

@@ -41,8 +41,14 @@ defmodule GenDurable.EngineTest do
         [id]
       )
 
-    %{status: s, result: result, last_error: err, attempt: attempt}
+    %{status: s, result: decode(result), last_error: err, attempt: attempt}
   end
+
+  # jsonb objects come back as maps; scalar-string rows (the pre-fix double-encoded
+  # format) as binaries.
+  defp decode(nil), do: nil
+  defp decode(value) when is_binary(value), do: Jason.decode!(value)
+  defp decode(value), do: value
 
   defp eventually(fun, timeout \\ 5_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
@@ -77,7 +83,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Counter, state: %{target: 3})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"count" => 3}
+    assert row.result == %{"count" => 3}
   end
 
   test "plain-map FSM also reaches :done" do
@@ -85,7 +91,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.MapCounter, state: %{"target" => 2})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"count" => 2}
+    assert row.result == %{"count" => 2}
   end
 
   test "await parks, signal wakes next_step which reads ctx.awaited and consumes it" do
@@ -96,7 +102,7 @@ defmodule GenDurable.EngineTest do
     :ok = GenDurable.signal(id, "go", %{v: 7})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"got" => %{"v" => 7}}
+    assert row.result == %{"got" => %{"v" => 7}}
 
     # The instance is done, so its inbox was cleaned up.
     assert GenDurable.Queries.load_signals(Repo, id) == []
@@ -112,7 +118,7 @@ defmodule GenDurable.EngineTest do
     start_engine()
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"got" => %{"v" => 9}}
+    assert row.result == %{"got" => %{"v" => 9}}
   end
 
   test "a retry on an await step re-sees ctx.awaited across the redo" do
@@ -125,7 +131,7 @@ defmodule GenDurable.EngineTest do
     # "woke" retries once (attempt 0), then finishes (attempt 1). It would crash on
     # hd([]) if the retry had cleared awaits / consumed the signal.
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"v" => 5, "attempt" => 1}
+    assert row.result == %{"v" => 5, "attempt" => 1}
   end
 
   test "await on a set wakes on any one and branches on which arrived" do
@@ -136,7 +142,7 @@ defmodule GenDurable.EngineTest do
     :ok = GenDurable.signal(id, "reject", %{"why" => "nope"})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"decision" => "reject", "by" => %{"why" => "nope"}}
+    assert row.result == %{"decision" => "reject", "by" => %{"why" => "nope"}}
   end
 
   test "a signal addressed by correlation_key wakes the instance" do
@@ -148,7 +154,7 @@ defmodule GenDurable.EngineTest do
     :ok = GenDurable.signal("cust:42", "go", %{"v" => 11})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"got" => %{"v" => 11}}
+    assert row.result == %{"got" => %{"v" => 11}}
   end
 
   test "await accumulates a pack across re-awaits, then processes all of it" do
@@ -161,7 +167,7 @@ defmodule GenDurable.EngineTest do
     :ok = GenDurable.signal(id, "c", %{"v" => 4})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"sum" => 7, "count" => 3}
+    assert row.result == %{"sum" => 7, "count" => 3}
     # Terminal cleanup removed the whole pack.
     assert GenDurable.Queries.load_signals(Repo, id) == []
   end
@@ -192,7 +198,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Reborn)
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"recovered" => true}
+    assert row.result == %{"recovered" => true}
     assert row.attempt >= 1
   end
 
@@ -221,7 +227,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Parent, state: %{"kids" => kids})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"children" => 4, "done" => 4, "failed" => 0}
+    assert row.result == %{"children" => 4, "done" => 4, "failed" => 0}
   end
 
   test "a failed child still releases the join barrier" do
@@ -230,7 +236,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Parent, state: %{"kids" => kids})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"children" => 2, "done" => 1, "failed" => 1}
+    assert row.result == %{"children" => 2, "done" => 1, "failed" => 1}
   end
 
   test "zero children means the parent proceeds to next_step immediately" do
@@ -238,7 +244,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Parent, state: %{"kids" => []})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"children" => 0, "done" => 0, "failed" => 0}
+    assert row.result == %{"children" => 0, "done" => 0, "failed" => 0}
   end
 
   test "picker honors priority (lower number runs first)" do
@@ -293,7 +299,7 @@ defmodule GenDurable.EngineTest do
     row = wait_status(id, "done")
     # attempt stays 0 => the lease never expired, so the step was never re-run
     assert row.attempt == 0
-    assert Jason.decode!(row.result) == %{"slept" => 900}
+    assert row.result == %{"slept" => 900}
   end
 
   test "prefetched (buffered) rows are heartbeated and never spuriously reaped" do
@@ -319,7 +325,7 @@ defmodule GenDurable.EngineTest do
     rows = for id <- ids, do: wait_status(id, "done")
 
     assert Enum.all?(rows, &(&1.attempt == 0))
-    assert Enum.all?(rows, &(Jason.decode!(&1.result) == %{"slept" => 200}))
+    assert Enum.all?(rows, &(&1.result == %{"slept" => 200}))
   end
 
   test "different concurrency_keys run in parallel (overlapping steps)" do
@@ -344,7 +350,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Auto)
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"auto" => true}
+    assert row.result == %{"auto" => true}
   end
 
   test "job form: a perform/1 job runs and finishes" do
@@ -352,7 +358,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.JobOk, args: %{"x" => 1})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{}
+    assert row.result == %{}
     assert row.attempt == 0
   end
 
@@ -361,7 +367,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.JobResult, args: %{"n" => 21})
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"doubled" => 42, "attempt" => 0}
+    assert row.result == %{"doubled" => 42, "attempt" => 0}
   end
 
   test "job form: {:error, _} retries with backoff then succeeds" do
@@ -369,7 +375,7 @@ defmodule GenDurable.EngineTest do
     {:ok, id} = GenDurable.insert(GenDurable.Test.JobRetry)
 
     row = wait_status(id, "done")
-    assert Jason.decode!(row.result) == %{"ok_at" => 2}
+    assert row.result == %{"ok_at" => 2}
     assert row.attempt == 2
   end
 
@@ -405,7 +411,8 @@ defmodule GenDurable.EngineTest do
     start_engine(queues: [default: 1], prefetch: 5, lease_ttl: 60_000, drain_timeout: 2_000)
 
     Process.sleep(120)
-    :ok = stop_supervised(GenDurable.Supervisor)
+    # the supervised child id is the instance name (default GenDurable)
+    :ok = stop_supervised(GenDurable)
 
     assert_received {:telemetry, [:gen_durable, :scheduler, :drain], %{released: 3, in_flight: 1},
                      _}
@@ -469,5 +476,42 @@ defmodule GenDurable.EngineTest do
     assert_receive {:telemetry, [:gen_durable, :rate_limit, :unknown], %{count: 1},
                     %{name: "ghost", step: "go"}},
                    2_000
+  end
+
+  test "two named instances coexist; API calls route by :name" do
+    # Default-named instance polling "default" + a second instance polling
+    # "second". The mere start of the second one exercises the isolation: named
+    # supervisor, task supervisor, config entry, and registry are all per-name.
+    start_engine()
+
+    start_supervised!(
+      {GenDurable,
+       [
+         name: GenDurable.EngineTwo,
+         repo: Repo,
+         fsms: GenDurable.Test.FSMs.all(),
+         queues: [second: 5],
+         poll_interval: 25,
+         lease_ttl: 1_000,
+         heartbeat_interval: 300,
+         reap_interval: 150
+       ]}
+    )
+
+    {:ok, id} =
+      GenDurable.insert(GenDurable.Test.Counter,
+        state: %{target: 2},
+        queue: "second",
+        name: GenDurable.EngineTwo
+      )
+
+    # only the second instance polls "second" — done means it ran there
+    row = wait_status(id, "done")
+    assert row.result == %{"count" => 2}
+
+    # an unknown instance name is a loud error, not a silent misroute
+    assert_raise ArgumentError, ~r/no GenDurable instance named/, fn ->
+      GenDurable.insert(GenDurable.Test.Counter, state: %{target: 1}, name: Nope)
+    end
   end
 end

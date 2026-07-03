@@ -1,7 +1,7 @@
 defmodule GenDurable.GC do
   @moduledoc """
   Periodically deletes terminal (`done`/`failed`) instances older than the
-  retention window (spec §8) — the engine's built-in pruner.
+  retention window — the engine's built-in pruner.
 
   Each sweep removes at most `:gc_batch` rows (`Queries.gc/3`); if it fills the
   batch, more remain, so it re-sweeps immediately to drain a backlog rather than
@@ -16,7 +16,9 @@ defmodule GenDurable.GC do
 
   alias GenDurable.Queries
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  # Unnamed: nothing calls it, and a global name would forbid a second engine
+  # instance (each instance runs its own GC under its own supervisor).
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @impl true
   def init(opts) do

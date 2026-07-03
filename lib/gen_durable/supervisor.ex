@@ -5,6 +5,11 @@ defmodule GenDurable.Supervisor do
 
   ## Options
 
+    * `:name` — the instance identity (an atom, default `GenDurable`). Everything
+      an instance owns — its supervisor registration, task supervisor, config
+      entry, FSM registry — is keyed by it, so several engines (e.g. different
+      repos, or disjoint queue sets) coexist; address API calls with `name:`.
+      Starting two instances with the same name fails with `:already_started`.
     * `:repo` — the host's `Ecto.Repo` (required).
     * `:fsms` — FSM modules to register explicitly (default `[]`). Only needed for a
       custom `:name` or to keep an old `:version` running; otherwise a machine is
@@ -25,7 +30,7 @@ defmodule GenDurable.Supervisor do
     * `:drain_timeout` — on shutdown, how long (ms) each queue waits for its
       in-flight steps to finish before giving up to the reaper (default `5_000`).
       Buffered (un-started) rows are released immediately regardless.
-    * `:rate_limits` — named token-bucket rate limits (spec §12, default `[]`), e.g.
+    * `:rate_limits` — named token-bucket rate limits (default `[]`), e.g.
       `[stripe: [allowed: 100, period: {1, :minute}], emails: [allowed: 5, period: 60, burst: 10]]`.
       `allowed`/`period` set the sustained rate; `burst` (default `allowed`) the capacity.
       A step opts into a limit by returning `rate_limit: :stripe` (or `{:stripe, key}`).
@@ -55,28 +60,36 @@ defmodule GenDurable.Supervisor do
   ]
 
   def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, GenDurable))
   end
 
   @impl true
   def init(opts) do
     opts = Keyword.merge(@defaults, opts)
     repo = Keyword.fetch!(opts, :repo)
+    name = Keyword.get(opts, :name, GenDurable)
 
     rate_configs = parse_rate_limits(Keyword.fetch!(opts, :rate_limits))
 
     config = %{
+      name: name,
       repo: repo,
+      # The FSM registry table is owned by this supervisor process — it lives
+      # and dies with the instance, and executors reach it through the config.
+      registry: GenDurable.Registry.new(Keyword.fetch!(opts, :fsms)),
       lease_ttl_ms: Keyword.fetch!(opts, :lease_ttl),
       rate_limit_names: MapSet.new(rate_configs, & &1.name)
     }
 
-    :persistent_term.put({GenDurable, :config}, config)
+    # Keyed by the instance name, so engines coexist. Not erased on shutdown (a
+    # Supervisor has no terminate hook); a stale entry is harmless — API writes
+    # against a stopped engine are legal, the rows wait in the database.
+    :persistent_term.put({GenDurable, name}, config)
 
-    # Seed the rate-limit policy table (spec §12) so the picker can join it. No-op when empty.
+    # Seed the rate-limit policy table so the picker can join it. No-op when empty.
     :ok = GenDurable.Queries.upsert_rate_configs(repo, rate_configs)
 
-    task_sup = GenDurable.TaskSupervisor
+    task_sup = Module.concat(name, TaskSupervisor)
 
     schedulers =
       for {name, concurrency} <- Keyword.fetch!(opts, :queues) do
@@ -108,7 +121,6 @@ defmodule GenDurable.Supervisor do
 
     children =
       [
-        {GenDurable.Registry, fsms: Keyword.fetch!(opts, :fsms)},
         {Task.Supervisor, name: task_sup},
         {GenDurable.Reaper, %{repo: repo, interval: Keyword.fetch!(opts, :reap_interval)}}
       ] ++ gc_child(repo, opts) ++ schedulers

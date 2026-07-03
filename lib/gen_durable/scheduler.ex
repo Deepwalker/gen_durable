@@ -1,6 +1,6 @@
 defmodule GenDurable.Scheduler do
   @moduledoc """
-  Per-queue feeder + executor loop (spec §6). Backpressure-driven: it claims work
+  Per-queue feeder + executor loop. Backpressure-driven: it claims work
   from the database into a small in-memory buffer, then spawns at most
   `concurrency` supervised Tasks at a time, draining the buffer as slots free.
 
@@ -33,7 +33,7 @@ defmodule GenDurable.Scheduler do
   the reaper — so deeper buffers mean a larger crash blip, bounded by the (short)
   TTL, not by the buffer depth.
 
-  `concurrency_key` serialization (spec §6) is handled per-job at execution time: a
+  `concurrency_key` serialization is handled per-job at execution time: a
   session-level advisory lock is taken on a checked-out connection held for the
   whole step, and released after the outcome commits. If the lock is contended,
   the row is returned to `runnable` and skipped.
@@ -99,7 +99,7 @@ defmodule GenDurable.Scheduler do
   end
 
   # Task crashed before returning: no outcome was written. Leave the row
-  # 'executing'; the reaper will recover it (spec §4.3). Do NOT call handle/2.
+  # 'executing'; the reaper will recover it. Do NOT call handle/2.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
       when is_map_key(state.in_flight, ref) do
     state = update_in(state.in_flight, &Map.delete(&1, ref))
@@ -109,7 +109,7 @@ defmodule GenDurable.Scheduler do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # Graceful shutdown (spec §6): stop claiming, hand the buffered (un-started)
+  # Graceful shutdown: stop claiming, hand the buffered (un-started)
   # rows straight back to `runnable` so they are picked up immediately instead of
   # waiting out the lease, then wait up to `drain_timeout` for in-flight steps to
   # commit their outcomes. The Task.Supervisor is shut down *after* the schedulers
@@ -236,7 +236,7 @@ defmodule GenDurable.Scheduler do
           %{id: job.id, fsm: job.fsm, concurrency_key: key}
         )
 
-        Queries.reset_to_runnable(repo, job.id)
+        Queries.reset_to_runnable(repo, job.id, job.worker)
         :skipped
       end
     end)

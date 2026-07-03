@@ -15,7 +15,7 @@ will differ on your hardware, but the *plan shapes* and *row counts* are what ma
 ## 1. The cost model of one step
 
 A step runs **between two short database transactions**, with the user's code in the
-middle, outside any transaction (see the architecture notes in `gen_durable_plan.md`):
+middle, outside any transaction:
 
 ```
  pick (claim+lease)         user step/2 (no DB, no txn)        outcome (commit)
@@ -248,7 +248,10 @@ limit itself throttles lower), so the lock is never the bottleneck for a bucket 
 Grants are **batched** (one lock acquisition per pick-cycle, not per job), and partitioned
 buckets spread contention to near-baseline. `SKIP LOCKED` on the bucket measured *slower* for a
 single hot bucket (spin-retry with no alternative work), so the picker uses blocking
-`FOR UPDATE`. Numbers are on a local Postgres 17 (devcontainer); read the ratios, not absolutes.
+`FOR UPDATE`. Buckets are locked in key order (`ORDER BY` sorts before `LockRows`), so
+concurrent picks acquire them in the same order and cannot deadlock — the sort is over the
+distinct bucket keys of one batch (a handful of rows), not a measurable cost. Numbers are on a
+local Postgres 17 (devcontainer); read the ratios, not absolutes.
 
 ---
 

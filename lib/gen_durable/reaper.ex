@@ -1,7 +1,7 @@
 defmodule GenDurable.Reaper do
   @moduledoc """
   Periodically returns `executing` rows with an expired lease to `runnable`,
-  bumping `attempt` (spec §4.3 / §10). This is the at-least-once safety floor for
+  bumping `attempt`. This is the at-least-once safety floor for
   worker crashes; `handle/2` is intentionally not involved.
   """
 
@@ -9,7 +9,9 @@ defmodule GenDurable.Reaper do
 
   alias GenDurable.Queries
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  # Unnamed: nothing calls it, and a global name would forbid a second engine
+  # instance (each instance runs its own reaper under its own supervisor).
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @impl true
   def init(opts) do

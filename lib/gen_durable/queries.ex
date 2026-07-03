@@ -1,17 +1,87 @@
 defmodule GenDurable.Queries do
   @moduledoc """
-  Every database statement from spec §10, one function each, as raw SQL.
+  Every database statement, one function each, as raw SQL.
 
   All functions take the `repo` explicitly. The `complete_*` functions run the
   outcome `UPDATE` and the consumed-signal `DELETE` in one transaction.
   `concurrency_key` serialization (advisory lock) helpers live here too; the
   caller is responsible for holding a single connection (`Repo.checkout/1`) for
   the lock's lifetime.
+
+  Every statement has a static SQL text and goes through the connection-level
+  prepared-statement cache (`cache_statement:`), so Postgres parses and plans it
+  once per connection instead of on every call — bulk inserts pass rows as
+  parallel arrays via `unnest` to keep the text static (and the parameter count
+  fixed, clear of the 65535-parameter protocol cap). The one exception is
+  `upsert_rate_configs` (dynamic VALUES, boot-time only). Hosts behind a
+  transaction-pooling proxy set `prepare: :unnamed` on the repo to bypass the
+  cache.
+
+  JSON values (state, result, signal payloads) arrive here as encoded JSON text
+  and are bound as TEXT parameters cast server-side (`$n::text::jsonb`). A bare
+  `$n::jsonb` parameter would make the driver JSON-encode the already-encoded
+  string, storing a double-encoded jsonb *scalar* instead of an object —
+  invisible to `->>`/jsonb indexes. Rows written by versions that did exactly
+  that still decode fine: the read paths accept both formats.
   """
+
+  # --- shared insert shape -----------------------------------------------------
+  # The 12 insert columns, used by insert / insert_all / complete_schedule_childs.
+
+  @insert_cols "fsm, fsm_version, step, state, queue, priority, concurrency_key, eligible_at, correlation_key, correlation_scope, rate_limit, weight"
+
+  # SELECT list decoding one unnest-ed row into the 12 columns above.
+  # correlation_scope travels comma-joined and is split back server-side: unnest
+  # zips scalar arrays element-wise, but an array-per-row column would need a
+  # rectangular multidim array (enum labels contain no commas, so the join is safe).
+  @unnest_row_select "SELECT t.fsm, t.fsm_version, t.step, t.state::jsonb, t.queue, t.priority, " <>
+                       "t.concurrency_key, COALESCE(t.eligible_at, now()), t.correlation_key, " <>
+                       "string_to_array(t.scope, ',')::durable_status[], t.rate_limit, t.weight"
+
+  # The unnest source for @unnest_row_select: 12 parallel arrays at $base+1..$base+12.
+  defp unnest_from(base) do
+    "FROM unnest($#{base + 1}::text[], $#{base + 2}::int[], $#{base + 3}::text[], " <>
+      "$#{base + 4}::text[], $#{base + 5}::text[], $#{base + 6}::int[], $#{base + 7}::text[], " <>
+      "$#{base + 8}::timestamptz[], $#{base + 9}::text[], $#{base + 10}::text[], " <>
+      "$#{base + 11}::text[], $#{base + 12}::float8[]) " <>
+      "AS t(fsm, fsm_version, step, state, queue, priority, concurrency_key, eligible_at, " <>
+      "correlation_key, scope, rate_limit, weight)"
+  end
+
+  # One list per insert column (parallel arrays for unnest), from a list of params maps.
+  defp column_arrays(rows) do
+    [
+      Enum.map(rows, & &1.fsm),
+      Enum.map(rows, & &1.fsm_version),
+      Enum.map(rows, & &1.step),
+      Enum.map(rows, & &1.state_json),
+      Enum.map(rows, & &1.queue),
+      Enum.map(rows, & &1.priority),
+      Enum.map(rows, & &1.concurrency_key),
+      Enum.map(rows, & &1.eligible_at),
+      Enum.map(rows, & &1.correlation_key),
+      Enum.map(rows, &Enum.join(&1.correlation_scope, ",")),
+      Enum.map(rows, & &1.rate_limit),
+      Enum.map(rows, & &1.weight)
+    ]
+  end
+
+  # Every static statement goes through the connection-level prepared-statement
+  # cache: parse + plan happen once per connection, not on every call. A host
+  # behind a transaction-pooling proxy sets `prepare: :unnamed` on the repo,
+  # which bypasses the cache gracefully. Dynamically-shaped SQL
+  # (upsert_rate_configs) stays uncached.
+  defp q!(repo, name, sql, params),
+    do: repo.query!(sql, params, cache_statement: "gen_durable/" <> name)
+
+  # An outcome's ownership guard matched (1, committed) or not (0, the worker no
+  # longer owns the row — the outcome was dropped).
+  defp committed?(1), do: :ok
+  defp committed?(0), do: :stale
 
   # --- picker ----------------------------------------------------------------
 
-  # concurrency_key dedup (spec §6): never claim more than one row per concurrency_key
+  # concurrency_key dedup: never claim more than one row per concurrency_key
   # in a batch, and never claim a key that is already being processed — without the
   # wasted claim→try_lock→reset churn that prefetch would amplify on hot keys.
   #
@@ -40,14 +110,16 @@ defmodule GenDurable.Queries do
   #
   # A same-key cluster filling the window can underfill the batch; completion-
   # driven refill closes the gap on the next pick.
-  # The pick combines concurrency_key dedup (spec §6) with token-bucket rate limiting
-  # (spec §12), in one statement:
+  # The pick combines concurrency_key dedup with token-bucket rate limiting
+  # , in one statement:
   #   cand     — top-$2 runnable rows, locked once (FOR UPDATE SKIP LOCKED via gen_durable_pick),
   #              with the per-concurrency_key window rank `rn`.
   #   winners  — the concurrency winners (rn = 1); add the cumulative weight `cw` of the urgency
   #              prefix per rate_limit bucket (ROWS, deterministic by id).
   #   locked   — lock the rate-bucket rows the winners draw from (the cross-node serialization
-  #              point); refill them to `avail` (clock_timestamp, real elapsed).
+  #              point), in key order: with ORDER BY the sort happens before LockRows, so every
+  #              concurrent pick acquires bucket locks in the same order — no deadlock. Then
+  #              refill them to `avail` (clock_timestamp, real elapsed).
   #   granted  — the prefix whose cumulative weight fits (`cw <= avail`); cw monotonic ⇒ a head
   #              that doesn't fit grants nothing (reservation, no skip-ahead).
   #   writeback — debit each bucket by the weight actually taken (max cw among its granted rows).
@@ -85,6 +157,7 @@ defmodule GenDurable.Queries do
     FROM gen_durable_rate_buckets b
     JOIN (SELECT DISTINCT rkey FROM winners WHERE rkey IS NOT NULL) k ON k.rkey = b.key
     JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(b.key, ':', 1)
+    ORDER BY b.key
     FOR UPDATE OF b
   ),
   avail AS (
@@ -128,10 +201,10 @@ defmodule GenDurable.Queries do
   """
 
   def pick(repo, queue, batch, worker, lease_ttl_ms) do
-    %{rows: rows} = repo.query!(@pick_sql, [queue, batch, worker, lease_ttl_ms])
+    %{rows: rows} = q!(repo, "pick", @pick_sql, [queue, batch, worker, lease_ttl_ms])
     {jobs, throttles} = Enum.split_with(rows, fn [tag | _] -> tag == 0 end)
 
-    # spec §12: a bucket that wanted more than it granted is biting — observable.
+    # a bucket that wanted more than it granted is biting — observable.
     for [_, _, _, _, _, _, _, _, _, key, wanted, granted] <- throttles do
       :telemetry.execute(
         [:gen_durable, :rate_limit, :throttled],
@@ -140,10 +213,15 @@ defmodule GenDurable.Queries do
       )
     end
 
-    Enum.map(jobs, &to_job/1)
+    Enum.map(jobs, &to_job(&1, worker))
   end
 
-  defp to_job([_tag, id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits | _]) do
+  # `worker` rides in the job: it is the claim's identity, and the outcome
+  # queries require it (ownership guard).
+  defp to_job(
+         [_tag, id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits | _],
+         worker
+       ) do
     %{
       id: id,
       fsm: fsm,
@@ -152,7 +230,8 @@ defmodule GenDurable.Queries do
       state: state,
       attempt: attempt,
       concurrency_key: concurrency_key,
-      awaits: awaits
+      awaits: awaits,
+      worker: worker
     }
   end
 
@@ -161,7 +240,9 @@ defmodule GenDurable.Queries do
   def heartbeat(_repo, [], _worker, _ttl), do: :ok
 
   def heartbeat(repo, ids, worker, lease_ttl_ms) when is_list(ids) do
-    repo.query!(
+    q!(
+      repo,
+      "heartbeat",
       """
       UPDATE gen_durable
       SET lease_expires_at = now() + $3::int * interval '1 millisecond', updated_at = now()
@@ -175,22 +256,27 @@ defmodule GenDurable.Queries do
 
   def reap(repo) do
     %{rows: rows} =
-      repo.query!("""
-      UPDATE gen_durable
-      SET status = 'runnable', locked_by = null, lease_expires_at = null,
-          attempt = attempt + 1, updated_at = now()
-      WHERE status = 'executing' AND lease_expires_at < now()
-      RETURNING id
-      """)
+      q!(
+        repo,
+        "reap",
+        """
+        UPDATE gen_durable
+        SET status = 'runnable', locked_by = null, lease_expires_at = null,
+            attempt = attempt + 1, updated_at = now()
+        WHERE status = 'executing' AND lease_expires_at < now()
+        RETURNING id
+        """,
+        []
+      )
 
     List.flatten(rows)
   end
 
-  # Garbage-collect terminal instances (spec §8). Deletes up to `batch` `done`/`failed`
+  # Garbage-collect terminal instances. Deletes up to `batch` `done`/`failed`
   # rows whose `updated_at` (their termination instant — terminal rows are immutable)
   # is older than `retention_ms`. The `NOT EXISTS` guard spares a terminal child whose
   # parent is still active (`awaiting_children`/runnable/executing): the parent may yet
-  # read it via `ctx.childs` on the join (spec §11). A deleted parent SET-NULLs its
+  # read it via `ctx.childs` on the join. A deleted parent SET-NULLs its
   # children's `parent_id` (FK), and `signals` cascade-delete. Returns the count deleted.
   # Two round-trips on purpose (GC is a background sweep, not latency-critical):
   # collect ≤ `batch` doomed ids, then delete them by `id = ANY($ids)`. A single
@@ -201,7 +287,9 @@ defmodule GenDurable.Queries do
   # valid between the two statements.
   def gc(repo, retention_ms, batch) do
     %{rows: rows} =
-      repo.query!(
+      q!(
+        repo,
+        "gc_doomed",
         """
         SELECT g.id FROM gen_durable g
         WHERE g.status IN ('done', 'failed')
@@ -221,16 +309,18 @@ defmodule GenDurable.Queries do
 
       ids ->
         %{num_rows: n} =
-          repo.query!("DELETE FROM gen_durable WHERE id = ANY($1::bigint[])", [ids])
+          q!(repo, "gc_delete", "DELETE FROM gen_durable WHERE id = ANY($1::bigint[])", [ids])
 
         n
     end
   end
 
-  # --- step outcomes (spec §3 / §10) -----------------------------------------
+  # --- step outcomes -----------------------------------------
   #
   # Each outcome is a SINGLE statement, not a transaction (one round-trip instead
-  # of BEGIN + … + COMMIT). The signal consume (spec §5) rides along as a leading
+  # of BEGIN + … + COMMIT) — except `:await`, which is deliberately a two-statement
+  # transaction (park + recheck): the extra round trips close the lost-wakeup race
+  # with deliver_signal (see complete_await). The signal consume rides along as a
   # data-modifying CTE, `consumed`, atomic with the outcome UPDATE because one
   # statement is its own implicit transaction; it runs to completion even though
   # the main query never reads it — Postgres guarantees data-modifying CTEs always
@@ -241,202 +331,293 @@ defmodule GenDurable.Queries do
   #   * terminal (:done / :stop) — the whole inbox (`target_id = $id`): the instance
   #     is finished, so nothing will read its signals again (cleanup).
   #   * :retry / :await consume nothing (the step is redone / still waiting).
+  #
+  # OWNERSHIP GUARD: every outcome commits only while the worker still owns the
+  # claim — `locked_by = $worker AND status = 'executing'`. An orphaned task (its
+  # scheduler crashed, so nobody heartbeats its rows) can outlive the lease; the
+  # reaper then hands the row to a new claimant, and the orphan's late commit
+  # must NOT land on top — unguarded it would rewind step/state mid-flight, null
+  # the new claimant's locked_by (silencing its heartbeat), or, terminally,
+  # delete the inbox and decrement the parent join barrier. Guarded, the stale
+  # outcome affects zero rows and every side effect is gated on the guarded
+  # UPDATE via CTE references (reading the update's RETURNING, never the table —
+  # a table re-read would see the pre-update snapshot and fire the side effects
+  # even when the guard EPQ-failed). Each complete_* returns :ok | :stale; the
+  # executor emits [:gen_durable, :outcome, :stale] telemetry on the drop, and
+  # the step's work is redone by the current claimant (at-least-once).
 
-  # The join-barrier decrement (spec §11), used as the main statement of the
-  # terminal outcomes after the `consumed` + `terminal` CTEs. No-op when the row
-  # has no parent (the join yields nothing). The decrement that hits zero releases
-  # the barrier; concurrent siblings serialize on the parent row lock. The
-  # `terminal` CTE updates the child (id = $1); this updates the parent (a
-  # different row), reading the child's pre-statement `parent_id` under the shared
-  # snapshot — so the two table-modifications never touch the same row.
+  # The join-barrier decrement, a CTE of the terminal outcomes. Reads the child's
+  # `parent_id` from the guarded `terminal` CTE's RETURNING — empty when the
+  # ownership guard failed, so a stale worker never touches the parent. No-op
+  # when the row has no parent (the join yields nothing). The decrement that hits
+  # zero releases the barrier; concurrent siblings serialize on the parent row
+  # lock. `terminal` updates the child; this updates the parent (a different
+  # row), so the two table-modifications never touch the same row. The final
+  # SELECT reports whether the outcome committed (1) or was stale (0).
   @notify_parent """
-  UPDATE gen_durable p
-  SET children_pending = p.children_pending - 1,
-      status = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
-                    THEN 'runnable' ELSE p.status END,
-      eligible_at = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
-                         THEN now() ELSE p.eligible_at END,
-      updated_at = now()
-  FROM gen_durable c
-  WHERE c.id = $1 AND c.parent_id = p.id
+  notify AS (
+    UPDATE gen_durable p
+    SET children_pending = p.children_pending - 1,
+        status = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
+                      THEN 'runnable' ELSE p.status END,
+        eligible_at = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
+                           THEN now() ELSE p.eligible_at END,
+        updated_at = now()
+    FROM terminal c
+    WHERE c.parent_id = p.id
+  )
+  SELECT count(*) FROM terminal
   """
 
   # :next sets the row's rate_limit key ($5, NULL ⇒ not limited) and weight ($6) for the
-  # next step (spec §12), and ensures the bucket exists (full) so the picker's locked reserve
+  # next step, and ensures the bucket exists (full) so the picker's locked reserve
   # never races a missing row. The `ensure` CTE no-ops when $5 is NULL (split_part(NULL,…) is
-  # NULL ⇒ matches no config) or when the bucket already exists (ON CONFLICT DO NOTHING).
-  def complete_next(repo, id, step, state_json, consumed_ids, rate_limit, weight) do
-    repo.query!(
-      """
-      WITH ensure AS (
-        INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
-        SELECT $5, cfg.burst, clock_timestamp()
-        FROM gen_durable_rate_configs cfg WHERE cfg.name = split_part($5, ':', 1)
-        ON CONFLICT (key) DO NOTHING
-      ),
-      consumed AS (
-        DELETE FROM signals WHERE target_id = $1 AND id = ANY($4::bigint[])
+  # NULL ⇒ matches no config), when the bucket already exists (ON CONFLICT DO
+  # NOTHING), or when the ownership guard failed (committed empty).
+  def complete_next(repo, id, worker, step, state_json, consumed_ids, rate_limit, weight) do
+    %{rows: [[n]]} =
+      q!(
+        repo,
+        "complete_next",
+        """
+        WITH committed AS (
+          UPDATE gen_durable
+          SET step = $2, state = $3::text::jsonb, status = 'runnable', eligible_at = now(),
+              attempt = 0, awaits = null, rate_limit = $5, weight = $6,
+              locked_by = null, lease_expires_at = null, updated_at = now()
+          WHERE id = $1 AND locked_by = $7 AND status = 'executing'
+          RETURNING id
+        ),
+        ensure AS (
+          INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
+          SELECT $5, cfg.burst, clock_timestamp()
+          FROM gen_durable_rate_configs cfg
+          WHERE cfg.name = split_part($5, ':', 1) AND EXISTS (SELECT 1 FROM committed)
+          ON CONFLICT (key) DO NOTHING
+        ),
+        consumed AS (
+          DELETE FROM signals
+          WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
+        )
+        SELECT count(*) FROM committed
+        """,
+        [id, step, state_json, consumed_ids, rate_limit, weight, worker]
       )
-      UPDATE gen_durable
-      SET step = $2, state = $3::jsonb, status = 'runnable', eligible_at = now(),
-          attempt = 0, awaits = null, rate_limit = $5, weight = $6,
-          locked_by = null, lease_expires_at = null, updated_at = now()
-      WHERE id = $1
-      """,
-      [id, step, state_json, consumed_ids, rate_limit, weight]
-    )
 
-    :ok
+    committed?(n)
   end
 
   # :retry redoes the same step, so it consumes nothing and KEEPS `awaits` — the
   # redo must see the same awaited signals it was handed.
-  def complete_retry(repo, id, state_json, delay_ms) do
-    repo.query!(
-      """
-      UPDATE gen_durable
-      SET state = $2::jsonb, status = 'runnable',
-          eligible_at = now() + $3::int * interval '1 millisecond',
-          attempt = attempt + 1, locked_by = null, lease_expires_at = null,
-          updated_at = now()
-      WHERE id = $1
-      """,
-      [id, state_json, delay_ms]
-    )
+  def complete_retry(repo, id, worker, state_json, delay_ms) do
+    %{num_rows: n} =
+      q!(
+        repo,
+        "complete_retry",
+        """
+        UPDATE gen_durable
+        SET state = $2::text::jsonb, status = 'runnable',
+            eligible_at = now() + $3::int * interval '1 millisecond',
+            attempt = attempt + 1, locked_by = null, lease_expires_at = null,
+            updated_at = now()
+        WHERE id = $1 AND locked_by = $4 AND status = 'executing'
+        """,
+        [id, state_json, delay_ms, worker]
+      )
 
-    :ok
+    committed?(n)
   end
 
   # Park on a name set ($3, text[]), transitioning to `next_step` ($4): when any named
   # signal arrives the row becomes runnable at `next_step`, which reads the matching
-  # subset as `ctx.awaited`. If a matching signal is already in the inbox (it arrived
-  # before this park committed), go straight to runnable so `next_step` runs at once —
-  # closing the lost-wakeup race.
-  def complete_await(repo, id, state_json, names, next_step) do
-    repo.query!(
-      """
-      UPDATE gen_durable
-      SET step = $4, state = $2::jsonb, awaits = $3::text[], eligible_at = now(),
-          status = (CASE WHEN EXISTS (
-                      SELECT 1 FROM signals WHERE target_id = $1 AND name = ANY($3::text[]))
-                    THEN 'runnable' ELSE 'awaiting_signal' END)::durable_status,
-          rate_limit = null, weight = 1,
-          locked_by = null, lease_expires_at = null, updated_at = now()
-      WHERE id = $1
-      """,
-      [id, state_json, names, next_step]
-    )
+  # subset as `ctx.awaited`.
+  #
+  # Two statements in ONE transaction — the park side of the lost-wakeup fix:
+  #   1. park — flips to awaiting_signal and takes the row lock (held to commit).
+  #   2. recheck — a fresh snapshot: a matching signal already in the inbox (its
+  #      delivery committed before this statement) flips straight to runnable.
+  # A delivery the recheck cannot see must commit after it — but its wake UPDATE
+  # matches the row unconditionally (see deliver_signal), so it queues on our row
+  # lock and performs the flip itself once we commit. Either the recheck or the
+  # delivery wakes the row; no interleaving leaves a matching signal with a
+  # parked instance. A single statement cannot do this: under READ COMMITTED its
+  # EXISTS runs on the statement snapshot, blind to a concurrently-committing
+  # delivery, while that delivery's status-guarded wake skips the not-yet-parked
+  # row without locking. The extra round trips buy the race away.
+  def complete_await(repo, id, worker, state_json, names, next_step) do
+    {:ok, result} =
+      repo.transaction(fn ->
+        %{num_rows: parked} =
+          q!(
+            repo,
+            "await_park",
+            """
+            UPDATE gen_durable
+            SET step = $4, state = $2::text::jsonb, awaits = $3::text[], eligible_at = now(),
+                status = 'awaiting_signal', rate_limit = null, weight = 1,
+                locked_by = null, lease_expires_at = null, updated_at = now()
+            WHERE id = $1 AND locked_by = $5 AND status = 'executing'
+            """,
+            [id, state_json, names, next_step, worker]
+          )
 
-    :ok
+        # Guard failed ⇒ the row is someone else's now — skip the recheck (its
+        # own claimant parks and rechecks for itself).
+        if parked == 1 do
+          q!(
+            repo,
+            "await_recheck",
+            """
+            UPDATE gen_durable
+            SET status = 'runnable', updated_at = now()
+            WHERE id = $1 AND status = 'awaiting_signal'
+              AND EXISTS (SELECT 1 FROM signals
+                          WHERE target_id = $1 AND name = ANY(gen_durable.awaits))
+            """,
+            [id]
+          )
+
+          :ok
+        else
+          :stale
+        end
+      end)
+
+    result
   end
 
-  def complete_done(repo, id, result_json) do
-    repo.query!(
-      """
-      WITH consumed AS (
-        DELETE FROM signals WHERE target_id = $1
-      ),
-      terminal AS (
-        UPDATE gen_durable
-        SET result = $2::jsonb, status = 'done', awaits = null,
-            locked_by = null, lease_expires_at = null, updated_at = now()
-        WHERE id = $1
+  def complete_done(repo, id, worker, result_json) do
+    %{rows: [[n]]} =
+      q!(
+        repo,
+        "complete_done",
+        """
+        WITH terminal AS (
+          UPDATE gen_durable
+          SET result = $2::text::jsonb, status = 'done', awaits = null,
+              locked_by = null, lease_expires_at = null, updated_at = now()
+          WHERE id = $1 AND locked_by = $3 AND status = 'executing'
+          RETURNING id, parent_id
+        ),
+        consumed AS (
+          DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
+        ),
+        """ <> @notify_parent,
+        [id, result_json, worker]
       )
-      """ <> @notify_parent,
-      [id, result_json]
-    )
 
-    :ok
+    committed?(n)
   end
 
-  def complete_stop(repo, id, reason_text) do
-    repo.query!(
-      """
-      WITH consumed AS (
-        DELETE FROM signals WHERE target_id = $1
-      ),
-      terminal AS (
-        UPDATE gen_durable
-        SET status = 'failed', last_error = $2, awaits = null,
-            locked_by = null, lease_expires_at = null, updated_at = now()
-        WHERE id = $1
+  def complete_stop(repo, id, worker, reason_text) do
+    %{rows: [[n]]} =
+      q!(
+        repo,
+        "complete_stop",
+        """
+        WITH terminal AS (
+          UPDATE gen_durable
+          SET status = 'failed', last_error = $2, awaits = null,
+              locked_by = null, lease_expires_at = null, updated_at = now()
+          WHERE id = $1 AND locked_by = $3 AND status = 'executing'
+          RETURNING id, parent_id
+        ),
+        consumed AS (
+          DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
+        ),
+        """ <> @notify_parent,
+        [id, reason_text, worker]
       )
-      """ <> @notify_parent,
-      [id, reason_text]
-    )
 
-    :ok
+    committed?(n)
   end
 
-  # :schedule_childs (spec §11) — spawn the batch and park the parent on the join
+  # :schedule_childs — spawn the batch and park the parent on the join
   # barrier, in one statement (consume + insert children + park). children_pending
   # is set to the number of children actually inserted; zero inserted ⇒ barrier
   # pre-satisfied ⇒ runnable.
-  def complete_schedule_childs(repo, parent_id, next_step, state_json, [], consumed_ids) do
-    repo.query!(
-      """
-      WITH consumed AS (
-        DELETE FROM signals WHERE target_id = $1 AND id = ANY($4::bigint[])
+  def complete_schedule_childs(repo, parent_id, worker, next_step, state_json, [], consumed_ids) do
+    %{rows: [[n]]} =
+      q!(
+        repo,
+        "schedule_childs_empty",
+        """
+        WITH committed AS (
+          UPDATE gen_durable
+          SET step = $2, state = $3::text::jsonb, children_pending = 0, status = 'runnable',
+              eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1,
+              locked_by = null, lease_expires_at = null, updated_at = now()
+          WHERE id = $1 AND locked_by = $5 AND status = 'executing'
+          RETURNING id
+        ),
+        consumed AS (
+          DELETE FROM signals
+          WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
+        )
+        SELECT count(*) FROM committed
+        """,
+        [parent_id, next_step, state_json, consumed_ids, worker]
       )
-      UPDATE gen_durable
-      SET step = $2, state = $3::jsonb, children_pending = 0, status = 'runnable',
-          eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1,
-          locked_by = null, lease_expires_at = null, updated_at = now()
-      WHERE id = $1
-      """,
-      [parent_id, next_step, state_json, consumed_ids]
-    )
 
-    :ok
+    committed?(n)
   end
 
-  def complete_schedule_childs(repo, parent_id, next_step, state_json, children, consumed_ids) do
-    placeholders =
-      children
-      |> Enum.with_index()
-      |> Enum.map(fn {_p, i} -> child_row_placeholders(4 + i * 12) end)
-
-    keys_n = 4 + length(children) * 12 + 1
-
+  # Children ride in as 12 parallel arrays via `unnest` (base 5: $6..$17), so the
+  # parameter count is fixed — 18 for any batch size (the wire protocol caps a
+  # statement at 65535 parameters, ~5400 rows in per-row-placeholder form) — and
+  # the SQL text is static (statement-cacheable). $1 doubles as the parent_id column.
+  # The ownership guard lives in a leading `claim` CTE (SELECT … FOR UPDATE): the
+  # children insert, the consume, and the parent park are all gated on it, because
+  # the park needs the inserted-children count and so cannot itself be the guard.
+  def complete_schedule_childs(
+        repo,
+        parent_id,
+        worker,
+        next_step,
+        state_json,
+        children,
+        consumed_ids
+      ) do
     sql =
-      "WITH ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
-        "SELECT k, cfg.burst, clock_timestamp() FROM unnest($#{keys_n}::text[]) k " <>
+      "WITH claim AS (SELECT id FROM gen_durable " <>
+        "WHERE id = $1 AND locked_by = $18 AND status = 'executing' FOR UPDATE), " <>
+        "ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
+        "SELECT k, cfg.burst, clock_timestamp() FROM unnest($5::text[]) k " <>
         "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
-        "ON CONFLICT (key) DO NOTHING), " <>
-        "consumed AS (DELETE FROM signals WHERE target_id = $1 AND id = ANY($4::bigint[])), " <>
-        "ins AS (INSERT INTO gen_durable " <>
-        "(fsm, fsm_version, step, state, queue, priority, concurrency_key, " <>
-        "eligible_at, correlation_key, correlation_scope, rate_limit, weight, parent_id) VALUES " <>
-        Enum.join(placeholders, ", ") <>
+        "WHERE EXISTS (SELECT 1 FROM claim) " <>
+        "ORDER BY k ON CONFLICT (key) DO NOTHING), " <>
+        "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
+        "AND id = ANY($4::bigint[])), " <>
+        "ins AS (INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>
+        @unnest_row_select <>
+        ", $1 " <>
+        unnest_from(5) <>
+        " WHERE EXISTS (SELECT 1 FROM claim)" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
         "cnt AS (SELECT count(*) AS n FROM ins) " <>
-        "UPDATE gen_durable SET step = $2, state = $3::jsonb, " <>
+        "UPDATE gen_durable SET step = $2, state = $3::text::jsonb, " <>
         "children_pending = (SELECT n FROM cnt), " <>
         "status = (CASE WHEN (SELECT n FROM cnt) = 0 THEN 'runnable' " <>
         "ELSE 'awaiting_children' END)::durable_status, " <>
         "eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1, " <>
-        "locked_by = null, lease_expires_at = null, updated_at = now() WHERE id = $1"
+        "locked_by = null, lease_expires_at = null, updated_at = now() " <>
+        "WHERE id IN (SELECT id FROM claim)"
 
     args =
-      [parent_id, next_step, state_json, consumed_ids] ++
-        Enum.flat_map(children, &row_args/1) ++ [bucket_keys(children)]
+      [parent_id, next_step, state_json, consumed_ids, bucket_keys(children)] ++
+        column_arrays(children) ++ [worker]
 
-    repo.query!(sql, args)
-    :ok
-  end
-
-  # Child placeholders share $1 (the parent id) as the parent_id column.
-  defp child_row_placeholders(base) do
-    "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}::jsonb, $#{base + 5}, " <>
-      "$#{base + 6}, $#{base + 7}, COALESCE($#{base + 8}::timestamptz, now()), " <>
-      "$#{base + 9}, $#{base + 10}::text[]::durable_status[], $#{base + 11}, $#{base + 12}, $1)"
+    %{num_rows: n} = q!(repo, "schedule_childs", sql, args)
+    committed?(n)
   end
 
   # --- signals ---------------------------------------------------------------
 
   def load_signals(repo, target_id) do
     %{rows: rows} =
-      repo.query!(
+      q!(
+        repo,
+        "load_signals",
         "SELECT id, name, payload FROM signals WHERE target_id = $1 ORDER BY id",
         [target_id]
       )
@@ -446,10 +627,12 @@ defmodule GenDurable.Queries do
     end)
   end
 
-  # A parent's children (spec §11), for ctx.childs on wake-up.
+  # A parent's children, for ctx.childs on wake-up.
   def load_childs(repo, parent_id) do
     %{rows: rows} =
-      repo.query!(
+      q!(
+        repo,
+        "load_childs",
         """
         SELECT id, fsm, status::text, state, result, last_error
         FROM gen_durable WHERE parent_id = $1 ORDER BY id
@@ -470,7 +653,7 @@ defmodule GenDurable.Queries do
   end
 
   # `target` is either an internal id (integer) or a correlation_key (string). The signal
-  # row is inserted before the wake-flip so the woken step already sees it (spec §5).
+  # row is inserted before the wake-flip so the woken step already sees it.
   # Returns `:ok`, or `{:error, :no_target}` when a correlation_key resolves to no
   # occupied instance.
   def deliver_signal(repo, target, name, payload_json, dedup_key) do
@@ -480,20 +663,38 @@ defmodule GenDurable.Queries do
           repo.rollback(:no_target)
 
         id ->
-          repo.query!(
+          q!(
+            repo,
+            "signal_insert",
             """
             INSERT INTO signals (target_id, name, payload, dedup_key)
-            VALUES ($1, $2, $3::jsonb, $4)
+            VALUES ($1, $2, $3::text::jsonb, $4)
             ON CONFLICT (target_id, dedup_key) DO NOTHING
             """,
             [id, name, payload_json, dedup_key]
           )
 
-          repo.query!(
+          # Wake flip — the delivery side of the lost-wakeup fix. Matches by id
+          # alone (the flip condition lives in CASE, not WHERE) so it always
+          # locks a live row: racing a park (complete_await) it queues behind
+          # the park's row lock and re-evaluates the CASE against the committed
+          # row (READ COMMITTED follows the update chain), flipping the freshly-
+          # parked row. A status-guarded WHERE would skip the not-yet-parked row
+          # without locking or waiting — the lost wakeup. Terminal rows are
+          # excluded: outcomes are one-shot, so no park can be in flight for
+          # them, and skipping keeps them out of the wake path entirely.
+          q!(
+            repo,
+            "signal_wake",
             """
             UPDATE gen_durable
-            SET status = 'runnable', eligible_at = now(), updated_at = now()
-            WHERE id = $1 AND status = 'awaiting_signal' AND $2 = ANY(awaits)
+            SET status = CASE WHEN status = 'awaiting_signal' AND $2 = ANY(awaits)
+                              THEN 'runnable'::durable_status ELSE status END,
+                eligible_at = CASE WHEN status = 'awaiting_signal' AND $2 = ANY(awaits)
+                                   THEN now() ELSE eligible_at END,
+                updated_at = CASE WHEN status = 'awaiting_signal' AND $2 = ANY(awaits)
+                                  THEN now() ELSE updated_at END
+            WHERE id = $1 AND status NOT IN ('done', 'failed')
             """,
             [id, name]
           )
@@ -513,7 +714,9 @@ defmodule GenDurable.Queries do
   defp resolve_target(_repo, id) when is_integer(id), do: id
 
   defp resolve_target(repo, key) when is_binary(key) do
-    case repo.query!("SELECT id FROM gen_durable WHERE correlation_guard = $1", [key]) do
+    case q!(repo, "resolve_target", "SELECT id FROM gen_durable WHERE correlation_guard = $1", [
+           key
+         ]) do
       %{rows: [[id]]} -> id
       %{rows: []} -> nil
     end
@@ -521,26 +724,29 @@ defmodule GenDurable.Queries do
 
   # --- insert / batch insert -------------------------------------------------
 
-  @insert_cols "fsm, fsm_version, step, state, queue, priority, concurrency_key, eligible_at, correlation_key, correlation_scope, rate_limit, weight"
-  # 12 = number of columns above (one positional placeholder each).
-
   # Ensures a token bucket exists (full) for each given rate_limit key, as a leading CTE so
-  # the insert stays one statement. `$n` is a text[] of distinct keys; empty ⇒ no-op (spec §12).
+  # the insert stays one statement. `$n` is a text[] of distinct keys; empty ⇒ no-op.
+  # ORDER BY k: deterministic insertion order — two statements creating the same new
+  # keys via the arbiter index in opposite orders would deadlock.
   defp ensure_buckets_cte(n) do
     "WITH ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
       "SELECT k, cfg.burst, clock_timestamp() FROM unnest($#{n}::text[]) k " <>
       "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
-      "ON CONFLICT (key) DO NOTHING) "
+      "ORDER BY k ON CONFLICT (key) DO NOTHING) "
   end
 
   defp bucket_keys(rows),
-    do: rows |> Enum.map(& &1.rate_limit) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+    do: rows |> Enum.map(& &1.rate_limit) |> Enum.reject(&is_nil/1) |> Enum.uniq() |> Enum.sort()
 
-  # Seed/refresh the rate-limit policy table at engine start (spec §12). `configs` is a list of
+  # Seed/refresh the rate-limit policy table at engine start. `configs` is a list of
   # `%{name, rate, burst}`. Idempotent: re-running with changed numbers updates them.
+  # Sorted by name: DO UPDATE locks existing rows in VALUES order, and two nodes
+  # booting with differently-ordered configs would deadlock.
   def upsert_rate_configs(_repo, []), do: :ok
 
   def upsert_rate_configs(repo, configs) when is_list(configs) do
+    configs = Enum.sort_by(configs, & &1.name)
+
     values =
       configs
       |> Enum.with_index()
@@ -562,33 +768,30 @@ defmodule GenDurable.Queries do
     sql =
       ensure_buckets_cte(12 + 1) <>
         "INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
-        row_placeholders(0) <>
+        "($1, $2, $3, $4::text::jsonb, $5, $6, $7, COALESCE($8::timestamptz, now()), " <>
+        "$9, $10::text[]::durable_status[], $11, $12)" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    case repo.query!(sql, row_args(p) ++ [bucket_keys([p])]) do
+    case q!(repo, "insert", sql, row_args(p) ++ [bucket_keys([p])]) do
       %{rows: [[id]]} -> {:ok, id}
       %{rows: []} -> {:error, :duplicate}
     end
   end
 
+  # Rows ride in as 12 parallel arrays via `unnest` — 13 parameters for any batch
+  # size (the wire protocol caps a statement at 65535 parameters, which the old
+  # per-row-placeholder form hit at ~5400 rows) and a static, cacheable SQL text.
   def insert_all(repo, rows) when is_list(rows) do
-    placeholders =
-      rows |> Enum.with_index() |> Enum.map(fn {_p, i} -> row_placeholders(i * 12) end)
-
     sql =
-      ensure_buckets_cte(length(rows) * 12 + 1) <>
-        "INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
-        Enum.join(placeholders, ", ") <>
+      ensure_buckets_cte(12 + 1) <>
+        "INSERT INTO gen_durable (#{@insert_cols}) " <>
+        @unnest_row_select <>
+        " " <>
+        unnest_from(0) <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    %{rows: out} = repo.query!(sql, Enum.flat_map(rows, &row_args/1) ++ [bucket_keys(rows)])
+    %{rows: out} = q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows)])
     List.flatten(out)
-  end
-
-  defp row_placeholders(base) do
-    "($#{base + 1}, $#{base + 2}, $#{base + 3}, $#{base + 4}::jsonb, $#{base + 5}, " <>
-      "$#{base + 6}, $#{base + 7}, COALESCE($#{base + 8}::timestamptz, now()), " <>
-      "$#{base + 9}, $#{base + 10}::text[]::durable_status[], $#{base + 11}, $#{base + 12})"
   end
 
   defp row_args(p) do
@@ -611,23 +814,27 @@ defmodule GenDurable.Queries do
   # --- concurrency_key serialization (advisory lock) ---------------------------
 
   def advisory_try_lock(repo, key) do
-    %{rows: [[locked]]} = repo.query!("SELECT pg_try_advisory_lock(hashtext($1))", [key])
+    %{rows: [[locked]]} =
+      q!(repo, "advisory_lock", "SELECT pg_try_advisory_lock(hashtext($1))", [key])
+
     locked
   end
 
   def advisory_unlock(repo, key) do
-    repo.query!("SELECT pg_advisory_unlock(hashtext($1))", [key])
+    q!(repo, "advisory_unlock", "SELECT pg_advisory_unlock(hashtext($1))", [key])
     :ok
   end
 
-  def reset_to_runnable(repo, id) do
-    repo.query!(
+  def reset_to_runnable(repo, id, worker) do
+    q!(
+      repo,
+      "reset_to_runnable",
       """
       UPDATE gen_durable
       SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
-      WHERE id = $1
+      WHERE id = $1 AND locked_by = $2 AND status = 'executing'
       """,
-      [id]
+      [id, worker]
     )
 
     :ok
@@ -639,7 +846,9 @@ defmodule GenDurable.Queries do
   def release(_repo, [], _worker), do: :ok
 
   def release(repo, ids, worker) when is_list(ids) do
-    repo.query!(
+    q!(
+      repo,
+      "release",
       """
       UPDATE gen_durable
       SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
@@ -651,6 +860,8 @@ defmodule GenDurable.Queries do
     :ok
   end
 
+  # The binary branch covers jsonb scalar-string rows written by versions that
+  # double-encoded JSON params (≤ 0.1.8); new rows arrive as decoded maps.
   defp decode_json(value) when is_binary(value), do: Jason.decode!(value)
   defp decode_json(value) when is_map(value), do: value
   defp decode_json(nil), do: %{}

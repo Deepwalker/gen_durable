@@ -12,6 +12,10 @@ defmodule GenDurable do
 
       {GenDurable, repo: MyApp.Repo, queues: [default: 10, checkout: 5]}
 
+  Several engine instances can coexist (different repos, disjoint queue sets):
+  give each a `:name` (an atom, default `GenDurable`) and route API calls with
+  `name: MyEngine` — see `GenDurable.Supervisor`.
+
   FSMs are resolved from the row (the `fsm` column defaults to the module name);
   pass `:fsms` only for a custom `:name` or to keep an old `:version` running.
 
@@ -41,18 +45,23 @@ defmodule GenDurable do
     * `[:gen_durable, :concurrency, :contended]` — a concurrency_key advisory lock
       was contended (a row was handed back). Measurements `%{count}`; metadata
       `%{id, fsm, concurrency_key}`.
+    * `[:gen_durable, :outcome, :stale]` — a worker committed an outcome for a row
+      it no longer owns (its lease expired and the row was reclaimed while the step
+      ran); the outcome was dropped and the current claimant redoes the step.
+      Measurements `%{count}`; metadata `%{id, fsm, step, kind}`.
     * `[:gen_durable, :reaper, :reaped]` — expired leases reclaimed. Measurements
       `%{count}`; metadata `%{ids}`.
     * `[:gen_durable, :gc, :swept]` — terminal rows deleted by a GC sweep.
       Measurements `%{count}`; metadata `%{}`.
     * `[:gen_durable, :rate_limit, :throttled]` — a rate-limit bucket granted fewer rows
-      than wanted in a pick (spec §12). Measurements `%{wanted, granted}`; metadata
+      than wanted in a pick. Measurements `%{wanted, granted}`; metadata
       `%{key, queue}`. The signal that a limit is biting.
     * `[:gen_durable, :rate_limit, :unknown]` — a step named a `rate_limit` whose name has
       no configured policy (the row would stall). Measurements `%{count}`; metadata
       `%{key, name, fsm, step}`.
 
-  See `gen_durable_spec.md` (normative) and `gen_durable_plan.md` (roadmap).
+  See the guides for the feature documentation (jobs, state machines, signals,
+  child fan-out, rate limiting, concurrency keys, identity, scheduling, operations).
   """
 
   alias GenDurable.{Queries, State}
@@ -63,7 +72,7 @@ defmodule GenDurable do
 
   def child_spec(opts) do
     %{
-      id: Keyword.get(opts, :name, GenDurable.Supervisor),
+      id: Keyword.get(opts, :name, GenDurable),
       start: {GenDurable.Supervisor, :start_link, [opts]},
       type: :supervisor
     }
@@ -76,6 +85,8 @@ defmodule GenDurable do
   `:step` (default the FSM's `:initial`), `:queue`, `:priority`, `:concurrency_key`,
   `:correlation_key`, `:correlation_scope`, and scheduling — `:eligible_at` (a `DateTime`),
   or the sugar `:schedule_at` (a `DateTime`) / `:schedule_in` (milliseconds from now).
+  `:name` routes the call to a named engine instance (default `GenDurable`);
+  `insert_all/3` and `signal/4` take it too.
   Returns `{:ok, id}` or `{:error, :duplicate}`.
 
   `:correlation_key` is the instance's business identity — both the key you can later
@@ -88,8 +99,7 @@ defmodule GenDurable do
   With no `:correlation_key` the instance is neither addressable nor deduplicated.
   """
   def insert(fsm_module, opts \\ []) do
-    repo = opts[:repo] || config().repo
-    Queries.insert(repo, build_params(fsm_module, opts))
+    Queries.insert(repo(opts), build_params(fsm_module, opts))
   end
 
   @doc """
@@ -98,12 +108,11 @@ defmodule GenDurable do
   list of inserted ids (duplicates dropped).
   """
   def insert_all(fsm_module, entries, opts \\ []) do
-    repo = opts[:repo] || config().repo
-    Queries.insert_all(repo, Enum.map(entries, &build_params(fsm_module, &1)))
+    Queries.insert_all(repo(opts), Enum.map(entries, &build_params(fsm_module, &1)))
   end
 
   @doc """
-  Deliver a durable signal to an instance (spec §5). Wakes the instance only on
+  Deliver a durable signal to an instance. Wakes the instance only on
   a name match. `:dedup_key` (default `nil`) makes redelivery idempotent.
 
   `target` is either the internal id (an integer) or a `:correlation_key` (a string) set
@@ -113,10 +122,8 @@ defmodule GenDurable do
   that does not exist yet). Returns `:ok` otherwise.
   """
   def signal(target, name, payload \\ %{}, opts \\ []) do
-    repo = opts[:repo] || config().repo
-
     Queries.deliver_signal(
-      repo,
+      repo(opts),
       target,
       to_string(name),
       Jason.encode!(payload),
@@ -146,7 +153,7 @@ defmodule GenDurable do
     }
   end
 
-  # Resolve an insert-time `:rate_limit` key (spec §12): nil | name | {name, partition}.
+  # Resolve an insert-time `:rate_limit` key: nil | name | {name, partition}.
   defp rate_limit_key(nil), do: nil
   defp rate_limit_key(name) when is_binary(name) or is_atom(name), do: to_string(name)
   defp rate_limit_key({name, partition}), do: "#{name}:#{partition}"
@@ -172,5 +179,13 @@ defmodule GenDurable do
     end
   end
 
-  defp config, do: :persistent_term.get({GenDurable, :config})
+  # Resolve the repo for an API call: an explicit `:repo` wins, else the config
+  # of the `:name`d instance (default `GenDurable`).
+  defp repo(opts), do: opts[:repo] || config(Keyword.get(opts, :name, GenDurable)).repo
+
+  defp config(name) do
+    :persistent_term.get({GenDurable, name}, nil) ||
+      raise ArgumentError,
+            "no GenDurable instance named #{inspect(name)} — is the engine started?"
+  end
 end

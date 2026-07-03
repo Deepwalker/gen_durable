@@ -3,6 +3,8 @@ defmodule GenDurable.PerfTest do
   Round-trip guards for the outcome path. Each `complete_*` must be a SINGLE
   database statement (one round-trip), not a `BEGIN … COMMIT` transaction — the
   signal consume and parent-join are folded in as data-modifying CTEs (F4).
+  The one deliberate exception is `complete_await`: park + recheck in one
+  transaction, trading round trips for the lost-wakeup fix (see its test).
 
   These tests guard the *round-trip count* only — that the collapse didn't
   silently revert to a multi-statement transaction. They say nothing about
@@ -79,7 +81,9 @@ defmodule GenDurable.PerfTest do
 
   test "complete_next is a single statement (one round-trip)" do
     id = setup_executing()
-    sql = statements(fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [], nil, 1) end)
+
+    sql =
+      statements(fn -> Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1) end)
 
     assert length(sql) == 1
     assert hd(sql) =~ "consumed AS"
@@ -87,28 +91,35 @@ defmodule GenDurable.PerfTest do
 
   test "complete_retry is a single statement" do
     id = setup_executing()
-    assert length(statements(fn -> Queries.complete_retry(Repo, id, ~s({}), 0) end)) == 1
+    assert length(statements(fn -> Queries.complete_retry(Repo, id, "w", ~s({}), 0) end)) == 1
   end
 
-  test "complete_await is a single statement" do
+  test "complete_await is park + recheck in one transaction (lost-wakeup fix)" do
     id = setup_executing()
 
-    assert length(statements(fn -> Queries.complete_await(Repo, id, ~s({}), ["go"], "woke") end)) ==
-             1
+    sql = statements(fn -> Queries.complete_await(Repo, id, "w", ~s({}), ["go"], "woke") end)
+
+    # Deliberately NOT a single statement: the park takes the row lock, then a
+    # second fresh-snapshot statement rechecks the inbox — closing the lost-wakeup
+    # race with deliver_signal (see Queries.complete_await). Guard the exact shape
+    # so an extra statement doesn't creep in unnoticed.
+    assert [_begin, park, recheck, _commit] = sql
+    assert park =~ "awaiting_signal"
+    assert recheck =~ "EXISTS"
   end
 
   test "complete_done is a single statement (consume + done + parent-join folded in)" do
     id = setup_executing()
-    sql = statements(fn -> Queries.complete_done(Repo, id, ~s({"ok":true})) end)
+    sql = statements(fn -> Queries.complete_done(Repo, id, "w", ~s({"ok":true})) end)
 
     assert length(sql) == 1
-    assert hd(sql) =~ "WITH consumed"
+    assert hd(sql) =~ "WITH terminal"
     assert hd(sql) =~ "children_pending"
   end
 
   test "complete_stop is a single statement" do
     id = setup_executing()
-    assert length(statements(fn -> Queries.complete_stop(Repo, id, "boom") end)) == 1
+    assert length(statements(fn -> Queries.complete_stop(Repo, id, "w", "boom") end)) == 1
   end
 
   test "complete_schedule_childs is a single statement (consume + insert + park)" do
@@ -117,7 +128,7 @@ defmodule GenDurable.PerfTest do
 
     sql =
       statements(fn ->
-        Queries.complete_schedule_childs(Repo, id, "join", ~s({}), children, [])
+        Queries.complete_schedule_childs(Repo, id, "w", "join", ~s({}), children, [])
       end)
 
     assert length(sql) == 1
@@ -129,8 +140,20 @@ defmodule GenDurable.PerfTest do
     id = setup_executing()
     iters = 500
 
-    new = bench(iters, fn -> Queries.complete_next(Repo, id, "tick", ~s({"n":1}), [], nil, 1) end)
-    old = bench(iters, fn -> complete_next_tx(id, "tick", ~s({"n":1})) end)
+    # Re-claim before each call (equal overhead on both sides): the ownership
+    # guard makes complete_next a no-op on an unclaimed row, which would bench
+    # nothing.
+    new =
+      bench(iters, fn ->
+        reclaim(id)
+        Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1)
+      end)
+
+    old =
+      bench(iters, fn ->
+        reclaim(id)
+        complete_next_tx(id, "tick", ~s({"n":1}))
+      end)
 
     IO.puts("\n  complete_next over #{iters} iters (median µs/call):")
     IO.puts("    collapsed (1 statement):  #{new} µs")
@@ -138,6 +161,13 @@ defmodule GenDurable.PerfTest do
     IO.puts("    speedup: #{Float.round(old / new, 2)}x")
 
     assert new < old
+  end
+
+  defp reclaim(id) do
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'executing', locked_by = 'w' WHERE id = $1",
+      [id]
+    )
   end
 
   # Median per-call microseconds over `n` runs.
