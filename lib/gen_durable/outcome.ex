@@ -1,9 +1,9 @@
 defmodule GenDurable.Outcome do
   @moduledoc """
-  The five step/handle outcomes from the spec §3, with shape validation.
+  The step/handle outcomes, with shape validation.
 
       {:next, step, state}        # transition, runnable, attempt := 0
-      {:next, step, state, opts}  # …with per-transition opts: rate_limit, weight (spec §12)
+      {:next, step, state, opts}  # …with per-transition opts: rate_limit, weight
       {:retry, state, delay_ms}   # same step, runnable, attempt += 1, eligible_at += delay
       {:await, names, next_step, state} # park; on any of `names`, run next_step (ctx.awaited)
       {:done, result}             # terminal, done

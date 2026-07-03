@@ -59,7 +59,7 @@ defmodule GenDurable.Migration do
     :ok
   end
 
-  # --- version 1: spec §9 DDL ------------------------------------------------
+  # --- version 1: DDL ------------------------------------------------
 
   defp change(1, :up, p) do
     execute("""
@@ -85,7 +85,7 @@ defmodule GenDurable.Migration do
       attempt       int  not null default 0,
       last_error    text,
 
-      -- rate limiting (spec §12): rate_limit is the bucket key for the CURRENT step
+      -- rate limiting: rate_limit is the bucket key for the CURRENT step
       -- (NULL ⇒ not rate-limited), weight is how many budget units this step's execution
       -- consumes (default 1). Both rewritten on every transition; kept on :retry.
       rate_limit    text,
@@ -98,7 +98,7 @@ defmodule GenDurable.Migration do
       children_pending int not null default 0,
 
       -- correlation_key: the instance's business identity — both the signal address
-      -- (§5) and the uniqueness guard (§7). correlation_scope is the set of statuses in
+      -- and the uniqueness guard. correlation_scope is the set of statuses in
       -- which the key is "occupied", supplied by the caller (defaults to the non-terminal
       -- statuses ⇒ unique among live, freed on termination). The guard equals the key
       -- while the status is occupied, else NULL (drops out of the unique/address index).
@@ -169,7 +169,7 @@ defmodule GenDurable.Migration do
 
     execute("CREATE INDEX signals_target ON #{p}.signals (target_id, name)")
 
-    # rate limiting (spec §12). Configs are seeded at engine start from the `rate_limits:`
+    # rate limiting. Configs are seeded at engine start from the `rate_limits:`
     # option; the picker joins them. Buckets are token-bucket counters, one row per distinct
     # key, ensured (full) by the transition that assigns the key.
     execute("""

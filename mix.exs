@@ -26,8 +26,7 @@ defmodule GenDurable.MixProject do
     [
       licenses: ["BSD-3-Clause"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib mix.exs README.md LICENSE CHANGELOG.md PERFORMANCE.md .formatter.exs
-                gen_durable_spec.md gen_durable_plan.md)
+      files: ~w(lib guides mix.exs README.md LICENSE CHANGELOG.md PERFORMANCE.md .formatter.exs)
     ]
   end
 
@@ -36,10 +35,20 @@ defmodule GenDurable.MixProject do
       main: "readme",
       extras: [
         "README.md",
-        "CHANGELOG.md": [title: "Changelog"],
+        "guides/jobs.md": [title: "Jobs"],
+        "guides/machines.md": [title: "State machines"],
+        "guides/signals.md": [title: "Signals & await"],
+        "guides/children.md": [title: "Child fan-out"],
+        "guides/rate_limiting.md": [title: "Rate limiting"],
+        "guides/concurrency.md": [title: "Concurrency keys"],
+        "guides/identity.md": [title: "Instance identity"],
+        "guides/scheduling.md": [title: "Scheduling & queues"],
+        "guides/operations.md": [title: "Operations"],
         "PERFORMANCE.md": [title: "Performance"],
-        "gen_durable_spec.md": [title: "Specification"],
-        "gen_durable_plan.md": [title: "Implementation plan"]
+        "CHANGELOG.md": [title: "Changelog"]
+      ],
+      groups_for_extras: [
+        Guides: ~r{guides/.*}
       ],
       groups_for_modules: [
         "Public API": [GenDurable, GenDurable.FSM, GenDurable.State, GenDurable.Migration],

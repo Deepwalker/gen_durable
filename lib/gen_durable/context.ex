@@ -8,7 +8,7 @@ defmodule GenDurable.Context do
   Two signal views: `awaited` is the subset the step's `:await` named (what the
   engine delivers and consumes — empty when the step was not reached via an await),
   and `all` is the full instance inbox. Both are empty for `handle/2`. `childs`
-  holds this instance's children (spec §11) — populated when a parent wakes from
+  holds this instance's children — populated when a parent wakes from
   `schedule_childs`, empty otherwise. See `GenDurable.FSM`.
   """
 
