@@ -108,7 +108,8 @@ defmodule GenDurable do
   @doc """
   Batch-enqueue instances in a single statement (dedup via the partial unique
   index). `entries` is a list of per-instance option keyword lists. Returns the
-  list of inserted ids (duplicates dropped).
+  list of inserted ids — duplicates are dropped and rows are inserted in
+  `correlation_key` order, so the list has no positional mapping to `entries`.
   """
   def insert_all(fsm_module, entries, opts \\ []) do
     Queries.insert_all(repo(opts), Enum.map(entries, &build_params(fsm_module, &1)))

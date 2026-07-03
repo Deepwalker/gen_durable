@@ -654,6 +654,8 @@ defmodule GenDurable.Queries do
   # The ownership guard lives in a leading `claim` CTE (SELECT … FOR UPDATE): the
   # children insert, the consume, and the parent park are all gated on it, because
   # the park needs the inserted-children count and so cannot itself be the guard.
+  # Children insert ORDER BY correlation_key — same arbiter-deadlock discipline
+  # as insert_all (see there).
   def complete_schedule_childs(
         repo,
         parent_id,
@@ -678,6 +680,7 @@ defmodule GenDurable.Queries do
         ", $1 " <>
         unnest_from(5) <>
         " WHERE EXISTS (SELECT 1 FROM claim)" <>
+        " ORDER BY t.correlation_key" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
         "cnt AS (SELECT count(*) AS n FROM ins) " <>
         "UPDATE gen_durable SET step = $2, state = $3::text::jsonb, " <>
@@ -833,6 +836,13 @@ defmodule GenDurable.Queries do
   # Rows ride in as 12 parallel arrays via `unnest` — 13 parameters for any batch
   # size (the wire protocol caps a statement at 65535 parameters, which the old
   # per-row-placeholder form hit at ~5400 rows) and a static, cacheable SQL text.
+  # ORDER BY correlation_key: deterministic insertion order across nodes — two
+  # concurrent batches inserting the same NEW keys in opposite orders would
+  # deadlock on the correlation_guard arbiter index (each waits on the other's
+  # uncommitted entry). Ids are therefore assigned in key order, not entry order
+  # — indistinguishable to callers, since dropped duplicates already break any
+  # positional mapping. Keyless rows never touch the arbiter; their order is
+  # irrelevant.
   def insert_all(repo, rows) when is_list(rows) do
     sql =
       ensure_buckets_cte(12 + 1) <>
@@ -840,6 +850,7 @@ defmodule GenDurable.Queries do
         @unnest_row_select <>
         " " <>
         unnest_from(0) <>
+        " ORDER BY t.correlation_key" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
     %{rows: out} = q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows)])

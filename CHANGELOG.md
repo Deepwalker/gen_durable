@@ -31,6 +31,10 @@ Findings and their resolutions are tracked in `ISSUES.md`.
 - **Batch-size ceiling**: `insert_all` and `schedule_childs` children ride in as `unnest`
   parallel arrays — the old per-row placeholders hit the wire protocol's 65535-parameter
   cap at ~5400 rows.
+- **Arbiter-order deadlock on concurrent batch inserts**: batches insert in
+  `correlation_key` order (server-side), so two nodes racing the same new keys can no
+  longer deadlock on the dedup index. Ids are consequently assigned in key order, not
+  entry order.
 - An uncaught `throw` in a step routes to `handle/2` as `{:throw, value}` instead of
   crashing the task and waiting out a full lease.
 

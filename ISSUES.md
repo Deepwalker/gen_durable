@@ -284,17 +284,24 @@ re-claimed row**, rewinding step/state mid-flight of the new claimant, nulling
 its `locked_by` (which silences its heartbeat), or — terminally — deleting the
 inbox and decrementing the parent join barrier.
 
-### 12. Arbiter-order deadlock on concurrent batch inserts with shared new keys
+### 12. Arbiter-order deadlock on concurrent batch inserts with shared new keys — FIXED
 
-Same class as item 2's `ensure` case, on `gen_durable` itself: two concurrent
-`insert_all` batches (or `schedule_childs` fan-outs) inserting the **same new
-correlation keys** in opposite orders can deadlock on the `correlation_guard`
-arbiter index (`ON CONFLICT` waits on the other uncommitted transaction).
-Insertion order is the caller's entry order. Sorting keyed entries by
-`correlation_key` before insert would close it; unkeyed rows (guard NULL)
-never arbiter-conflict and need no ordering. Not fixed: requires two writers
-racing the same fresh business keys in reversed order — note it, fix if a real
-workload can produce it.
+**Status: fixed.** `insert_all` and `complete_schedule_childs` insert
+`ORDER BY t.correlation_key` (server-side, inside the unnest SELECT), so every
+node acquires arbiter-index entries in the same global order — the cycle is
+impossible by construction, the same discipline item 2 applied to the bucket
+writers. Side effect: ids are assigned in key order, not entry order —
+indistinguishable to callers, since dropped duplicates already break any
+positional mapping (documented on `insert_all/3`). Keyless rows never touch
+the arbiter index and are unaffected. Like the item-1 race, this is argued,
+not tested — a deterministic reproduction needs transaction-level interleaving
+control; the existing dedup and 6000-row tests guard against regressions.
+
+Original finding: same class as item 2's `ensure` case, on `gen_durable`
+itself — two concurrent batches inserting the same NEW correlation keys in
+opposite orders (`ON CONFLICT` waits on the other uncommitted transaction's
+index entry) could deadlock; insertion order was the caller's entry order,
+which is arbitrary when batches are built from maps/sets.
 
 ## Verified sound (checked deliberately)
 
