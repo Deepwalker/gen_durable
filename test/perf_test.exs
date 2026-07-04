@@ -119,7 +119,8 @@ defmodule GenDurable.PerfTest do
   test "complete_await is park + recheck in one transaction (lost-wakeup fix)" do
     id = setup_executing()
 
-    sql = statements(fn -> Queries.complete_await(Repo, id, "w", ~s({}), ["go"], "woke", []) end)
+    sql =
+      statements(fn -> Queries.complete_await(Repo, id, "w", ~s({}), ["go"], "woke", [], nil) end)
 
     # Deliberately NOT a single statement: the park takes the row lock, then a
     # second fresh-snapshot statement rechecks the inbox — closing the lost-wakeup

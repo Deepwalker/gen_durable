@@ -369,6 +369,33 @@ defmodule GenDurable.Queries do
     List.flatten(rows)
   end
 
+  # Wake parks whose await timeout fired: expired `await_deadline` ⇒ runnable,
+  # deadline cleared, `awaits`/`attempt` KEPT (the woken step reads the inbox
+  # through `awaits` as usual — an empty ctx.awaited is the timeout signal; this
+  # is a wake, not a failure). Ordered SKIP LOCKED per the maintenance note above.
+  def expire_awaits(repo) do
+    %{num_rows: n} =
+      q!(
+        repo,
+        "expire_awaits",
+        """
+        WITH expired AS (
+          SELECT id FROM gen_durable
+          WHERE status = 'awaiting_signal' AND await_deadline < now()
+          ORDER BY id
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE gen_durable g
+        SET status = 'runnable', eligible_at = now(), await_deadline = null, updated_at = now()
+        FROM expired e
+        WHERE g.id = e.id
+        """,
+        []
+      )
+
+    n
+  end
+
   # Garbage-collect terminal instances. Deletes up to `batch` `done`/`failed`
   # rows whose `updated_at` (their termination instant — terminal rows are immutable)
   # is older than `retention_ms`. The `NOT EXISTS` guard spares a terminal child whose
@@ -589,7 +616,13 @@ defmodule GenDurable.Queries do
   # earlier but committed later (invisible to the step's enrichment snapshot).
   # Deliveries are unaffected — a delivered signal is a fresh insert, never in
   # the presented set, and the wake checks only the name.
-  def complete_await(repo, id, worker, state_json, names, next_step, presented_ids) do
+  # `timeout_ms` (nil ⇒ no deadline) arms `await_deadline`: the reaper's sweep
+  # returns an expired park to runnable, and the woken step sees whatever is in
+  # the inbox — for a fresh await an empty ctx.awaited means timeout. The park is
+  # the only writer of the column (NULL propagation: a nil timeout stores NULL),
+  # so a stale deadline left on a woken row is always overwritten by the next park
+  # and never matches the sweep's status filter in between.
+  def complete_await(repo, id, worker, state_json, names, next_step, presented_ids, timeout_ms) do
     {:ok, result} =
       repo.transaction(fn ->
         %{num_rows: parked} =
@@ -600,10 +633,11 @@ defmodule GenDurable.Queries do
             UPDATE gen_durable
             SET step = $4, state = $2::text::jsonb, awaits = $3::text[], eligible_at = now(),
                 status = 'awaiting_signal', attempt = 0, rate_limit = null, weight = 1,
+                await_deadline = now() + $6::int * interval '1 millisecond',
                 locked_by = null, lease_expires_at = null, updated_at = now()
             WHERE id = $1 AND locked_by = $5 AND status = 'executing'
             """,
-            [id, state_json, names, next_step, worker]
+            [id, state_json, names, next_step, worker, timeout_ms]
           )
 
         # Guard failed ⇒ the row is someone else's now — skip the recheck (its

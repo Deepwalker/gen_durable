@@ -58,6 +58,12 @@ Findings and their resolutions are tracked in `ISSUES.md`.
 - Worker ids are now `<instance>:<queue>@<vm>-<uniq>` (opaque, stored in `locked_by`).
 
 ### Added
+- **Await timeouts**: `{:await, names, next_step, state, timeout: ms}` wakes the instance
+  after the deadline even without a signal — a wake, not a failure (`attempt` untouched);
+  a fresh await distinguishes by empty `ctx.awaited`, the accumulate pattern proceeds with
+  its partial pack. Resolution is bounded by `:reap_interval`. Schema version 2 (adds
+  `await_deadline` + its partial index): add another one-line migration calling
+  `GenDurable.Migration.up()`. Telemetry: `[:gen_durable, :await, :timeout]`.
 - **Multi-instance engines**: give each a `:name` (default `GenDurable`) and route API
   calls with `name:` — config, task supervisor, and FSM registry are per-instance; a
   duplicate name fails with `:already_started`.

@@ -121,6 +121,29 @@ defmodule GenDurable.EngineTest do
     assert row.result == %{"got" => %{"v" => 9}}
   end
 
+  test "an await timeout wakes the step with empty awaited (not a failure)" do
+    attach_telemetry([[:gen_durable, :await, :timeout]])
+    start_engine(reap_interval: 50)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitTimeout)
+
+    row = wait_status(id, "done")
+    assert row.result == %{"timed_out" => true}
+    # a timeout is a wake, not a failure
+    assert row.attempt == 0
+    assert_received {:telemetry, [:gen_durable, :await, :timeout], %{count: 1}, _}
+  end
+
+  test "a signal delivered before the deadline beats the await timeout" do
+    start_engine(reap_interval: 50)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitTimeout)
+
+    wait_status(id, "awaiting_signal")
+    :ok = GenDurable.signal(id, "go", %{v: 1})
+
+    row = wait_status(id, "done")
+    assert row.result == %{"got" => %{"v" => 1}}
+  end
+
   test "a retry on an await step re-sees ctx.awaited across the redo" do
     start_engine()
     {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitRetry)

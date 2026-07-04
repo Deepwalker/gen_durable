@@ -5,22 +5,25 @@ defmodule GenDurable.Outcome do
       {:next, step, state}        # transition, runnable, attempt := 0
       {:next, step, state, opts}  # …with per-transition opts: rate_limit, weight
       {:retry, state, delay_ms}   # same step, runnable, attempt += 1, eligible_at += delay
-      {:await, names, next_step, state} # park; on any of `names`, run next_step (ctx.awaited)
+      {:await, names, next_step, state}       # park; on any of `names`, run next_step
+      {:await, names, next_step, state, opts} # …with opts: timeout (ms; wake with what's
+                                              # in the inbox when it fires)
       {:done, result}             # terminal, done
       {:stop, reason}             # terminal, failed
 
   Step names and signal names are normalized to strings. `:await` accepts a single
   name or a list of names; both normalize to a list. `:next` accepts an optional 4th
-  keyword `opts` (`rate_limit:`, `weight:`); it is normalized to a `next_opts` map and
-  the outcome to the 4-tuple `{:next, step, state, opts_map}`.
+  keyword `opts` (`rate_limit:`, `weight:`), `:await` an optional 5th (`timeout:`);
+  both normalize to an opts map in the tuple's last position.
   """
 
   @type next_opts :: %{rate_limit: String.t() | nil, weight: number()}
+  @type await_opts :: %{timeout: pos_integer() | nil}
 
   @type t ::
           {:next, String.t(), term(), next_opts()}
           | {:retry, term(), non_neg_integer()}
-          | {:await, [String.t()], String.t(), term()}
+          | {:await, [String.t()], String.t(), term(), await_opts()}
           | {:schedule_childs, String.t(), [term()], term()}
           | {:done, map()}
           | {:stop, term()}
@@ -42,13 +45,20 @@ defmodule GenDurable.Outcome do
   def validate({:retry, state, delay}) when is_integer(delay) and delay >= 0,
     do: {:ok, {:retry, state, delay}}
 
-  def validate({:await, names, next_step, state})
-      when is_binary(next_step) or is_atom(next_step) do
-    list = List.wrap(names)
+  def validate({:await, names, next_step, state}),
+    do: validate({:await, names, next_step, state, []})
 
-    if list != [] and Enum.all?(list, &(is_binary(&1) or is_atom(&1))),
-      do: {:ok, {:await, Enum.map(list, &to_string/1), to_string(next_step), state}},
-      else: {:error, {:bad_outcome, {:await, names, next_step, state}}}
+  def validate({:await, names, next_step, state, opts})
+      when (is_binary(next_step) or is_atom(next_step)) and is_list(opts) do
+    list = List.wrap(names)
+    timeout = Keyword.get(opts, :timeout)
+
+    if list != [] and Enum.all?(list, &(is_binary(&1) or is_atom(&1))) and
+         (is_nil(timeout) or (is_integer(timeout) and timeout > 0)),
+       do:
+         {:ok,
+          {:await, Enum.map(list, &to_string/1), to_string(next_step), state, %{timeout: timeout}}},
+       else: {:error, {:bad_outcome, {:await, names, next_step, state, opts}}}
   end
 
   def validate({:schedule_childs, step, children, state})

@@ -19,11 +19,17 @@ defmodule GenDurable.OutcomeTest do
              Outcome.validate({:next, "charge", :st, rate_limit: {:stripe, 42}, weight: 50})
 
     assert {:ok, {:retry, :st, 500}} = Outcome.validate({:retry, :st, 500})
-    # await: a single name or a list, both normalize to a list of strings
-    assert {:ok, {:await, ["go"], "woke", :st}} = Outcome.validate({:await, :go, :woke, :st})
 
-    assert {:ok, {:await, ["go", "stop"], "woke", :st}} =
+    # await: a single name or a list, both normalize to a list of strings; the
+    # optional timeout normalizes into the opts map (5-tuple)
+    assert {:ok, {:await, ["go"], "woke", :st, %{timeout: nil}}} =
+             Outcome.validate({:await, :go, :woke, :st})
+
+    assert {:ok, {:await, ["go", "stop"], "woke", :st, %{timeout: nil}}} =
              Outcome.validate({:await, ["go", :stop], "woke", :st})
+
+    assert {:ok, {:await, ["go"], "woke", :st, %{timeout: 30_000}}} =
+             Outcome.validate({:await, :go, :woke, :st, timeout: 30_000})
 
     assert {:ok, {:done, %{"ok" => true}}} = Outcome.validate({:done, %{"ok" => true}})
     assert {:ok, {:stop, :boom}} = Outcome.validate({:stop, :boom})
@@ -36,6 +42,9 @@ defmodule GenDurable.OutcomeTest do
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, :go, :st})
     # await with an empty name set is invalid
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, [], "woke", :st})
+    # await timeout must be a positive integer (or absent)
+    assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, :go, :woke, :st, timeout: 0})
+    assert {:error, {:bad_outcome, _}} = Outcome.validate({:await, :go, :woke, :st, timeout: "x"})
     # :next with a bad weight (non-positive) is invalid
     assert {:error, {:bad_outcome, _}} = Outcome.validate({:next, "x", :st, weight: 0})
     assert {:error, {:bad_outcome, _}} = Outcome.validate(:nonsense)

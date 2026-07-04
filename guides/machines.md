@@ -50,6 +50,7 @@ A step (and the error handler `handle/2`) returns one of:
 | `{:next, step, state, opts}` | …with per-transition [`rate_limit:`/`weight:`](rate_limiting.md) |
 | `{:retry, state, delay_ms}` | re-run the **same** step after `delay_ms`, `attempt += 1` |
 | `{:await, names, next_step, state}` | park until a [signal](signals.md) arrives |
+| `{:await, names, next_step, state, timeout: ms}` | …but wake after `ms` even without one |
 | `{:schedule_childs, next_step, children, state}` | [fan out](children.md) and wait for the children |
 | `{:done, result}` | terminal, `done`, `result` recorded |
 | `{:stop, reason}` | terminal, `failed`, `reason` recorded |

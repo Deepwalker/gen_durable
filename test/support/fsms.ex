@@ -46,6 +46,16 @@ defmodule GenDurable.Test.Awaiter do
   def step("woke", ctx), do: {:done, %{"got" => hd(ctx.awaited).payload}}
 end
 
+defmodule GenDurable.Test.AwaitTimeout do
+  @moduledoc "Awaits with a timeout; empty ctx.awaited on wake means the timeout fired."
+  use GenDurable.FSM, name: "await_timeout", version: 1, initial: "wait"
+
+  @impl true
+  def step("wait", ctx), do: {:await, "go", "woke", ctx.state, timeout: 300}
+  def step("woke", %{awaited: []}), do: {:done, %{"timed_out" => true}}
+  def step("woke", ctx), do: {:done, %{"got" => hd(ctx.awaited).payload}}
+end
+
 defmodule GenDurable.Test.Selector do
   @moduledoc "Awaits any of a set, branches on which name arrived."
   use GenDurable.FSM, name: "selector", version: 1, initial: "wait"
@@ -303,6 +313,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.RateUnknown,
       GenDurable.Test.MapCounter,
       GenDurable.Test.Awaiter,
+      GenDurable.Test.AwaitTimeout,
       GenDurable.Test.Selector,
       GenDurable.Test.Collector,
       GenDurable.Test.AwaitRetry,

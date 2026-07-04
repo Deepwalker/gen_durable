@@ -14,8 +14,10 @@ end
 ```
 
 `up/1` records the installed schema version in a table comment and only applies missing
-increments, so the host-facing call stays stable as the library evolves. `:prefix` puts the
-tables in a non-`public` Postgres schema.
+increments, so the host-facing call stays stable as the library evolves: when a library
+release ships a new schema version, add another one-line migration with the same body — it
+applies just the missing increments. `:prefix` puts the tables in a non-`public` Postgres
+schema (the runtime also needs it on the repo's `search_path`).
 
 ## Starting the engine
 
@@ -85,7 +87,7 @@ The engine is started as `{GenDurable, opts}`:
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows |
 | `:poll_interval` | `1_000` | base ms between idle polls |
-| `:reap_interval` | `30_000` | ms between reaper sweeps |
+| `:reap_interval` | `30_000` | ms between reaper sweeps (also the [await-timeout](signals.md#timeouts) resolution) |
 | `:gc_interval` | `60_000` | ms between GC sweeps; `nil` disables GC |
 | `:gc_retention` | `86_400_000` | ms a terminal row is kept before GC may delete it |
 | `:gc_batch` | `10_000` | max rows deleted per GC sweep |

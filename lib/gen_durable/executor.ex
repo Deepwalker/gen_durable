@@ -138,8 +138,8 @@ defmodule GenDurable.Executor do
       {:retry, state, delay} ->
         {:retry, State.to_db(state_module, state), delay}
 
-      {:await, names, next_step, state} ->
-        {:await, names, next_step, State.to_db(state_module, state)}
+      {:await, names, next_step, state, opts} ->
+        {:await, names, next_step, State.to_db(state_module, state), opts}
 
       {:schedule_childs, next_step, children, state} ->
         child_params = Enum.map(children, &child_to_params/1)
@@ -181,8 +181,17 @@ defmodule GenDurable.Executor do
         {:retry, state_json, delay} ->
           Queries.complete_retry(repo, id, worker, state_json, delay)
 
-        {:await, names, next_step, state_json} ->
-          Queries.complete_await(repo, id, worker, state_json, names, next_step, consumed)
+        {:await, names, next_step, state_json, opts} ->
+          Queries.complete_await(
+            repo,
+            id,
+            worker,
+            state_json,
+            names,
+            next_step,
+            consumed,
+            opts.timeout
+          )
 
         {:schedule_childs, next_step, child_params, state_json} ->
           Queries.complete_schedule_childs(

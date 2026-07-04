@@ -54,6 +54,8 @@ defmodule GenDurable do
       Measurements `%{count}`; metadata `%{id, fsm, step, kind}`.
     * `[:gen_durable, :reaper, :reaped]` — expired leases reclaimed. Measurements
       `%{count}`; metadata `%{}`.
+    * `[:gen_durable, :await, :timeout]` — parked instances whose await deadline
+      fired were woken (a wake, not a failure). Measurements `%{count}`; metadata `%{}`.
     * `[:gen_durable, :gc, :swept]` — a GC sweep deleted something. Measurements
       `%{count, buckets}` (terminal rows and stale rate buckets); metadata `%{}`.
     * `[:gen_durable, :rate_limit, :throttled]` — a rate-limit bucket granted fewer rows

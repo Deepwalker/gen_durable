@@ -161,7 +161,7 @@ defmodule GenDurable.QueriesTest do
   test "complete_retry keeps awaits and consumes nothing (redo sees the same inputs)" do
     {:ok, id} = Queries.insert(Repo, params())
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-    :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [])
+    :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [], nil)
     :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
@@ -217,7 +217,7 @@ defmodule GenDurable.QueriesTest do
     test "deliver wakes a matching await and keeps the awaited set" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [])
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [], nil)
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
 
@@ -234,7 +234,7 @@ defmodule GenDurable.QueriesTest do
     test "a signal outside the awaited set does not wake the instance" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [])
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [], nil)
 
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
 
@@ -250,7 +250,7 @@ defmodule GenDurable.QueriesTest do
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [])
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [], nil)
 
       %{rows: [[status, step]]} =
         Repo.query!("SELECT status::text, step FROM gen_durable WHERE id = $1", [id])
@@ -271,7 +271,8 @@ defmodule GenDurable.QueriesTest do
       # The accumulate pattern: the step was HANDED sig ("a") and re-awaits the
       # full set. The recheck must NOT re-wake on it — that would spin
       # park → flip → re-pick → re-await at full speed until the pack completes.
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["a", "b"], "collect", [sig.id])
+      :ok =
+        Queries.complete_await(Repo, id, @worker, ~s({}), ["a", "b"], "collect", [sig.id], nil)
 
       %{rows: [[status]]} =
         Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
@@ -314,7 +315,7 @@ defmodule GenDurable.QueriesTest do
     test "progress consumes exactly the passed ids; other signals survive" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [])
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [], nil)
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
@@ -395,6 +396,48 @@ defmodule GenDurable.QueriesTest do
     assert t == "object"
   end
 
+  describe "await timeout" do
+    test "expire_awaits wakes only parks past their deadline, keeping awaits" do
+      # expired: deadline armed at ~now
+      {:ok, expired} = Queries.insert(Repo, params())
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_await(Repo, expired, @worker, ~s({}), ["go"], "woke", [], 1)
+
+      # future deadline: not to be touched
+      {:ok, later} = Queries.insert(Repo, params())
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_await(Repo, later, @worker, ~s({}), ["go"], "woke", [], 60_000)
+
+      # no timeout at all: never swept
+      {:ok, forever} = Queries.insert(Repo, params())
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_await(Repo, forever, @worker, ~s({}), ["go"], "woke", [], nil)
+
+      Process.sleep(5)
+      assert Queries.expire_awaits(Repo) == 1
+
+      %{rows: [[status, awaits, attempt, deadline]]} =
+        Repo.query!(
+          "SELECT status::text, awaits, attempt, await_deadline FROM gen_durable WHERE id = $1",
+          [expired]
+        )
+
+      # a wake, not a failure: awaits kept (the woken step reads the inbox through
+      # it as usual), attempt untouched, deadline cleared
+      assert status == "runnable"
+      assert awaits == ["go"]
+      assert attempt == 0
+      assert deadline == nil
+
+      for id <- [later, forever] do
+        %{rows: [[status]]} =
+          Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
+
+        assert status == "awaiting_signal"
+      end
+    end
+  end
+
   describe "stale outcomes (ownership guard)" do
     test "a reclaimed row rejects every outcome from its old worker" do
       {:ok, id} = Queries.insert(Repo, params())
@@ -404,7 +447,10 @@ defmodule GenDurable.QueriesTest do
 
       assert :stale = Queries.complete_next(Repo, id, @worker, "next", ~s({"n":9}), [], nil, 1)
       assert :stale = Queries.complete_retry(Repo, id, @worker, ~s({"n":9}), 0)
-      assert :stale = Queries.complete_await(Repo, id, @worker, ~s({"n":9}), ["go"], "woke", [])
+
+      assert :stale =
+               Queries.complete_await(Repo, id, @worker, ~s({"n":9}), ["go"], "woke", [], nil)
+
       assert :stale = Queries.complete_stop(Repo, id, @worker, "boom")
 
       # the row is untouched: still runnable at the original step and state
@@ -489,7 +535,7 @@ defmodule GenDurable.QueriesTest do
         )
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [])
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [], nil)
 
       assert :ok = Queries.deliver_signal(Repo, "order:7", "go", ~s({"v":1}), nil)
 
@@ -525,7 +571,7 @@ defmodule GenDurable.QueriesTest do
         )
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, fresh, @worker, ~s({}), ["go"], "woke", [])
+      :ok = Queries.complete_await(Repo, fresh, @worker, ~s({}), ["go"], "woke", [], nil)
       assert :ok = Queries.deliver_signal(Repo, "order:9", "go", ~s({}), nil)
 
       %{rows: [[status]]} =

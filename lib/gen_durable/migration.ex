@@ -28,7 +28,7 @@ defmodule GenDurable.Migration do
 
   use Ecto.Migration
 
-  @latest_version 1
+  @latest_version 2
 
   @doc "Migrate the schema up to `:version` (default: latest)."
   def up(opts \\ []) do
@@ -198,6 +198,25 @@ defmodule GenDurable.Migration do
     execute("DROP TABLE IF EXISTS #{p}.signals")
     execute("DROP TABLE IF EXISTS #{p}.gen_durable")
     execute("DROP TYPE IF EXISTS #{p}.durable_status")
+  end
+
+  # --- version 2: await timeouts ----------------------------------------------
+  # `await_deadline` — set by the park when the step passed `timeout:`; the
+  # reaper sweeps expired parks back to runnable (the woken step sees whatever
+  # is in the inbox — for a fresh await, an empty ctx.awaited means timeout).
+
+  defp change(2, :up, p) do
+    execute("ALTER TABLE #{p}.gen_durable ADD COLUMN await_deadline timestamptz")
+
+    execute("""
+    CREATE INDEX gen_durable_await_deadline ON #{p}.gen_durable (await_deadline)
+      WHERE status = 'awaiting_signal' AND await_deadline IS NOT NULL
+    """)
+  end
+
+  defp change(2, :down, p) do
+    execute("DROP INDEX IF EXISTS #{p}.gen_durable_await_deadline")
+    execute("ALTER TABLE #{p}.gen_durable DROP COLUMN IF EXISTS await_deadline")
   end
 
   # --- helpers ---------------------------------------------------------------

@@ -59,6 +59,26 @@ Re-awaiting is cheap: the engine wakes a park only on signals the parking step w
 handed, so re-awaiting while your inputs sit unconsumed in the inbox parks cleanly — the
 instance sleeps until the next new arrival, it does not spin.
 
+## Timeouts
+
+`{:await, names, next_step, state, timeout: 30_000}` arms a deadline: if no matching signal
+arrives in time, the engine wakes the instance anyway and runs `next_step`. A timeout is a
+**wake, not a failure** — `attempt` is untouched, and the step distinguishes the cases by
+what it received:
+
+```elixir
+def step("wait", ctx), do: {:await, "payment", "decide", ctx.state, timeout: :timer.hours(1)}
+
+def step("decide", %{awaited: []} = ctx), do: {:stop, "payment never came"}  # timed out
+def step("decide", ctx), do: {:next, "ship", ctx.state}                      # signal arrived
+```
+
+For a fresh await, empty `ctx.awaited` on wake means the deadline fired. In the
+[accumulate pattern](#accumulating-a-pack), a timeout wakes you with the **partial pack** —
+"proceed with what arrived" falls out naturally. Timeout resolution is bounded by
+`:reap_interval` (the sweep that fires them; default 30s), so treat the deadline as
+"at least this long", not a precise timer.
+
 ## Under the hood
 
 `await` is sugar over a raw signal model: every instance has a durable inbox (`ctx.all`), and a
