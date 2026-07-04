@@ -56,6 +56,7 @@ defmodule GenDurable.MixProject do
           GenDurable.Supervisor,
           GenDurable.Scheduler,
           GenDurable.Reaper,
+          GenDurable.GC,
           GenDurable.Registry,
           GenDurable.Executor
         ],
