@@ -79,8 +79,12 @@ defmodule GenDurable.Scheduler do
     # certainly dead — the prefix pins the VM (see claim_prefix/2) and, within
     # a VM, the supervisor serializes scheduler lifetimes. Its orphaned tasks
     # may still be running; the outcome ownership guard drops their late
-    # commits, so an early re-run is safe (at-least-once).
-    reclaimed = Queries.reclaim_orphans(opts.config.repo, opts.queue, prefix)
+    # commits, so an early re-run is safe (at-least-once). The staleness margin
+    # (remaining lease below `lease_ttl - 2 × heartbeat`) additionally protects
+    # against claim-prefix collisions: a live owner's freshly-beaten claims are
+    # never touched — see Queries.reclaim_orphans/4.
+    margin_ms = max(opts.config.lease_ttl_ms - 2 * opts.heartbeat_interval, 0)
+    reclaimed = Queries.reclaim_orphans(opts.config.repo, opts.queue, prefix, margin_ms)
 
     if reclaimed > 0 do
       :telemetry.execute(
@@ -95,7 +99,9 @@ defmodule GenDurable.Scheduler do
       queue: opts.queue,
       concurrency: opts.concurrency,
       prefetch: opts.prefetch,
-      min_demand: opts.min_demand,
+      # Clamped: a min_demand above the claim ceiling could never be satisfied,
+      # so refill would only ever fire from full idle — a silent config footgun.
+      min_demand: min(opts.min_demand, opts.concurrency + opts.prefetch),
       worker: worker,
       poll_interval: opts.poll_interval,
       max_poll_interval: opts.max_poll_interval,
@@ -218,8 +224,9 @@ defmodule GenDurable.Scheduler do
     end
   end
 
-  # Spawn buffered jobs into free executor slots, highest-priority first (the
-  # buffer preserves the picker's ORDER BY priority, eligible_at).
+  # Spawn buffered jobs into free executor slots in buffer order. The buffer
+  # roughly follows the picker's urgency order (the claim UPDATE's RETURNING
+  # order is not SQL-guaranteed, so this is best-effort, not a contract).
   defp drain(%{buffer: [job | rest]} = state)
        when map_size(state.in_flight) < state.concurrency do
     task = Task.Supervisor.async_nolink(state.task_sup, fn -> execute_job(state.config, job) end)

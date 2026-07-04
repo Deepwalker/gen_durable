@@ -303,6 +303,118 @@ opposite orders (`ON CONFLICT` waits on the other uncommitted transaction's
 index entry) could deadlock; insertion order was the caller's entry order,
 which is arbitrary when batches are built from maps/sets.
 
+## Re-review findings (second adversarial pass, post-hardening)
+
+An independent adversarial review of the final state verified items 1–5, 8–12
+as sound (full interleaving arguments for the lost-wakeup fix and the
+ownership guard) and found the following. All fixed unless noted.
+
+### 13. `gc_buckets` could permanently stall rate-limited rows — FIXED (was a regression of item 6)
+
+The pick grants a rate-limited winner only if its bucket row exists (`locked`
+inner-joins buckets), and buckets were created only by the `ensure` CTEs at
+transition time — never by the pick. A row that slept past its bucket's refill
+horizon (far-future schedule, long retry backoff — writeback refreshes
+`last_refill` only on pick traffic, and `ensure`'s DO NOTHING never does) woke
+up ungrantable **forever**, and such rows accumulate at the head of the
+`cand` window, eventually starving the whole queue. The item-6 premise
+("recreation-full equals refilled") was right about tokens, wrong about there
+being a recreator. **Fix:** a `heal` CTE in the pick recreates (full) any
+winner's missing bucket; the insert is invisible to `locked` in the same
+statement (CTE snapshot), so the row is granted on the NEXT pick. Common path
+(no rate-limited winners) is a no-op. Tested: delete the bucket, first pick
+returns `[]` and recreates it, second pick grants.
+
+### 14. The documented accumulate-a-pack pattern spun in a busy-loop — FIXED
+
+The park recheck (and the pre-fix park EXISTS before it — this predates the
+item-1 fix) woke on ANY inbox signal matching `awaits`, unable to distinguish
+a signal the step was just handed (`:await` consumes nothing) from a new one.
+The guide's own Collector pattern: woken by "b" → re-await → recheck sees the
+unconsumed "b" → immediate flip → completion-driven re-pick → re-await → … a
+full-speed loop until the pack completes. **Fix:** `complete_await` takes the
+`presented_ids` (the `ctx.awaited` the step received — the executor already
+had them as `consumed`) and the recheck excludes them
+(`id != ALL($presented)`). A set-difference, not a max-id watermark: ids
+commit out of order, and a watermark could skip a signal inserted earlier but
+committed later. Deliveries are unaffected (a delivered signal is a fresh
+insert, never in the presented set). Tested: re-await with the presented
+signal parks; a new matching signal wakes.
+
+### 15. Deterministic user-data errors became infinite crash loops — FIXED
+
+`Jason.encode!` of an unencodable `:done` result, `State.to_db` of a bad
+state, a bad child spec — all raised AFTER `invoke`'s rescue window, so
+`handle/2` never saw them: crash → lease wait → reap → same crash, forever,
+no terminal state. **Fix:** outcome serialization moved inside `invoke`'s
+guarded region (a new `serialize/2` producing the DB-ready tuple), so these
+route to `handle/2` (default `{:stop, reason}`) like any step failure;
+`apply_outcome` now consumes pre-serialized outcomes only. Deliberately NOT
+guarded: `Registry.fetch!` — an unresolvable fsm is most likely a rolling
+deploy (this node doesn't know the module yet; another does), so the crash
+path (lease floor, re-pick elsewhere) is correct and a terminal `:stop` would
+lose the instance. Tested: an unencodable result reaches `failed` promptly
+under a 60s lease.
+
+### 16. `vm_id` collision could reclaim a live VM's claims — FIXED
+
+Containers commonly run BEAM as OS pid 1, and hostnames can collide
+(compose-scaled fixed `hostname:`, cloned images) — two non-distributed VMs
+then share a claim prefix, and startup reclaim would release each other's
+live claims. **Fix:** reclaim additionally requires a stale lease —
+`lease_expires_at < now() + (lease_ttl − 2 × heartbeat_interval)`. A live
+owner beats every `heartbeat_interval` and always sits above the threshold
+regardless of prefix collisions; a dead owner's rows qualify after ~2 missed
+beats, still far ahead of full lease expiry. Rows claimed moments before the
+predecessor died wait for the reaper (documented remainder).
+
+### 17. Multi-row maintenance statements could deadlock each other — FIXED
+
+A late `heartbeat` (id-order locking) overlapping the `reap` (lease-index
+order) on ≥2 expired rows could cycle; same shape for `release` vs `reap` and
+`gc_buckets` vs the pick's bucket locks. Self-healing (supervisor restart +
+ownership guard) but crash-amplifying. **Fix:** every multi-row maintenance
+statement (heartbeat, reap, release, reclaim_orphans, gc_buckets) now claims
+its rows via `SELECT … ORDER BY … FOR UPDATE SKIP LOCKED` and then
+updates/deletes the claimed set — never waits, deterministic order, no cycles
+possible. SKIP LOCKED is also semantically better: a locked row is being
+actively worked (outcome committing, beat extending) — exactly when
+maintenance should skip it until the next tick.
+
+### 18. Window-partition collision between a numeric concurrency_key and an id — FIXED
+
+`coalesce(concurrency_key, id::text)` collapsed a key `"42"` with an
+unrelated row of id 42 into one dedup partition (transient underfill only).
+Now `coalesce('k:' || concurrency_key, 'i:' || id::text)`.
+
+### 19. `min_demand` above the claim ceiling silently disabled refill — FIXED
+
+Clamped at scheduler init to `concurrency + prefetch`.
+
+### 20. PERFORMANCE.md contained stale, now-false claims — FIXED
+
+§1's cost table (per-step loads "always-on"), §3's `deliver_signal` EXPLAIN
+showing the pre-fix status-guarded wake (the exact shape whose
+skip-without-locking was the item-1 bug), and the `gen_durable_unique`
+index naming — all refreshed to the shipped code.
+
+### 21. Hygiene batch
+
+Fixed: `complete_await` now resets `attempt` (asymmetry with `:next` looked
+unintentional); the scheduler's buffer-order comment no longer overclaims
+(RETURNING order is not SQL-guaranteed); the supervisor's queue-loop variable
+no longer shadows the instance name; documented — `:prefix` requires the
+schema on the repo's `search_path`, GC frees "reserved" correlation keys at
+retention (identity guide), `ctx.childs` spans fan-out rounds (children
+guide), the registry's dynamic fallback needs loaded modules (lazy-loading
+caveat).
+
+Noted, not fixed: insert-time `:rate_limit`/`:weight` are unvalidated (no
+`[:rate_limit, :unknown]` telemetry on the insert path — only `:next` warns);
+`upsert_rate_configs` never deletes removed config rows (harmless — orphaned
+buckets ARE swept, config rows are a handful); two instances sharing a repo
+with different `rate_limits` last-write-win on shared names.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

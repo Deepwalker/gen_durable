@@ -161,7 +161,7 @@ defmodule GenDurable.QueriesTest do
   test "complete_retry keeps awaits and consumes nothing (redo sees the same inputs)" do
     {:ok, id} = Queries.insert(Repo, params())
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-    :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke")
+    :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [])
     :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
@@ -217,7 +217,7 @@ defmodule GenDurable.QueriesTest do
     test "deliver wakes a matching await and keeps the awaited set" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke")
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [])
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
 
@@ -234,7 +234,7 @@ defmodule GenDurable.QueriesTest do
     test "a signal outside the awaited set does not wake the instance" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke")
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [])
 
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
 
@@ -250,7 +250,7 @@ defmodule GenDurable.QueriesTest do
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke")
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [])
 
       %{rows: [[status, step]]} =
         Repo.query!("SELECT status::text, step FROM gen_durable WHERE id = $1", [id])
@@ -259,6 +259,32 @@ defmodule GenDurable.QueriesTest do
       # parked at next_step
       assert status == "runnable"
       assert step == "woke"
+    end
+
+    test "re-awaiting with already-presented signals parks cleanly (no spin); a new one wakes" do
+      {:ok, id} = Queries.insert(Repo, params())
+      :ok = Queries.deliver_signal(Repo, id, "a", ~s({}), nil)
+      [sig] = Queries.load_signals(Repo, id)
+
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+      # The accumulate pattern: the step was HANDED sig ("a") and re-awaits the
+      # full set. The recheck must NOT re-wake on it — that would spin
+      # park → flip → re-pick → re-await at full speed until the pack completes.
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["a", "b"], "collect", [sig.id])
+
+      %{rows: [[status]]} =
+        Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
+
+      assert status == "awaiting_signal"
+
+      # a NEW matching signal still wakes the park
+      :ok = Queries.deliver_signal(Repo, id, "b", ~s({}), nil)
+
+      %{rows: [[status]]} =
+        Repo.query!("SELECT status::text FROM gen_durable WHERE id = $1", [id])
+
+      assert status == "runnable"
     end
 
     test "a terminal or missing target refuses the signal as :no_target" do
@@ -288,7 +314,7 @@ defmodule GenDurable.QueriesTest do
     test "progress consumes exactly the passed ids; other signals survive" do
       {:ok, id} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke")
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [])
 
       :ok = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
       :ok = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
@@ -378,7 +404,7 @@ defmodule GenDurable.QueriesTest do
 
       assert :stale = Queries.complete_next(Repo, id, @worker, "next", ~s({"n":9}), [], nil, 1)
       assert :stale = Queries.complete_retry(Repo, id, @worker, ~s({"n":9}), 0)
-      assert :stale = Queries.complete_await(Repo, id, @worker, ~s({"n":9}), ["go"], "woke")
+      assert :stale = Queries.complete_await(Repo, id, @worker, ~s({"n":9}), ["go"], "woke", [])
       assert :stale = Queries.complete_stop(Repo, id, @worker, "boom")
 
       # the row is untouched: still runnable at the original step and state
@@ -463,7 +489,7 @@ defmodule GenDurable.QueriesTest do
         )
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke")
+      :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [])
 
       assert :ok = Queries.deliver_signal(Repo, "order:7", "go", ~s({"v":1}), nil)
 
@@ -499,7 +525,7 @@ defmodule GenDurable.QueriesTest do
         )
 
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-      :ok = Queries.complete_await(Repo, fresh, @worker, ~s({}), ["go"], "woke")
+      :ok = Queries.complete_await(Repo, fresh, @worker, ~s({}), ["go"], "woke", [])
       assert :ok = Queries.deliver_signal(Repo, "order:9", "go", ~s({}), nil)
 
       %{rows: [[status]]} =
@@ -744,6 +770,20 @@ defmodule GenDurable.QueriesTest do
       assert tokens("api") == 1.0
       # both children are runnable; the bucket (burst 1) lets one through
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+    end
+
+    test "the pick self-heals a swept bucket; the row is grantable on the next pick" do
+      :ok = seed(0, 5)
+      {:ok, id} = Queries.insert(Repo, params(%{rate_limit: "api"}))
+      # simulate gc_buckets having swept the bucket while the row slept
+      Repo.query!("DELETE FROM gen_durable_rate_buckets WHERE key = 'api'")
+
+      # first pick cannot grant (no bucket row) but the heal CTE recreates it full…
+      assert Queries.pick(Repo, "default", 10, @worker, @ttl) == []
+      assert tokens("api") == 5.0
+
+      # …so the next pick grants — no permanent stall
+      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
     end
 
     test "gc_buckets sweeps refilled-idle and orphaned buckets, keeps the rest" do

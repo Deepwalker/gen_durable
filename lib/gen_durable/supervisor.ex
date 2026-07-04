@@ -92,8 +92,8 @@ defmodule GenDurable.Supervisor do
     task_sup = Module.concat(name, TaskSupervisor)
 
     schedulers =
-      for {name, concurrency} <- Keyword.fetch!(opts, :queues) do
-        queue = to_string(name)
+      for {queue_name, concurrency} <- Keyword.fetch!(opts, :queues) do
+        queue = to_string(queue_name)
 
         drain_timeout = Keyword.fetch!(opts, :drain_timeout)
 

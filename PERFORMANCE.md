@@ -28,19 +28,20 @@ The database work per step, and where it goes:
 
 | Phase | Statements | Round-trips | Notes |
 |---|---|---|---|
-| **pick** | 1 (`UPDATE … RETURNING` over a window-dedup claim) | ~`1/B` per step | one pick claims a batch of `B`; the feeder amortizes it |
-| **load signals** | 1 `SELECT` | 1 | always-on today; gated by an FSM flag is the remaining F4 step |
-| **load childs** | 1 `SELECT` | 1 | same |
+| **pick** | 3 (window-dedup claim + batched signal load + batched children load) | ~`3/B` per step | one pick claims and enriches a batch of `B`; the feeder amortizes it |
 | **user `step/2`** | 0 | 0 | runs outside any transaction |
 | **outcome** | 1 CTE (`consumed` DELETE + outcome UPDATE [+ parent-join]) | **1** | folded from a 4–5-stmt transaction into one statement (F4) |
 
-So a plain `:next` step is now **~3 round-trips** (2 loads + 1 outcome), with the pick
-amortized to near-zero by batching. The outcome used to be a 4-statement
-`BEGIN`/consume/`UPDATE`/`COMMIT` transaction (+1 for `:done`/`:stop`'s parent-join);
-folding it into a single data-modifying CTE made it **1** — measured at exactly one
-statement (`test/perf_test.exs`), and consistently faster than the transaction form on
-wall-clock (the round-trips are the cost). Gating the two loads behind an FSM capability
-flag is the last F4 step → **~1 round-trip/step**. See §7.
+So a plain `:next` step is **~1 round-trip** — its outcome — with the pick (including the
+inbox/children enrichment) amortized to near-zero by batching. The outcome used to be a
+4-statement `BEGIN`/consume/`UPDATE`/`COMMIT` transaction (+1 for `:done`/`:stop`'s
+parent-join); folding it into a single data-modifying CTE made it **1** — measured at
+exactly one statement (`test/perf_test.exs`), and consistently faster than the
+transaction form on wall-clock (the round-trips are the cost). The two per-step loads
+(signals, children) that used to add 2 round-trips per step are gone: the pick
+batch-loads them for the whole claim set (asserted at exactly 3 statements per pick in
+`test/perf_test.exs`). The exception is `:await` — deliberately a 4-round-trip
+transaction (park + recheck buys the lost-wakeup fix; parking is externally-paced).
 
 Round-trips, not query execution time, dominate: every statement below executes in
 **well under 1 ms** at the database, but each client↔Postgres hop is a network round-trip
@@ -299,18 +300,18 @@ EXPLAIN is the *execution-cost* evidence. Different claims, both checked.)
 
 ### Point queries
 
-**`deliver_signal` — wake by id+status+awaits:**
-```
-Update on gen_durable
-  ->  Index Scan using gen_durable_pkey (rows=0)
-        Filter: ((status = 'awaiting_signal') AND (awaits = 'go'))
-Execution Time: 0.029 ms
-```
+**`deliver_signal` — one statement (target resolve → inbox insert → wake), all
+PK/partial-index driven.** Note the wake deliberately has NO status filter in its WHERE —
+it matches the target row unconditionally and flips via CASE, because a status-guarded
+WHERE skips a not-yet-parked row *without locking*, which was the lost-wakeup race. The
+row lock it always takes on a live row is the correctness mechanism, and it costs one
+PK-indexed row.
 
-**`insert` — single row, dedup via the partial unique index:**
+**`insert` — single row, dedup via the partial unique index
+(`gen_durable_correlation` on `correlation_guard`):**
 ```
 Insert on gen_durable
-  Conflict Arbiter Indexes: gen_durable_unique
+  Conflict Arbiter Indexes: gen_durable_correlation
   Tuples Inserted: 1
 Execution Time: 0.468 ms
 ```
@@ -399,7 +400,7 @@ bulk (700k `done`/`failed`) sits in none of the partial indexes.
 | `pick` concurrency guard | `gen_durable_concurrency_active (concurrency_key) WHERE status='executing' AND concurrency_key IS NOT NULL` | partial, index-only probe |
 | `pick` lock / outcomes / signal | `gen_durable_pkey (id)` | primary key |
 | `reap` | `gen_durable_lease (lease_expires_at) WHERE status='executing'` | partial |
-| `insert` dedup | `gen_durable_unique (unique_guard) WHERE unique_guard IS NOT NULL` | partial unique |
+| `insert` dedup / key addressing | `gen_durable_correlation (correlation_guard) WHERE correlation_guard IS NOT NULL` | partial unique |
 | child join | `gen_durable_parent (parent_id) WHERE parent_id IS NOT NULL` | partial |
 | `gc` id-select | `gen_durable_gc (updated_at) WHERE status IN ('done','failed')` | partial (situational) |
 | `gc` delete | `gen_durable_pkey (id)` | primary key |

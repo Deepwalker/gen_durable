@@ -123,6 +123,14 @@ defmodule GenDurable.Test.Thrower do
   def handle({:throw, value}, _ctx), do: {:stop, "threw #{inspect(value)}"}
 end
 
+defmodule GenDurable.Test.BadResult do
+  @moduledoc "Returns an unencodable :done result; serialization must route to handle/2."
+  use GenDurable.FSM, name: "bad_result", version: 1, initial: "go"
+
+  @impl true
+  def step("go", _ctx), do: {:done, %{"oops" => self()}}
+end
+
 defmodule GenDurable.Test.Reborn do
   @moduledoc "Crashes the worker (no outcome) on the first attempt, then succeeds."
   use GenDurable.FSM, name: "reborn", version: 1, initial: "go"
@@ -300,6 +308,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.AwaitRetry,
       GenDurable.Test.Crasher,
       GenDurable.Test.Thrower,
+      GenDurable.Test.BadResult,
       GenDurable.Test.Reborn,
       GenDurable.Test.ConcurrencyInc,
       GenDurable.Test.Plain,

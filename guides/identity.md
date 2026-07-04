@@ -46,8 +46,10 @@ GenDurable.insert(Checkout, correlation_key: "order:42", correlation_scope: [])
 ```
 
 > Including a terminal status (`done`/`failed`) in the scope keeps a *finished* instance
-> occupying its key, so `signal/4` would resolve to that dead instance and silently park a
-> signal it never reads. Keep terminal statuses out of the scope unless you specifically want the
-> key reserved (not addressable) after the instance ends.
+> occupying its key (`signal/4` to it is refused as `{:error, :no_target}` — nothing reads a
+> terminal inbox). Keep terminal statuses out of the scope unless you specifically want the
+> key reserved after the instance ends — and note the reservation lasts only as long as the
+> row does: [GC](operations.md) deletes terminal rows after the retention window, freeing the
+> key. For a longer reservation, raise `:gc_retention` (or disable GC).
 
 With no `correlation_key`, an instance is neither addressable nor deduplicated.

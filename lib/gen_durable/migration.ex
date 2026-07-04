@@ -15,6 +15,9 @@ defmodule GenDurable.Migration do
   ## Options
 
     * `:prefix`  — Postgres schema the tables live in (default `"public"`).
+      The runtime queries reference the tables **unqualified**, so a non-default
+      prefix also requires the schema on the repo's `search_path`
+      (e.g. `after_connect: {Postgrex, :query!, ["SET search_path TO my_schema, public", []]}`).
     * `:version` — schema version to migrate to (default: latest for `up/1`,
       `0` for `down/1`).
 

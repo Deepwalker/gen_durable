@@ -97,7 +97,8 @@ defmodule GenDurable.Queries do
   #            serialize, so they short-circuit the guard and a non-keyed
   #            queue pays nothing for it. `row_number()` over the *locked* set
   #            marks the most-urgent row per key (NULL keys fall back to id, so
-  #            each is its own group and is never collapsed).
+  #            each is its own group and is never collapsed; the 'k:'/'i:'
+  #            prefixes keep a numeric key from colliding with an id).
   #   UPDATE — flip only the per-key winners (`rn = 1`). The losers (`rn > 1`)
   #            were locked but not touched, so they stay `runnable` and their
   #            lock is released at commit — no advisory-lock bounce. The next
@@ -116,6 +117,12 @@ defmodule GenDurable.Queries do
   #              with the per-concurrency_key window rank `rn`.
   #   winners  — the concurrency winners (rn = 1); add the cumulative weight `cw` of the urgency
   #              prefix per rate_limit bucket (ROWS, deterministic by id).
+  #   heal     — recreate (full) any winner's bucket that is missing: buckets are minted by the
+  #              ensure CTEs at transition time and swept by gc_buckets when idle, so a row that
+  #              slept past its bucket's refill horizon (far-future schedule, long retry backoff)
+  #              would otherwise be ungrantable forever — the pick self-heals instead. The insert
+  #              is invisible to `locked` in this same statement (CTE snapshot), so the row is
+  #              granted on the NEXT pick; the common path (no rate-limited winners) is a no-op.
   #   locked   — lock the rate-bucket rows the winners draw from (the cross-node serialization
   #              point), in key order: with ORDER BY the sort happens before LockRows, so every
   #              concurrent pick acquires bucket locks in the same order — no deadlock. Then
@@ -129,7 +136,7 @@ defmodule GenDurable.Queries do
   @pick_sql """
   WITH cand AS (
     SELECT id, rate_limit, weight, priority, eligible_at,
-           row_number() OVER (PARTITION BY coalesce(concurrency_key, id::text)
+           row_number() OVER (PARTITION BY coalesce('k:' || concurrency_key, 'i:' || id::text)
                               ORDER BY priority, eligible_at) AS rn
     FROM (
       SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at
@@ -151,6 +158,15 @@ defmodule GenDurable.Queries do
                              ROWS UNBOUNDED PRECEDING) AS cw
     FROM cand
     WHERE rn = 1
+  ),
+  heal AS (
+    INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
+    SELECT k.rkey, cfg.burst, clock_timestamp()
+    FROM (SELECT DISTINCT rkey FROM winners WHERE rkey IS NOT NULL) k
+    JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k.rkey, ':', 1)
+    WHERE NOT EXISTS (SELECT 1 FROM gen_durable_rate_buckets b WHERE b.key = k.rkey)
+    ORDER BY k.rkey
+    ON CONFLICT (key) DO NOTHING
   ),
   locked AS (
     SELECT b.key, b.tokens, b.last_refill, cfg.burst, cfg.rate
@@ -292,6 +308,17 @@ defmodule GenDurable.Queries do
   end
 
   # --- lease / reaper --------------------------------------------------------
+  #
+  # Every multi-row maintenance statement (heartbeat, reap, release, startup
+  # reclaim, bucket GC) claims its rows first via
+  # `SELECT … ORDER BY … FOR UPDATE SKIP LOCKED`, then updates/deletes the
+  # claimed set. Never waiting (SKIP LOCKED) plus deterministic order means no
+  # two maintenance statements can deadlock against each other — an unordered
+  # multi-row UPDATE locks rows in plan order, and e.g. a late heartbeat
+  # (id order) overlapping the reaper (lease-index order) on two expired rows
+  # would cycle. A row that is locked right now is being actively worked (its
+  # outcome committing, a beat extending it) — exactly when maintenance should
+  # leave it alone until the next tick.
 
   def heartbeat(_repo, [], _worker, _ttl), do: :ok
 
@@ -300,9 +327,16 @@ defmodule GenDurable.Queries do
       repo,
       "heartbeat",
       """
-      UPDATE gen_durable
+      WITH mine AS (
+        SELECT id FROM gen_durable
+        WHERE id = ANY($1) AND locked_by = $2
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE gen_durable g
       SET lease_expires_at = now() + $3::int * interval '1 millisecond', updated_at = now()
-      WHERE id = ANY($1) AND locked_by = $2
+      FROM mine m
+      WHERE g.id = m.id
       """,
       [ids, worker, lease_ttl_ms]
     )
@@ -316,11 +350,18 @@ defmodule GenDurable.Queries do
         repo,
         "reap",
         """
-        UPDATE gen_durable
+        WITH doomed AS (
+          SELECT id FROM gen_durable
+          WHERE status = 'executing' AND lease_expires_at < now()
+          ORDER BY id
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE gen_durable g
         SET status = 'runnable', locked_by = null, lease_expires_at = null,
             attempt = attempt + 1, updated_at = now()
-        WHERE status = 'executing' AND lease_expires_at < now()
-        RETURNING id
+        FROM doomed d
+        WHERE g.id = d.id
+        RETURNING g.id
         """,
         []
       )
@@ -373,26 +414,34 @@ defmodule GenDurable.Queries do
 
   # Sweep stale rate buckets — the GC side of partitioned limits
   # (`{name, partition}` mints a bucket row per partition ever seen). A bucket
-  # is deletable when recreating it equals its natural state: `ensure` recreates
-  # buckets FULL, so one idle longer than burst/rate seconds (fully refilled by
-  # now anyway) loses nothing. rate = 0 never qualifies (it never refills, so
-  # delete-and-recreate would grant a fresh burst), and a bucket whose config
-  # was removed is unusable (both the pick and `ensure` join configs) — swept
-  # unconditionally. Racing a concurrent pick is safe: the DELETE waits on the
-  # bucket row lock and re-checks `last_refill` (EPQ) — a just-debited bucket
-  # carries a fresh timestamp and is skipped.
+  # is deletable when recreating it equals its natural state: buckets are
+  # recreated FULL (by the ensure CTEs at transition time, and by the pick's
+  # `heal` CTE for rows that slept past the refill horizon), so one idle longer
+  # than burst/rate seconds (fully refilled by now anyway) loses nothing.
+  # rate = 0 never qualifies (it never refills, so delete-and-recreate would
+  # grant a fresh burst), and a bucket whose config was removed is unusable
+  # (both the pick and `ensure` join configs) — swept unconditionally. The
+  # ordered SKIP LOCKED claim (see the lease/reaper note) also means a bucket a
+  # concurrent pick holds is simply skipped — it is active, not stale.
   def gc_buckets(repo) do
     %{num_rows: n} =
       q!(
         repo,
         "gc_buckets",
         """
+        WITH doomed AS (
+          SELECT key FROM gen_durable_rate_buckets b
+          WHERE NOT EXISTS (SELECT 1 FROM gen_durable_rate_configs cfg
+                            WHERE cfg.name = split_part(b.key, ':', 1))
+             OR EXISTS (SELECT 1 FROM gen_durable_rate_configs cfg
+                        WHERE cfg.name = split_part(b.key, ':', 1) AND cfg.rate > 0
+                          AND b.last_refill < now() - make_interval(secs => cfg.burst / cfg.rate))
+          ORDER BY key
+          FOR UPDATE SKIP LOCKED
+        )
         DELETE FROM gen_durable_rate_buckets b
-        WHERE NOT EXISTS (SELECT 1 FROM gen_durable_rate_configs cfg
-                          WHERE cfg.name = split_part(b.key, ':', 1))
-           OR EXISTS (SELECT 1 FROM gen_durable_rate_configs cfg
-                      WHERE cfg.name = split_part(b.key, ':', 1) AND cfg.rate > 0
-                        AND b.last_refill < now() - make_interval(secs => cfg.burst / cfg.rate))
+        USING doomed d
+        WHERE b.key = d.key
         """,
         []
       )
@@ -529,7 +578,18 @@ defmodule GenDurable.Queries do
   # EXISTS runs on the statement snapshot, blind to a concurrently-committing
   # delivery, while that delivery's status-guarded wake skips the not-yet-parked
   # row without locking. The extra round trips buy the race away.
-  def complete_await(repo, id, worker, state_json, names, next_step) do
+  #
+  # `presented_ids` — the awaited-signal ids the parking step was HANDED
+  # (ctx.awaited; :await consumes nothing, so they are still in the inbox). The
+  # recheck excludes them: waking on a signal the step already saw and chose to
+  # re-await would spin the accumulate-a-pack pattern (park → recheck flips →
+  # immediate re-pick → re-await → …) at full speed until the pack completes.
+  # A set-difference, not a max-id watermark: signal ids commit out of order, so
+  # "id greater than the newest presented" could skip a signal that was inserted
+  # earlier but committed later (invisible to the step's enrichment snapshot).
+  # Deliveries are unaffected — a delivered signal is a fresh insert, never in
+  # the presented set, and the wake checks only the name.
+  def complete_await(repo, id, worker, state_json, names, next_step, presented_ids) do
     {:ok, result} =
       repo.transaction(fn ->
         %{num_rows: parked} =
@@ -539,7 +599,7 @@ defmodule GenDurable.Queries do
             """
             UPDATE gen_durable
             SET step = $4, state = $2::text::jsonb, awaits = $3::text[], eligible_at = now(),
-                status = 'awaiting_signal', rate_limit = null, weight = 1,
+                status = 'awaiting_signal', attempt = 0, rate_limit = null, weight = 1,
                 locked_by = null, lease_expires_at = null, updated_at = now()
             WHERE id = $1 AND locked_by = $5 AND status = 'executing'
             """,
@@ -557,9 +617,10 @@ defmodule GenDurable.Queries do
             SET status = 'runnable', updated_at = now()
             WHERE id = $1 AND status = 'awaiting_signal'
               AND EXISTS (SELECT 1 FROM signals
-                          WHERE target_id = $1 AND name = ANY(gen_durable.awaits))
+                          WHERE target_id = $1 AND name = ANY(gen_durable.awaits)
+                            AND id != ALL($2::bigint[]))
             """,
-            [id]
+            [id, presented_ids]
           )
 
           :ok
@@ -909,20 +970,38 @@ defmodule GenDurable.Queries do
   # Startup reclaim: release rows still claimed by a dead predecessor of this
   # scheduler — same claim prefix (instance+queue+VM, see Scheduler.claim_prefix/2),
   # any incarnation suffix. Prefix-compared with `left(...)` rather than LIKE, so
-  # queue/instance names containing `%`/`_` need no escaping. Scans the (small)
-  # executing set via the partial lease index; runs once per scheduler boot.
-  def reclaim_orphans(repo, queue, prefix) do
+  # queue/instance names containing `%`/`_` need no escaping.
+  #
+  # The lease-staleness condition ($3, `lease_ttl - 2 × heartbeat_interval` ms of
+  # remaining lease at most) is the safety net for claim-prefix collisions: a
+  # LIVE owner beats every heartbeat_interval, keeping its remaining lease above
+  # the threshold, so its claims are never touched even if two VMs end up with
+  # the same prefix (e.g. containers with identical hostnames and BEAM as OS
+  # pid 1). A dead owner's lease decays below it after ~2 missed beats — the
+  # reclaim fires then, still far ahead of full lease expiry (the reaper's
+  # floor). Rows claimed moments before the predecessor died are the remainder;
+  # they wait for the reaper. Scans the (small) executing set via the partial
+  # lease index; runs once per scheduler boot.
+  def reclaim_orphans(repo, queue, prefix, margin_ms) do
     %{num_rows: n} =
       q!(
         repo,
         "reclaim_orphans",
         """
-        UPDATE gen_durable
+        WITH stale AS (
+          SELECT id FROM gen_durable
+          WHERE queue = $1 AND status = 'executing'
+            AND left(locked_by, char_length($2)) = $2
+            AND lease_expires_at < now() + $3::int * interval '1 millisecond'
+          ORDER BY id
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE gen_durable g
         SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
-        WHERE queue = $1 AND status = 'executing'
-          AND left(locked_by, char_length($2)) = $2
+        FROM stale s
+        WHERE g.id = s.id
         """,
-        [queue, prefix]
+        [queue, prefix, margin_ms]
       )
 
     n
@@ -938,9 +1017,16 @@ defmodule GenDurable.Queries do
       repo,
       "release",
       """
-      UPDATE gen_durable
+      WITH mine AS (
+        SELECT id FROM gen_durable
+        WHERE id = ANY($1) AND locked_by = $2 AND status = 'executing'
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE gen_durable g
       SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
-      WHERE id = ANY($1) AND locked_by = $2 AND status = 'executing'
+      FROM mine m
+      WHERE g.id = m.id
       """,
       [ids, worker]
     )

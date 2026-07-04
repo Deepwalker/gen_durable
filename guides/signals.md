@@ -55,6 +55,10 @@ end
 
 `{:retry, ...}` on an awaiting step also keeps the awaited inputs, so a redo re-sees them.
 
+Re-awaiting is cheap: the engine wakes a park only on signals the parking step was **not**
+handed, so re-awaiting while your inputs sit unconsumed in the inbox parks cleanly — the
+instance sleeps until the next new arrival, it does not spin.
+
 ## Under the hood
 
 `await` is sugar over a raw signal model: every instance has a durable inbox (`ctx.all`), and a

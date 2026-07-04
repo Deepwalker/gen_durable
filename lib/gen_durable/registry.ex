@@ -64,7 +64,10 @@ defmodule GenDurable.Registry do
   # Treat `name` as a module name (the default `__gd_name__`), accept it only if it
   # is an FSM whose own name and version match — so we never run an arbitrary or
   # wrong-version module. A custom `:name` or an old `:version` won't match here and
-  # must be registered explicitly.
+  # must be registered explicitly. `to_existing_atom` (never `to_atom` — DB strings
+  # must not mint atoms) requires the module's atom to exist already: true in
+  # releases (modules preloaded), but under lazy code loading a compiled-yet-unloaded
+  # FSM resolves as NotFound — list it in `:fsms` to pin it.
   defp resolve(name, version) when is_binary(name) do
     module = String.to_existing_atom("Elixir." <> name)
 

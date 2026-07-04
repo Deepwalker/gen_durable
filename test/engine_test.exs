@@ -204,18 +204,33 @@ defmodule GenDurable.EngineTest do
     assert row.attempt == 0
   end
 
+  test "an unserializable outcome routes to handle/2, not an infinite crash loop" do
+    # A :done result Jason cannot encode is a deterministic user error: it must
+    # reach handle/2 (default {:stop, reason}) promptly — on the crash path it
+    # would loop through the reaper forever, one lease per cycle.
+    start_engine(lease_ttl: 60_000)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.BadResult)
+
+    row = wait_status(id, "failed")
+    assert row.attempt == 0
+    assert row.last_error =~ "Jason.Encoder"
+  end
+
   test "startup reclaim frees a dead incarnation's claims without waiting out the lease" do
     {:ok, id} = GenDurable.insert(GenDurable.Test.Plain, repo: Repo)
 
     # Simulate a claim left by a dead scheduler of the same instance+queue+VM:
-    # same claim prefix, different incarnation suffix, lease far in the future —
-    # so within this test only the startup reclaim can free the row.
+    # same claim prefix, different incarnation suffix. The lease is decayed past
+    # the staleness margin (lease_ttl 1000 − 2×heartbeat 300 = 400ms of
+    # remaining lease at most) but not yet expired — a freshly-heartbeated claim
+    # (a LIVE owner) would sit above the margin and must never be reclaimed.
     stale = GenDurable.Scheduler.claim_prefix(GenDurable, "default") <> "0"
 
     Repo.query!(
       """
       UPDATE gen_durable
-      SET status = 'executing', locked_by = $2, lease_expires_at = now() + interval '1 hour'
+      SET status = 'executing', locked_by = $2,
+          lease_expires_at = now() + interval '200 milliseconds'
       WHERE id = $1
       """,
       [id, stale]

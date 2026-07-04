@@ -37,6 +37,17 @@ Findings and their resolutions are tracked in `ISSUES.md`.
   entry order.
 - An uncaught `throw` in a step routes to `handle/2` as `{:throw, value}` instead of
   crashing the task and waiting out a full lease.
+- **A second adversarial review pass** (findings 13–21 in `ISSUES.md`): the pick
+  self-heals a swept rate bucket (a slept-past-refill row can no longer stall forever and
+  starve the queue); re-awaiting with already-presented signals parks cleanly instead of
+  spinning (the accumulate-a-pack pattern no longer busy-loops); unserializable outcomes
+  (an unencodable `:done` result, a bad child spec) route to `handle/2` instead of looping
+  through the reaper forever; startup reclaim requires a stale lease, so claim-prefix
+  collisions (containers with identical hostnames, BEAM as pid 1) can never release a live
+  VM's claims; all multi-row maintenance statements claim rows via ordered
+  `FOR UPDATE SKIP LOCKED` (no maintenance-vs-maintenance deadlocks); a numeric
+  concurrency_key can no longer collide with a row id in the dedup window; `min_demand` is
+  clamped to the claim ceiling; `:await` resets `attempt` like `:next`.
 
 ### Changed (behavior)
 - `GenDurable.signal/4` returns `{:error, :no_target}` for a terminal or nonexistent

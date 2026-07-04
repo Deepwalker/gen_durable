@@ -28,10 +28,14 @@ defmodule GenDurable.Executor do
 
   @doc """
   Execute `job` (a map returned by `Queries.pick/5`). `config` is `%{repo: ...}`.
-  Returns the validated outcome tuple.
+  Returns the outcome tuple in its serialized (DB-ready) form.
   """
   def run(config, job) do
     repo = config.repo
+    # Deliberately OUTSIDE the guarded region: an unresolvable fsm here is most
+    # likely a rolling deploy (this node does not know the module yet — another
+    # node does), so the right move is the crash path (lease floor, re-pick
+    # elsewhere), not a terminal :stop that would lose the instance.
     module = Registry.fetch!(config.registry, job.fsm, job.fsm_version)
     state_module = module.__gd_state__()
 
@@ -54,8 +58,8 @@ defmodule GenDurable.Executor do
     }
 
     started = System.monotonic_time()
-    {outcome, consumed} = invoke(module, ctx)
-    apply_outcome(repo, state_module, job, outcome, consumed)
+    {outcome, consumed} = invoke(module, state_module, ctx)
+    apply_outcome(repo, job, outcome, consumed)
     warn_unknown_rate_limit(config, job, outcome)
 
     :telemetry.execute(
@@ -90,82 +94,112 @@ defmodule GenDurable.Executor do
   # return, not a crash; without the catch it would kill the Task and cost a
   # full lease_ttl through the reaper). A bare `exit` is deliberately NOT caught:
   # it is a process-level event and takes the crash path (reaper, at-least-once
-  # floor). Returns the validated outcome plus the signal ids to consume on a
-  # progressing outcome (the awaited snapshot the step received; none on the
-  # handle path, since the step failed).
-  defp invoke(module, ctx) do
-    outcome = Outcome.validate!(module.step(ctx.step, ctx))
+  # floor). The outcome is SERIALIZED inside the guarded region too: a
+  # deterministic user-data error (an unencodable `:done` result or state, a bad
+  # child spec) must route to `handle/2` — outside the guard it would crash the
+  # Task and loop forever through the reaper, one lease per cycle, with no
+  # terminal state. Returns the serialized outcome plus the signal ids to
+  # consume on a progressing outcome (the awaited snapshot the step received;
+  # none on the handle path, since the step failed).
+  defp invoke(module, state_module, ctx) do
+    outcome =
+      module.step(ctx.step, ctx)
+      |> Outcome.validate!()
+      |> serialize(state_module)
+
     {outcome, Enum.map(ctx.awaited, & &1.id)}
   rescue
-    reason -> {handle(module, ctx, reason), []}
+    reason -> {handle(module, state_module, ctx, reason), []}
   catch
-    :throw, value -> {handle(module, ctx, {:throw, value}), []}
+    :throw, value -> {handle(module, state_module, ctx, {:throw, value}), []}
   end
 
-  defp handle(module, ctx, reason) do
+  defp handle(module, state_module, ctx, reason) do
     handle_ctx = %{ctx | awaited: [], all: [], childs: []}
 
     try do
-      Outcome.validate!(module.handle(reason, handle_ctx))
+      module.handle(reason, handle_ctx)
+      |> Outcome.validate!()
+      |> serialize(state_module)
     rescue
-      e2 -> {:stop, e2}
+      e2 -> {:stop, format_reason(e2)}
+    end
+  end
+
+  # A validated outcome in its DB-ready form: state/result encoded to JSON text,
+  # child specs expanded to insert params, stop reasons formatted. Raises on
+  # unserializable user data — deliberately called inside invoke's guarded
+  # region, so the error reaches `handle/2` like any other step failure.
+  defp serialize(outcome, state_module) do
+    case outcome do
+      {:next, step, state, opts} ->
+        {:next, step, State.to_db(state_module, state), opts}
+
+      {:retry, state, delay} ->
+        {:retry, State.to_db(state_module, state), delay}
+
+      {:await, names, next_step, state} ->
+        {:await, names, next_step, State.to_db(state_module, state)}
+
+      {:schedule_childs, next_step, children, state} ->
+        child_params = Enum.map(children, &child_to_params/1)
+        {:schedule_childs, next_step, child_params, State.to_db(state_module, state)}
+
+      {:done, result} ->
+        {:done, Jason.encode!(result)}
+
+      {:stop, reason} ->
+        {:stop, format_reason(reason)}
     end
   end
 
   # `consumed` is the awaited-signal ids to delete on a progressing outcome; terminal
   # outcomes delete the whole inbox regardless (cleanup), :retry/:await delete nothing.
-  # Every outcome carries the claim's worker id (ownership guard): a `:stale`
-  # return means the lease expired and the row was reclaimed while this step ran —
-  # the outcome is dropped (the new claimant redoes the work) and the drop is
-  # made observable via telemetry.
-  defp apply_outcome(repo, state_module, job, outcome, consumed) do
+  # An :await passes them as the PRESENTED set instead: the park's recheck must not
+  # re-wake on a signal the step already saw and chose to re-await (see
+  # Queries.complete_await). Every outcome carries the claim's worker id (ownership
+  # guard): a `:stale` return means the lease expired and the row was reclaimed
+  # while this step ran — the outcome is dropped (the new claimant redoes the
+  # work) and the drop is made observable via telemetry.
+  defp apply_outcome(repo, job, outcome, consumed) do
     %{id: id, worker: worker} = job
 
     result =
       case outcome do
-        {:next, step, state, opts} ->
+        {:next, step, state_json, opts} ->
           Queries.complete_next(
             repo,
             id,
             worker,
             step,
-            State.to_db(state_module, state),
+            state_json,
             consumed,
             opts.rate_limit,
             opts.weight
           )
 
-        {:retry, state, delay} ->
-          Queries.complete_retry(repo, id, worker, State.to_db(state_module, state), delay)
+        {:retry, state_json, delay} ->
+          Queries.complete_retry(repo, id, worker, state_json, delay)
 
-        {:await, names, next_step, state} ->
-          Queries.complete_await(
-            repo,
-            id,
-            worker,
-            State.to_db(state_module, state),
-            names,
-            next_step
-          )
+        {:await, names, next_step, state_json} ->
+          Queries.complete_await(repo, id, worker, state_json, names, next_step, consumed)
 
-        {:schedule_childs, next_step, children, state} ->
-          child_params = Enum.map(children, &child_to_params/1)
-
+        {:schedule_childs, next_step, child_params, state_json} ->
           Queries.complete_schedule_childs(
             repo,
             id,
             worker,
             next_step,
-            State.to_db(state_module, state),
+            state_json,
             child_params,
             consumed
           )
 
-        {:done, result} ->
-          Queries.complete_done(repo, id, worker, Jason.encode!(result))
+        {:done, result_json} ->
+          Queries.complete_done(repo, id, worker, result_json)
 
-        {:stop, reason} ->
-          Queries.complete_stop(repo, id, worker, format_reason(reason))
+        {:stop, reason_text} ->
+          Queries.complete_stop(repo, id, worker, reason_text)
       end
 
     if result == :stale do

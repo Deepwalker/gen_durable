@@ -35,6 +35,11 @@ The barrier waits for **termination, not success** — a child that ends `failed
 its slot. The parent sees the failure in `ctx.childs` and decides what to do (proceed,
 `{:stop, _}`, compensate). The engine does not auto-propagate child failure.
 
+`ctx.childs` holds **all** of the instance's children still in the database — including
+those from earlier `schedule_childs` rounds (until [GC](operations.md) prunes them). A
+parent that fans out repeatedly should filter by its own bookkeeping (e.g. ids or a marker
+in the child state) rather than assume the list is the latest batch.
+
 ## Not covered
 
 - **No cancel/cascade** — terminating or failing a parent does not touch its children, and
