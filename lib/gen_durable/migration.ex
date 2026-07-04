@@ -28,7 +28,7 @@ defmodule GenDurable.Migration do
 
   use Ecto.Migration
 
-  @latest_version 2
+  @latest_version 1
 
   @doc "Migrate the schema up to `:version` (default: latest)."
   def up(opts \\ []) do
@@ -88,6 +88,10 @@ defmodule GenDurable.Migration do
       attempt       int  not null default 0,
       last_error    text,
 
+      -- await timeout: set by the park when the step passed `timeout:`; the
+      -- reaper sweeps expired parks back to runnable (a wake, not a failure).
+      await_deadline timestamptz,
+
       -- rate limiting: rate_limit is the bucket key for the CURRENT step
       -- (NULL ⇒ not rate-limited), weight is how many budget units this step's execution
       -- consumes (default 1). Both rewritten on every transition; kept on :retry.
@@ -127,6 +131,12 @@ defmodule GenDurable.Migration do
     execute("""
     CREATE INDEX gen_durable_lease ON #{p}.gen_durable (lease_expires_at)
       WHERE status = 'executing'
+    """)
+
+    # Supports the await-timeout sweep: parked rows with an armed deadline.
+    execute("""
+    CREATE INDEX gen_durable_await_deadline ON #{p}.gen_durable (await_deadline)
+      WHERE status = 'awaiting_signal' AND await_deadline IS NOT NULL
     """)
 
     # Supports the picker's "skip a key already being processed" guard
@@ -198,25 +208,6 @@ defmodule GenDurable.Migration do
     execute("DROP TABLE IF EXISTS #{p}.signals")
     execute("DROP TABLE IF EXISTS #{p}.gen_durable")
     execute("DROP TYPE IF EXISTS #{p}.durable_status")
-  end
-
-  # --- version 2: await timeouts ----------------------------------------------
-  # `await_deadline` — set by the park when the step passed `timeout:`; the
-  # reaper sweeps expired parks back to runnable (the woken step sees whatever
-  # is in the inbox — for a fresh await, an empty ctx.awaited means timeout).
-
-  defp change(2, :up, p) do
-    execute("ALTER TABLE #{p}.gen_durable ADD COLUMN await_deadline timestamptz")
-
-    execute("""
-    CREATE INDEX gen_durable_await_deadline ON #{p}.gen_durable (await_deadline)
-      WHERE status = 'awaiting_signal' AND await_deadline IS NOT NULL
-    """)
-  end
-
-  defp change(2, :down, p) do
-    execute("DROP INDEX IF EXISTS #{p}.gen_durable_await_deadline")
-    execute("ALTER TABLE #{p}.gen_durable DROP COLUMN IF EXISTS await_deadline")
   end
 
   # --- helpers ---------------------------------------------------------------

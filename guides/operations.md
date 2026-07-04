@@ -14,10 +14,10 @@ end
 ```
 
 `up/1` records the installed schema version in a table comment and only applies missing
-increments, so the host-facing call stays stable as the library evolves: when a library
-release ships a new schema version, add another one-line migration with the same body — it
-applies just the missing increments. `:prefix` puts the tables in a non-`public` Postgres
-schema (the runtime also needs it on the repo's `search_path`).
+increments, so the host-facing call stays stable as the library evolves. Pre-1.0 there is a
+single schema version, edited in place — upgrading means re-creating the schema. `:prefix`
+puts the tables in a non-`public` Postgres schema (the runtime also needs it on the repo's
+`search_path`).
 
 ## Starting the engine
 
