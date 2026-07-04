@@ -397,7 +397,7 @@ bulk (700k `done`/`failed`) sits in none of the partial indexes.
 | Query | Index | Kind |
 |---|---|---|
 | `pick` scan | `gen_durable_pick (queue, priority, eligible_at) WHERE status='runnable'` | partial, ordered |
-| `pick` concurrency guard | `gen_durable_concurrency_active (concurrency_key) WHERE status='executing' AND concurrency_key IS NOT NULL` | partial, index-only probe |
+| `pick` concurrency guard | `gen_durable_concurrency_active` / `gen_durable_lease` (planner's choice: per-candidate probes or one hashed scan of the executing set) | partial; bounded by in-flight count, not table size |
 | `pick` lock / outcomes / signal | `gen_durable_pkey (id)` | primary key |
 | `reap` | `gen_durable_lease (lease_expires_at) WHERE status='executing'` | partial |
 | `insert` dedup / key addressing | `gen_durable_correlation (correlation_guard) WHERE correlation_guard IS NOT NULL` | partial unique |
@@ -500,3 +500,15 @@ postgres`, create a scratch database, apply the v1 DDL from
 signals), `ANALYZE`, and run `EXPLAIN (ANALYZE, BUFFERS)` on each statement from
 `lib/gen_durable/queries.ex`. Wrap mutating statements in `BEGIN; … ; ROLLBACK;` so the
 plan executes without changing the dataset. Run each twice and read the second (warm).
+
+Re-verified after the 0.2.0 hardening on a fresh 1M-row seed (same recipe), warm plans:
+the common-path pick still rides `gen_durable_pick` with the rate CTEs **and the new
+`heal` CTE** at zero rows / `never executed` (~4 ms with a 6k-row executing set — the
+concurrency guard's hashed scan of the in-flight set is the biggest component; on a
+keyless queue with the full rate machinery active the pick is ~2 ms, heal's
+exists-check costing ~0.01 ms); the reworked maintenance statements keep their
+proportionality — reap ≈ 8 µs per expired row including the new ordered SKIP LOCKED
+claim, a 50-row heartbeat ≈ 0.6 ms, both PK/partial-index driven; the one-statement
+`deliver_signal` ≈ 0.27 ms, all PK scans; batch enrichment ≈ 0.1–0.14 ms per 50-row
+batch; the collapsed outcome holds its bench win (~1.75× vs the transaction form,
+`mix test --only bench`).
