@@ -80,6 +80,7 @@ For the trivial "run once and finish" case, define [`perform/1`](guides/jobs.md)
 | [Concurrency keys](guides/concurrency.md) | serialize per key, parallel across keys |
 | [Instance identity](guides/identity.md) | `correlation_key` — address a signal by business key + dedup |
 | [Scheduling & queues](guides/scheduling.md) | delays, priority, queues, recurring work |
+| [Testing](guides/testing.md) | inline synchronous execution (`drain`), assertions, sandbox-friendly |
 | [Operations](guides/operations.md) | migration, crash recovery, GC, the config reference, telemetry |
 
 ## Documentation

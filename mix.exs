@@ -43,6 +43,7 @@ defmodule GenDurable.MixProject do
         "guides/concurrency.md": [title: "Concurrency keys"],
         "guides/identity.md": [title: "Instance identity"],
         "guides/scheduling.md": [title: "Scheduling & queues"],
+        "guides/testing.md": [title: "Testing"],
         "guides/operations.md": [title: "Operations"],
         "PERFORMANCE.md": [title: "Performance"],
         "CHANGELOG.md": [title: "Changelog"]
@@ -51,7 +52,13 @@ defmodule GenDurable.MixProject do
         Guides: ~r{guides/.*}
       ],
       groups_for_modules: [
-        "Public API": [GenDurable, GenDurable.FSM, GenDurable.State, GenDurable.Migration],
+        "Public API": [
+          GenDurable,
+          GenDurable.FSM,
+          GenDurable.State,
+          GenDurable.Migration,
+          GenDurable.Testing
+        ],
         Runtime: [
           GenDurable.Supervisor,
           GenDurable.Scheduler,

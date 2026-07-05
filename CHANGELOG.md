@@ -58,6 +58,12 @@ Findings and their resolutions are tracked in `ISSUES.md`.
 - Worker ids are now `<instance>:<queue>@<vm>-<uniq>` (opaque, stored in `locked_by`).
 
 ### Added
+- **`GenDurable.Testing` — inline test mode**: `drain/1` synchronously runs everything
+  runnable in the calling process through the production pick/executor path (no engine,
+  sandbox-compatible), collapsing scheduled/backoff delays by default and failing fast on
+  runaway FSMs (`max_steps`); assertion helpers (`assert_status`, `assert_awaiting`,
+  `assert_done`, `assert_failed`, `durable/1`, `fire_timeouts/0`) bound to the repo via
+  `use GenDurable.Testing, repo: MyRepo`. See the Testing guide.
 - **Await timeouts**: `{:await, names, next_step, state, timeout: ms}` wakes the instance
   after the deadline even without a signal — a wake, not a failure (`attempt` untouched);
   a fresh await distinguishes by empty `ctx.awaited`, the accumulate pattern proceeds with
