@@ -73,7 +73,7 @@ assert %{done: 1} = drain()
 ## Inline semantics vs the engine
 
 Steps run one at a time in pick order, so `concurrency_key` serialization is trivially
-satisfied (no advisory locks are taken). A raise in a step routes to `handle/2` exactly as
+satisfied. A raise in a step routes to `handle/2` exactly as
 in production; a bare `exit` crashes the test process — there is no reaper inline, which
 also means crash-recovery paths (lease expiry, reclaim) are engine behavior you cover with
 an engine test, not inline.

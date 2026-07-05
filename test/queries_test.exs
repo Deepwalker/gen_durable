@@ -124,6 +124,19 @@ defmodule GenDurable.QueriesTest do
 
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 3
     end
+
+    test "the unique arbiter makes a second executing row per key uncommittable" do
+      # The picker's guard is the optimization; THIS is the correctness layer:
+      # a cross-node claim race resolves by unique violation, never by two
+      # concurrent executions of one key.
+      {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
+      {:ok, b} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
+      :ok = claim(a)
+
+      assert_raise Postgrex.Error, ~r/gen_durable_concurrency_active/, fn ->
+        Repo.query!("UPDATE gen_durable SET status = 'executing' WHERE id = $1", [b])
+      end
+    end
   end
 
   test "complete_next resets attempt and returns to runnable" do

@@ -45,9 +45,9 @@ defmodule GenDurable do
     * `[:gen_durable, :scheduler, :reclaimed]` — at scheduler startup, claims of a
       dead predecessor (same instance+queue+VM) were released early instead of
       waiting out the lease. Measurements `%{count}`; metadata `%{queue}`.
-    * `[:gen_durable, :concurrency, :contended]` — a concurrency_key advisory lock
-      was contended (a row was handed back). Measurements `%{count}`; metadata
-      `%{id, fsm, concurrency_key}`.
+    * `[:gen_durable, :concurrency, :contended]` — a cross-node claim race on a
+      concurrency_key hit the unique arbiter and the pick retried. Measurements
+      `%{count}`; metadata `%{queue}`.
     * `[:gen_durable, :outcome, :stale]` — a worker committed an outcome for a row
       it no longer owns (its lease expired and the row was reclaimed while the step
       ran); the outcome was dropped and the current claimant redoes the step.

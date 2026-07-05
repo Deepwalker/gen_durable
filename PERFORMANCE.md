@@ -127,7 +127,7 @@ What to read here:
   rows, inner = one primary-key point lookup each (`loops=50, rows=1`). That is O(batch)
   point updates, the textbook-best way to update N rows by id; see §2.5 for the proof
   that forcing it off is ~10× slower. The per-key losers (`rn > 1`) were locked but not
-  updated, so they stay `runnable` and their lock releases at commit — no advisory bounce.
+  updated, so they stay `runnable` and their lock releases at commit.
 
 ### 2.3 The bounded-window trade-off
 
@@ -454,10 +454,14 @@ The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 14 µs/row`
    *output*, not how far it skips. Mitigation (future): picker sharding by `hashtext(key)`
    so one key maps to one scheduler, or a per-key "next eligible" side structure. A single
    key monopolizing a queue is itself a modeling smell.
-2. **Concurrency-keyed steps pin a connection.** `concurrency_key` serialization holds a session
-   advisory lock on a checked-out connection for the *whole* step (user code included), so
-   in-flight concurrency-keyed steps consume pool connections 1:1. Size the pool for peak
-   concurrency-keyed concurrency. Non-concurrency-keyed steps grab/release per statement.
+2. **A cross-node concurrency_key claim race aborts the whole pick batch.**
+   Serialization is a UNIQUE partial index over executing keys, so two picks racing the
+   same key resolve by a unique violation on one of them — which aborts that pick's entire
+   claim statement, not just the conflicting row (an UPDATE has no ON CONFLICT). The pick
+   retries (bounded), the winner is visible by then, and the loser's batch is re-claimed —
+   one wasted round-trip on a rare race, observable via `[:concurrency, :contended]`. In
+   exchange, no per-step locks or pinned connections exist at all: every step, keyed or
+   not, touches the pool per statement only.
 3. **A far-future scheduled backlog on a more-urgent priority.** The pick index is
    `(queue, priority, eligible_at)`: within one priority group, eligible rows sort before
    future ones, so delayed work on the *same* priority costs nothing. But to reach

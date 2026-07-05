@@ -4,9 +4,11 @@ defmodule GenDurable.Queries do
 
   All functions take the `repo` explicitly. The `complete_*` functions run the
   outcome `UPDATE` and the consumed-signal `DELETE` in one transaction.
-  `concurrency_key` serialization (advisory lock) helpers live here too; the
-  caller is responsible for holding a single connection (`Repo.checkout/1`) for
-  the lock's lifetime.
+  `concurrency_key` serialization is enforced by the database — the UNIQUE
+  partial index `gen_durable_concurrency_active` makes a second executing row
+  per key uncommittable, so the pick's claim IS the lock (held exactly for the
+  step window, released by any outcome or the reaper); no advisory locks, no
+  pinned connections.
 
   Every statement has a static SQL text and goes through the connection-level
   prepared-statement cache (`cache_statement:`), so Postgres parses and plans it
@@ -82,8 +84,8 @@ defmodule GenDurable.Queries do
   # --- picker ----------------------------------------------------------------
 
   # concurrency_key dedup: never claim more than one row per concurrency_key
-  # in a batch, and never claim a key that is already being processed — without the
-  # wasted claim→try_lock→reset churn that prefetch would amplify on hot keys.
+  # in a batch, and never claim a key that is already being processed — without
+  # the wasted claim→violation→retry churn that prefetch would amplify on hot keys.
   #
   # Shape: the canonical Postgres claim (one `SELECT … FOR UPDATE SKIP LOCKED
   # LIMIT`, then one `UPDATE`) plus an in-batch dedup that needs no extra pass.
@@ -101,8 +103,11 @@ defmodule GenDurable.Queries do
   #            prefixes keep a numeric key from colliding with an id).
   #   UPDATE — flip only the per-key winners (`rn = 1`). The losers (`rn > 1`)
   #            were locked but not touched, so they stay `runnable` and their
-  #            lock is released at commit — no advisory-lock bounce. The next
-  #            pick skips them via the NOT EXISTS guard once the winner executes.
+  #            lock is released at commit. The next pick skips them via the
+  #            NOT EXISTS guard while the winner executes. The guard is the
+  #            optimization; the correctness is the UNIQUE arbiter on
+  #            (concurrency_key) WHERE executing — a cross-node claim race
+  #            cannot commit two rows of one key (see pick/6's retry).
   #
   # Dedup is a window function *after* locking, so there is no separate re-lock
   # pass: exactly ONE nested loop — the `UPDATE` join by id, which is the optimal
@@ -216,7 +221,18 @@ defmodule GenDurable.Queries do
   FROM throttled
   """
 
-  def pick(repo, queue, batch, worker, lease_ttl_ms) do
+  def pick(repo, queue, batch, worker, lease_ttl_ms),
+    do: pick(repo, queue, batch, worker, lease_ttl_ms, 3)
+
+  # A cross-node claim race on a concurrency_key (two picks, different rows, one
+  # key, both invisible to each other's snapshot) ends in a unique violation on
+  # the gen_durable_concurrency_active arbiter — the DB-enforced serialization.
+  # The violation aborts the whole claim statement, so the losing pick simply
+  # retries: the winner is committed by then and the NOT EXISTS guard routes
+  # around its key. Rare (the guard filters everything visible), observable via
+  # [:gen_durable, :concurrency, :contended]; after the attempts run out this
+  # round claims nothing and the next poll tries again.
+  defp pick(repo, queue, batch, worker, lease_ttl_ms, attempts) do
     %{rows: rows} = q!(repo, "pick", @pick_sql, [queue, batch, worker, lease_ttl_ms])
     {jobs, throttles} = Enum.split_with(rows, fn [tag | _] -> tag == 0 end)
 
@@ -230,6 +246,17 @@ defmodule GenDurable.Queries do
     end
 
     enrich(repo, Enum.map(jobs, &to_job(&1, worker)))
+  rescue
+    e in Postgrex.Error ->
+      if is_map(e.postgres) && e.postgres[:constraint] == "gen_durable_concurrency_active" do
+        :telemetry.execute([:gen_durable, :concurrency, :contended], %{count: 1}, %{queue: queue})
+
+        if attempts > 1,
+          do: pick(repo, queue, batch, worker, lease_ttl_ms, attempts - 1),
+          else: []
+      else
+        reraise e, __STACKTRACE__
+      end
   end
 
   # `worker` rides in the job: it is the claim's identity, and the outcome
@@ -967,38 +994,6 @@ defmodule GenDurable.Queries do
       p.rate_limit,
       p.weight
     ]
-  end
-
-  # --- concurrency_key serialization (advisory lock) ---------------------------
-
-  # hashtextextended (64-bit) over hashtext (32-bit): an advisory-key collision
-  # falsely serializes two distinct concurrency keys, and the bigint keyspace
-  # makes that negligible.
-  def advisory_try_lock(repo, key) do
-    %{rows: [[locked]]} =
-      q!(repo, "advisory_lock", "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", [key])
-
-    locked
-  end
-
-  def advisory_unlock(repo, key) do
-    q!(repo, "advisory_unlock", "SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key])
-    :ok
-  end
-
-  def reset_to_runnable(repo, id, worker) do
-    q!(
-      repo,
-      "reset_to_runnable",
-      """
-      UPDATE gen_durable
-      SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
-      WHERE id = $1 AND locked_by = $2 AND status = 'executing'
-      """,
-      [id, worker]
-    )
-
-    :ok
   end
 
   # Startup reclaim: release rows still claimed by a dead predecessor of this

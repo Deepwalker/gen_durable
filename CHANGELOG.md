@@ -5,6 +5,19 @@ All notable changes to `gen_durable` are documented here. The format follows
 **no backward-compatibility guarantees** — there is one schema version and migrations are
 edited in place until the MVP settles.
 
+## 0.2.2
+
+### Changed
+- **`concurrency_key` serialization moved into the database**: the
+  `gen_durable_concurrency_active` partial index is now UNIQUE, so a second executing row
+  per key is uncommittable — the claim itself is the lock, spanning exactly the step
+  window and released by any outcome (or the reaper on a crash). The whole advisory-lock
+  layer is gone: no session locks, no `Repo.checkout`, and keyed steps **no longer pin a
+  pool connection for the step duration** (the former known-limit #2). A cross-node claim
+  race now resolves as a unique violation and a bounded pick retry;
+  `[:gen_durable, :concurrency, :contended]` metadata changed to `%{queue}`.
+  Schema: the index became UNIQUE (v1 DDL edited in place — re-create the schema).
+
 ## 0.2.1
 
 ### Added

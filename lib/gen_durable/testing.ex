@@ -34,7 +34,7 @@ defmodule GenDurable.Testing do
   Inline semantics vs the engine:
 
     * steps run one at a time, in pick order — `concurrency_key` serialization
-      is trivially satisfied, no advisory locks are taken;
+      is trivially satisfied;
     * scheduled/backoff delays are collapsed by default (`with_scheduled: true`)
       so retries and `schedule_in` run immediately — an FSM that retries forever
       hits the `max_steps` cap and raises instead of hanging the test;

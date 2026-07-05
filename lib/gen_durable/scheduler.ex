@@ -35,10 +35,10 @@ defmodule GenDurable.Scheduler do
   the reaper — so deeper buffers mean a larger crash blip, bounded by the (short)
   TTL, not by the buffer depth.
 
-  `concurrency_key` serialization is handled per-job at execution time: a
-  session-level advisory lock is taken on a checked-out connection held for the
-  whole step, and released after the outcome commits. If the lock is contended,
-  the row is returned to `runnable` and skipped.
+  `concurrency_key` serialization is enforced at claim time by the database
+  (the UNIQUE partial index over executing keys): the pick either commits the
+  only executing row for a key or retries on the violation — no per-step locks,
+  no pinned connections. See `GenDurable.Queries` (the pick).
   """
 
   use GenServer
@@ -229,12 +229,12 @@ defmodule GenDurable.Scheduler do
   # order is not SQL-guaranteed, so this is best-effort, not a contract).
   defp drain(%{buffer: [job | rest]} = state)
        when map_size(state.in_flight) < state.concurrency do
-    task = Task.Supervisor.async_nolink(state.task_sup, fn -> execute_job(state.config, job) end)
+    task = Task.Supervisor.async_nolink(state.task_sup, fn -> Executor.run(state.config, job) end)
 
     state = %{
       state
       | buffer: rest,
-        in_flight: Map.put(state.in_flight, task.ref, {job.id, job.concurrency_key})
+        in_flight: Map.put(state.in_flight, task.ref, job.id)
     }
 
     drain(state)
@@ -260,35 +260,6 @@ defmodule GenDurable.Scheduler do
     %{state | cur_poll: cur}
   end
 
-  # Run the step, serializing on concurrency_key when present.
-  defp execute_job(config, %{concurrency_key: nil} = job), do: Executor.run(config, job)
-
-  defp execute_job(config, %{concurrency_key: key} = job) do
-    repo = config.repo
-
-    repo.checkout(fn ->
-      if Queries.advisory_try_lock(repo, key) do
-        try do
-          Executor.run(config, job)
-        after
-          Queries.advisory_unlock(repo, key)
-        end
-      else
-        # Another worker holds this key; hand the row back. With the picker's
-        # concurrency_key dedup this should be rare (only a cross-node or unlock-gap
-        # race), so it is worth a telemetry signal.
-        :telemetry.execute(
-          [:gen_durable, :concurrency, :contended],
-          %{count: 1},
-          %{id: job.id, fsm: job.fsm, concurrency_key: key}
-        )
-
-        Queries.reset_to_runnable(repo, job.id, job.worker)
-        :skipped
-      end
-    end)
-  end
-
   # Gauge of how loaded this queue is — emitted each poll so a handler can read
   # in-flight depth, buffer depth, and free slots to tune the feeder knobs.
   defp saturation(state) do
@@ -305,7 +276,7 @@ defmodule GenDurable.Scheduler do
   end
 
   defp buffer_ids(buffer), do: Enum.map(buffer, & &1.id)
-  defp in_flight_ids(in_flight), do: in_flight |> Map.values() |> Enum.map(&elem(&1, 0))
+  defp in_flight_ids(in_flight), do: Map.values(in_flight)
 
   defp schedule(msg, after_ms), do: Process.send_after(self(), msg, after_ms)
 end

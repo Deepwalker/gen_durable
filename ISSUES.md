@@ -415,6 +415,36 @@ Noted, not fixed: insert-time `:rate_limit`/`:weight` are unvalidated (no
 buckets ARE swept, config rows are a handful); two instances sharing a repo
 with different `rate_limits` last-write-win on shared names.
 
+### 22. The advisory-lock layer was redundant — REPLACED with a unique arbiter
+
+**Status: fixed** (came out of the concurrency-cap design discussion). The
+execution-time serialization of `concurrency_key` — a session advisory lock on
+a checked-out connection held for the whole step — existed to close the
+cross-node claim race the pick's snapshot guard cannot see. But the invariant
+it protected ("at most one executing row per key") is exactly expressible as a
+DB constraint: `gen_durable_concurrency_active` is now a UNIQUE partial index,
+so the second claim of a racing pair is **uncommittable** — the claim itself
+is the lock, held precisely for the step window (the executing status) and
+released by any outcome or the reaper. Deleted: `advisory_try_lock/unlock`,
+the `Repo.checkout` pinning (keyed steps no longer consume a pool connection
+1:1 for their duration — former PERFORMANCE known-limit #2),
+`reset_to_runnable`, the contended hand-back path. A violation aborts the
+losing pick's whole claim statement (an UPDATE has no ON CONFLICT), which
+costs one bounded retry of a rare race — observable via the repurposed
+`[:gen_durable, :concurrency, :contended]` (`%{queue}` metadata).
+
+Why hold-for-the-step could not simply be dropped without the constraint: a
+momentary lock validates nothing (the second claimant acquires it a moment
+later), and post-commit self-checks cannot safely elect a loser — the earlier
+committer can be provably blind to the later one, and commit order is not
+cheaply recoverable from row data. Mutual exclusion over a time window needs
+something held for the window; the executing row itself, fenced by the unique
+arbiter, is that something — for free.
+
+Note for the future concurrency-cap feature (K > 1): a unique index does not
+count to K; that design needs a slots table — tracked in the design
+discussion, not here.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

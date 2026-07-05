@@ -139,12 +139,16 @@ defmodule GenDurable.Migration do
       WHERE status = 'awaiting_signal' AND await_deadline IS NOT NULL
     """)
 
-    # Supports the picker's "skip a key already being processed" guard
-    # (concurrency_key dedup): NOT EXISTS over executing rows by concurrency_key.
-    # Scoped to non-null keys: the guard only ever probes real keys, so a
-    # non-keyed claim (the common case) never writes to this index.
+    # concurrency_key serialization, enforced by the database: at most ONE
+    # executing row per key can ever be committed. The picker's NOT EXISTS guard
+    # reads it as an optimization; the UNIQUE arbiter is the correctness — a
+    # cross-node claim race ends in a unique violation and the losing pick
+    # retries. The "lock" is the row's own executing status, so it spans exactly
+    # the step window and releases with any outcome (or the reaper, on a crash).
+    # Scoped to non-null keys: a non-keyed claim (the common case) never writes
+    # to this index.
     execute("""
-    CREATE INDEX gen_durable_concurrency_active ON #{p}.gen_durable (concurrency_key)
+    CREATE UNIQUE INDEX gen_durable_concurrency_active ON #{p}.gen_durable (concurrency_key)
       WHERE status = 'executing' AND concurrency_key IS NOT NULL
     """)
 

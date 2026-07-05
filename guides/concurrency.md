@@ -12,9 +12,11 @@ GenDurable.insert(Account.Sync, state: %{id: 9}, concurrency_key: "account:9")  
 ```
 
 The picker never claims more than one row per `concurrency_key`, and never claims a key that is
-already executing, so steps sharing a key cannot overlap. Enforcement is a session-level
-Postgres **advisory lock** held for the duration of the step; a worker death drops the
-connection and releases the lock automatically (crash-safe).
+already executing, so steps sharing a key cannot overlap. Enforcement is a **unique partial
+index** over executing keys: a second executing row per key is uncommittable, so the claim
+itself is the lock — held exactly for the step window, released by any outcome, and by the
+[reaper](operations.md) if the worker dies (crash-safe). No per-step locks or pinned
+connections are involved.
 
 A `NULL` `concurrency_key` (the common case) never serializes — those instances run with the
 full queue concurrency and pay nothing for the machinery.

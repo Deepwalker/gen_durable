@@ -116,8 +116,11 @@ Attach to these `[:gen_durable, …]` events:
 | `[:pick, :stop]` | a picker batch ran | `%{count, demand}` / `%{queue, worker}` |
 | `[:scheduler, :saturation]` | per-poll gauge | `%{in_flight, buffer, concurrency, prefetch}` / `%{queue}` |
 | `[:scheduler, :drain]` | graceful queue shutdown | `%{released, in_flight}` / `%{queue}` |
-| `[:concurrency, :contended]` | a [concurrency_key](concurrency.md) lock was contended | `%{count}` / `%{id, fsm, concurrency_key}` |
-| `[:reaper, :reaped]` | expired leases reclaimed | `%{count}` / `%{ids}` |
-| `[:gc, :swept]` | terminal rows deleted | `%{count}` / `%{}` |
+| `[:scheduler, :reclaimed]` | startup reclaim of a dead predecessor's claims | `%{count}` / `%{queue}` |
+| `[:concurrency, :contended]` | a cross-node [concurrency_key](concurrency.md) claim race; the pick retried | `%{count}` / `%{queue}` |
+| `[:outcome, :stale]` | a reclaimed row rejected its old worker's outcome | `%{count}` / `%{id, fsm, step, kind}` |
+| `[:reaper, :reaped]` | expired leases reclaimed | `%{count}` / `%{}` |
+| `[:await, :timeout]` | [await deadlines](signals.md#timeouts) fired | `%{count}` / `%{}` |
+| `[:gc, :swept]` | terminal rows / stale rate buckets deleted | `%{count, buckets}` / `%{}` |
 | `[:rate_limit, :throttled]` | a [bucket](rate_limiting.md) bit | `%{wanted, granted}` / `%{key, queue}` |
 | `[:rate_limit, :unknown]` | a step named an unconfigured limit | `%{count}` / `%{key, name, fsm, step}` |
