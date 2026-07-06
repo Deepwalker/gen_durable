@@ -105,7 +105,9 @@ defmodule GenDurable.PerfTest do
     id = setup_executing()
 
     sql =
-      statements(fn -> Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1) end)
+      statements(fn ->
+        Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1, :keep)
+      end)
 
     assert length(sql) == 1
     assert hd(sql) =~ "consumed AS"
@@ -169,7 +171,7 @@ defmodule GenDurable.PerfTest do
     new =
       bench(iters, fn ->
         reclaim(id)
-        Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1)
+        Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1, :keep)
       end)
 
     old =

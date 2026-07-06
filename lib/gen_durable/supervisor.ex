@@ -34,6 +34,16 @@ defmodule GenDurable.Supervisor do
       `[stripe: [allowed: 100, period: {1, :minute}], emails: [allowed: 5, period: 60, burst: 10]]`.
       `allowed`/`period` set the sustained rate; `burst` (default `allowed`) the capacity.
       A step opts into a limit by returning `rate_limit: :stripe` (or `{:stripe, key}`).
+    * `:concurrency_limits` — named concurrency caps for `concurrency_key` (default
+      `[]`), e.g. `[stripe: [limit: 1000, shards: 10]]`: at most `limit` concurrent
+      executions per key whose name matches (`concurrency_key: {:stripe, tenant}` ⇒
+      key `"stripe:tenant"`, name `"stripe"`). An unconfigured key keeps the default
+      limit of 1 (mutual exclusion). `shards` (default 1) splits the cap across
+      bucket rows — completions of one key serialize per shard, so size
+      `shards ≥ limit × commit_latency / step_duration`. **Careful**: a config name
+      captures every key with that prefix — configuring a name that collides with
+      identity-style keys (e.g. `order:` used for mutual exclusion) silently raises
+      their limit and breaks the exclusion.
 
   `:prefetch`, `:min_demand`, and `:max_poll_interval` are the feeder
   aggressiveness knobs and apply to every queue; see `GenDurable.Scheduler` for
@@ -56,7 +66,8 @@ defmodule GenDurable.Supervisor do
     min_demand: 1,
     max_poll_interval: 5_000,
     drain_timeout: 5_000,
-    rate_limits: []
+    rate_limits: [],
+    concurrency_limits: []
   ]
 
   def start_link(opts) do
@@ -86,8 +97,14 @@ defmodule GenDurable.Supervisor do
     # against a stopped engine are legal, the rows wait in the database.
     :persistent_term.put({GenDurable, name}, config)
 
-    # Seed the rate-limit policy table so the picker can join it. No-op when empty.
+    # Seed the policy tables so the picker can join them. No-ops when empty.
     :ok = GenDurable.Queries.upsert_rate_configs(repo, rate_configs)
+
+    :ok =
+      GenDurable.Queries.upsert_concurrency_configs(
+        repo,
+        parse_concurrency_limits(Keyword.fetch!(opts, :concurrency_limits))
+      )
 
     task_sup = Module.concat(name, TaskSupervisor)
 
@@ -158,6 +175,19 @@ defmodule GenDurable.Supervisor do
         rate: allowed / period,
         burst: Keyword.get(cfg, :burst, allowed) * 1.0
       }
+    end
+  end
+
+  # `[stripe: [limit: 1000, shards: 10]]` → `[%{name, cap, shards}]`. `shards`
+  # defaults to 1 and is clamped to the cap (more shards than slots is nonsense).
+  defp parse_concurrency_limits(limits) do
+    for {name, cfg} <- limits do
+      cap = Keyword.fetch!(cfg, :limit)
+
+      if not is_integer(cap) or cap < 1,
+        do: raise(ArgumentError, "concurrency limit #{inspect(name)} must be a positive integer")
+
+      %{name: to_string(name), cap: cap, shards: cfg |> Keyword.get(:shards, 1) |> min(cap)}
     end
   end
 

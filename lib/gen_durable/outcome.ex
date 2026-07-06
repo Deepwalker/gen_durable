@@ -30,13 +30,16 @@ defmodule GenDurable.Outcome do
 
   @spec validate(term()) :: {:ok, t()} | {:error, {:bad_outcome, term()}}
   def validate({:next, step, state}) when is_binary(step) or is_atom(step),
-    do: {:ok, {:next, to_string(step), state, %{rate_limit: nil, weight: 1}}}
+    do:
+      {:ok,
+       {:next, to_string(step), state, %{rate_limit: nil, weight: 1, concurrency_key: :keep}}}
 
   def validate({:next, step, state, opts})
       when (is_binary(step) or is_atom(step)) and is_list(opts) do
     with {:ok, rl} <- normalize_rate_limit(Keyword.get(opts, :rate_limit)),
-         {:ok, w} <- normalize_weight(Keyword.get(opts, :weight)) do
-      {:ok, {:next, to_string(step), state, %{rate_limit: rl, weight: w}}}
+         {:ok, w} <- normalize_weight(Keyword.get(opts, :weight)),
+         {:ok, ck} <- normalize_concurrency_key(Keyword.fetch(opts, :concurrency_key)) do
+      {:ok, {:next, to_string(step), state, %{rate_limit: rl, weight: w, concurrency_key: ck}}}
     else
       :error -> {:error, {:bad_outcome, {:next, step, state, opts}}}
     end
@@ -89,6 +92,13 @@ defmodule GenDurable.Outcome do
   defp normalize_weight(nil), do: {:ok, 1}
   defp normalize_weight(w) when is_number(w) and w > 0, do: {:ok, w}
   defp normalize_weight(_), do: :error
+
+  # concurrency_key on :next — absent means KEEP the current key (identity keys
+  # persist across steps, unlike the per-step rate_limit); an explicit nil
+  # releases it, a value sets it (same nil | name | {name, partition} shapes).
+  defp normalize_concurrency_key(:error), do: {:ok, :keep}
+  defp normalize_concurrency_key({:ok, nil}), do: {:ok, nil}
+  defp normalize_concurrency_key({:ok, value}), do: normalize_rate_limit(value)
 
   @spec validate!(term()) :: t()
   def validate!(outcome) do

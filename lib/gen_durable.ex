@@ -48,6 +48,9 @@ defmodule GenDurable do
     * `[:gen_durable, :concurrency, :contended]` — a cross-node claim race on a
       concurrency_key hit the unique arbiter and the pick retried. Measurements
       `%{count}`; metadata `%{queue}`.
+    * `[:gen_durable, :concurrency, :throttled]` — a concurrency gate admitted fewer
+      rows than wanted in a pick (the cap is biting). Measurements
+      `%{wanted, admitted}`; metadata `%{key, queue}`.
     * `[:gen_durable, :outcome, :stale]` — a worker committed an outcome for a row
       it no longer owns (its lease expired and the row was reclaimed while the step
       ran); the outcome was dropped and the current claimant redoes the step.
@@ -56,8 +59,9 @@ defmodule GenDurable do
       `%{count}`; metadata `%{}`.
     * `[:gen_durable, :await, :timeout]` — parked instances whose await deadline
       fired were woken (a wake, not a failure). Measurements `%{count}`; metadata `%{}`.
-    * `[:gen_durable, :gc, :swept]` — a GC sweep deleted something. Measurements
-      `%{count, buckets}` (terminal rows and stale rate buckets); metadata `%{}`.
+    * `[:gen_durable, :gc, :swept]` — a GC sweep deleted or repaired something.
+      Measurements `%{count, buckets, gates}` (terminal rows, stale rate buckets,
+      reconciled/swept concurrency-gate buckets); metadata `%{}`.
     * `[:gen_durable, :rate_limit, :throttled]` — a rate-limit bucket granted fewer rows
       than wanted in a pick. Measurements `%{wanted, granted}`; metadata
       `%{key, queue}`. The signal that a limit is biting.
@@ -151,7 +155,10 @@ defmodule GenDurable do
       state_json: State.cast(state_module, opts[:state] || opts[:args] || %{}),
       queue: opts[:queue] || fsm_module.__gd_queue__(),
       priority: opts[:priority] || 0,
-      concurrency_key: opts[:concurrency_key],
+      # same nil | name | {name, partition} shapes as :rate_limit; a name with a
+      # `concurrency_limits:` config makes the key a gate (semaphore of size
+      # `limit`), an unconfigured key defaults to mutual exclusion (limit 1)
+      concurrency_key: rate_limit_key(opts[:concurrency_key]),
       correlation_key: opts[:correlation_key],
       correlation_scope: correlation_scope(opts),
       rate_limit: rate_limit_key(opts[:rate_limit]),

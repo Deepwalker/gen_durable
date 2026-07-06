@@ -84,6 +84,7 @@ The engine is started as `{GenDurable, opts}`:
 | `:fsms` | `[]` | modules to register — only for a custom `:name` or versioning |
 | `:queues` | `[default: 10]` | `queue_name => concurrency` |
 | `:rate_limits` | `[]` | named [token-bucket limits](rate_limiting.md) |
+| `:concurrency_limits` | `[]` | named [concurrency gates](concurrency.md) for `concurrency_key` (`[api: [limit: 100, shards: 1]]`) |
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows |
 | `:poll_interval` | `1_000` | base ms between idle polls |
@@ -118,9 +119,10 @@ Attach to these `[:gen_durable, …]` events:
 | `[:scheduler, :drain]` | graceful queue shutdown | `%{released, in_flight}` / `%{queue}` |
 | `[:scheduler, :reclaimed]` | startup reclaim of a dead predecessor's claims | `%{count}` / `%{queue}` |
 | `[:concurrency, :contended]` | a cross-node [concurrency_key](concurrency.md) claim race; the pick retried | `%{count}` / `%{queue}` |
+| `[:concurrency, :throttled]` | a [concurrency gate](concurrency.md) admitted fewer than wanted | `%{wanted, admitted}` / `%{key, queue}` |
 | `[:outcome, :stale]` | a reclaimed row rejected its old worker's outcome | `%{count}` / `%{id, fsm, step, kind}` |
 | `[:reaper, :reaped]` | expired leases reclaimed | `%{count}` / `%{}` |
 | `[:await, :timeout]` | [await deadlines](signals.md#timeouts) fired | `%{count}` / `%{}` |
-| `[:gc, :swept]` | terminal rows / stale rate buckets deleted | `%{count, buckets}` / `%{}` |
+| `[:gc, :swept]` | terminal rows / stale buckets deleted, gate counters reconciled | `%{count, buckets, gates}` / `%{}` |
 | `[:rate_limit, :throttled]` | a [bucket](rate_limiting.md) bit | `%{wanted, granted}` / `%{key, queue}` |
 | `[:rate_limit, :unknown]` | a step named an unconfigured limit | `%{count}` / `%{key, name, fsm, step}` |

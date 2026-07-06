@@ -175,7 +175,8 @@ defmodule GenDurable.Executor do
             state_json,
             consumed,
             opts.rate_limit,
-            opts.weight
+            opts.weight,
+            opts.concurrency_key
           )
 
         {:retry, state_json, delay} ->

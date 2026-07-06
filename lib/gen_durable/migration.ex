@@ -83,7 +83,18 @@ defmodule GenDurable.Migration do
 
       queue         text     not null default 'default',
       priority      smallint not null default 0,
-      concurrency_key text,
+
+      -- concurrency_key: a semaphore of size K on the key. K comes from the
+      -- `concurrency_limits:` config by name (split_part(key, ':', 1)); an
+      -- unconfigured key defaults to K = 1 (mutual exclusion). concurrency_shard
+      -- is set at claim time for CONFIGURED keys only (which bucket shard the
+      -- slot was drawn from — the release credits it back addressed); its
+      -- NULLness is also the tier discriminator: unconfigured claims keep it
+      -- NULL and are fenced by the unique index below, configured claims are
+      -- fenced by the bucket CHECK instead.
+      concurrency_key   text,
+      concurrency_shard smallint,
+
       eligible_at   timestamptz not null default now(),
       attempt       int  not null default 0,
       last_error    text,
@@ -139,17 +150,19 @@ defmodule GenDurable.Migration do
       WHERE status = 'awaiting_signal' AND await_deadline IS NOT NULL
     """)
 
-    # concurrency_key serialization, enforced by the database: at most ONE
-    # executing row per key can ever be committed. The picker's NOT EXISTS guard
-    # reads it as an optimization; the UNIQUE arbiter is the correctness — a
-    # cross-node claim race ends in a unique violation and the losing pick
-    # retries. The "lock" is the row's own executing status, so it spans exactly
-    # the step window and releases with any outcome (or the reaper, on a crash).
-    # Scoped to non-null keys: a non-keyed claim (the common case) never writes
-    # to this index.
+    # The K = 1 tier of concurrency_key (unconfigured keys), enforced by the
+    # database: at most ONE executing row per key can ever be committed. The
+    # picker's NOT EXISTS guard reads it as an optimization; the UNIQUE arbiter
+    # is the correctness — a cross-node claim race ends in a unique violation
+    # and the losing pick retries. The "lock" is the row's own executing status,
+    # so it spans exactly the step window and releases with any outcome (or the
+    # reaper, on a crash). Configured (gated) keys claim with a non-null
+    # concurrency_shard and drop out of this index — their cap is the bucket
+    # CHECK below. Non-keyed claims (the common case) never write to it.
     execute("""
     CREATE UNIQUE INDEX gen_durable_concurrency_active ON #{p}.gen_durable (concurrency_key)
       WHERE status = 'executing' AND concurrency_key IS NOT NULL
+        AND concurrency_shard IS NULL
     """)
 
     # correlation_key: one partial unique index does double duty — it enforces
@@ -204,9 +217,40 @@ defmodule GenDurable.Migration do
       last_refill timestamptz not null default clock_timestamp()
     )
     """)
+
+    # concurrency gates: `cap` is the whole-key limit, split across `shards`
+    # bucket rows to spread the release chains (completions of one key
+    # serialize on their shard's row lock, so shards multiply the per-key
+    # completion ceiling). Configs are seeded at engine start.
+    execute("""
+    CREATE TABLE #{p}.gen_durable_concurrency_configs (
+      name   text primary key,
+      cap    int not null,
+      shards int not null
+    )
+    """)
+
+    # One row per (gate key, shard). `available` is the free-slot count for the
+    # shard; claims debit it (batched, in the pick), releases credit it back
+    # addressed (a rider in the outcome). The CHECK is the hard cap: an
+    # over-admission (or a double release) is uncommittable. Crash paths leak
+    # conservatively (available too LOW — under-admission), healed by the GC
+    # reconciler from the executing-rows truth.
+    execute("""
+    CREATE TABLE #{p}.gen_durable_concurrency_buckets (
+      key       text not null,
+      shard     smallint not null,
+      cap       int not null,
+      available int not null,
+      PRIMARY KEY (key, shard),
+      CHECK (available >= 0 AND available <= cap)
+    )
+    """)
   end
 
   defp change(1, :down, p) do
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_concurrency_buckets")
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_concurrency_configs")
     execute("DROP TABLE IF EXISTS #{p}.gen_durable_rate_buckets")
     execute("DROP TABLE IF EXISTS #{p}.gen_durable_rate_configs")
     execute("DROP TABLE IF EXISTS #{p}.signals")

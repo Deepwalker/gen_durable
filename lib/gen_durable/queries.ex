@@ -116,8 +116,37 @@ defmodule GenDurable.Queries do
   #
   # A same-key cluster filling the window can underfill the batch; completion-
   # driven refill closes the gap on the next pick.
-  # The pick combines concurrency_key dedup with token-bucket rate limiting
-  # , in one statement:
+  #
+  # The pick combines three admissions in one statement — concurrency_key K=1
+  # dedup (unconfigured keys), concurrency GATES (configured keys: a semaphore of
+  # size `cap`, sharded), and token-bucket rate limiting:
+  #
+  #   winners  — unconfigured keys keep only their rn=1 row (the K=1 window
+  #              dedup); GATED keys (name in concurrency_configs) keep ALL their
+  #              candidate rows — their admission is capacity-based, below.
+  #   c_heal   — recreate (full) a gated key's missing bucket shards (swept by
+  #              GC while the key slept); invisible to c_locked this statement,
+  #              admitted next pick. No-op on the common path.
+  #   c_locked — lock ALL bucket shards of the gated winner keys, ordered
+  #              (key, shard): grants are BATCHED — one lock pass per pick over
+  #              the aggregate capacity — while releases are addressed per shard
+  #              (see the credit riders in complete_*), which is the whole point
+  #              of sharding: completions of one key serialize per shard row.
+  #   c_ranges — cumulative admission ranges over shards, most-available first,
+  #              so claims spread across shards and their release chains stay
+  #              balanced.
+  #   c_admit  — a gated row is admitted iff its per-key rank rn falls inside
+  #              some shard's range; the shard is remembered on the row
+  #              (concurrency_shard) so the release can credit it back addressed.
+  #              Admission is computed from the LOCKED shard rows (fresh values
+  #              after any lock wait), so concurrent picks cannot over-admit;
+  #              the bucket CHECK (0 ≤ available ≤ cap) is the uncommittable
+  #              backstop on top.
+  #   pool     — the concurrency-admitted set (unconfigured rn=1 rows pass
+  #              through), which the rate CTEs below then filter further; both
+  #              writebacks are computed from the FINAL claimed set, so a row
+  #              admitted by the gate but denied by its rate limit debits
+  #              neither.
   #   cand     — top-$2 runnable rows, locked once (FOR UPDATE SKIP LOCKED via gen_durable_pick),
   #              with the per-concurrency_key window rank `rn`.
   #   winners  — the concurrency winners (rn = 1); add the cumulative weight `cw` of the urgency
@@ -140,34 +169,83 @@ defmodule GenDurable.Queries do
   # this reduces to the plain concurrency pick.
   @pick_sql """
   WITH cand AS (
-    SELECT id, rate_limit, weight, priority, eligible_at,
+    SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at,
            row_number() OVER (PARTITION BY coalesce('k:' || concurrency_key, 'i:' || id::text)
                               ORDER BY priority, eligible_at) AS rn
     FROM (
       SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at
       FROM gen_durable g
       WHERE g.status = 'runnable' AND g.eligible_at <= now() AND g.queue = $1
-        AND (g.concurrency_key IS NULL OR NOT EXISTS (
-          SELECT 1 FROM gen_durable e
-          WHERE e.concurrency_key = g.concurrency_key AND e.status = 'executing'
-        ))
+        AND (g.concurrency_key IS NULL
+             OR EXISTS (SELECT 1 FROM gen_durable_concurrency_configs cc
+                        WHERE cc.name = split_part(g.concurrency_key, ':', 1))
+             OR NOT EXISTS (
+               SELECT 1 FROM gen_durable e
+               WHERE e.concurrency_key = g.concurrency_key AND e.status = 'executing'))
       ORDER BY g.priority, g.eligible_at
       FOR UPDATE SKIP LOCKED
       LIMIT $2
     ) s
   ),
   winners AS (
-    SELECT id, rate_limit AS rkey,
-           sum(weight) OVER (PARTITION BY rate_limit
-                             ORDER BY priority, eligible_at, id
+    SELECT c.id, c.concurrency_key, c.rate_limit, c.weight, c.priority, c.eligible_at, c.rn,
+           (cc.name IS NOT NULL) AS gated
+    FROM cand c
+    LEFT JOIN gen_durable_concurrency_configs cc
+           ON cc.name = split_part(c.concurrency_key, ':', 1)
+    WHERE c.rn = 1 OR cc.name IS NOT NULL
+  ),
+  c_heal AS (
+    INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available)
+    SELECT k.concurrency_key, s.shard,
+           (cc.cap / cc.shards) + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END,
+           (cc.cap / cc.shards) + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END
+    FROM (SELECT DISTINCT concurrency_key FROM winners WHERE gated) k
+    JOIN gen_durable_concurrency_configs cc ON cc.name = split_part(k.concurrency_key, ':', 1)
+    CROSS JOIN LATERAL generate_series(0, cc.shards - 1) AS s(shard)
+    WHERE NOT EXISTS (SELECT 1 FROM gen_durable_concurrency_buckets b
+                      WHERE b.key = k.concurrency_key)
+    ORDER BY k.concurrency_key, s.shard
+    ON CONFLICT (key, shard) DO NOTHING
+  ),
+  c_locked AS (
+    SELECT b.key, b.shard, b.available
+    FROM gen_durable_concurrency_buckets b
+    JOIN (SELECT DISTINCT concurrency_key FROM winners WHERE gated) k
+      ON k.concurrency_key = b.key
+    ORDER BY b.key, b.shard
+    FOR UPDATE OF b
+  ),
+  c_ranges AS (
+    SELECT key, shard, available,
+           sum(available) OVER (PARTITION BY key ORDER BY available DESC, shard
+                                ROWS UNBOUNDED PRECEDING) AS hi
+    FROM c_locked
+  ),
+  c_admit AS (
+    SELECT w.id, r.shard
+    FROM winners w
+    JOIN c_ranges r ON r.key = w.concurrency_key
+                   AND w.rn > r.hi - r.available AND w.rn <= r.hi
+    WHERE w.gated
+  ),
+  pool AS (
+    SELECT w.id, w.concurrency_key, w.rate_limit AS rkey, w.weight,
+           w.priority, w.eligible_at, w.gated, a.shard AS c_shard
+    FROM winners w
+    LEFT JOIN c_admit a ON a.id = w.id
+    WHERE (NOT w.gated) OR a.id IS NOT NULL
+  ),
+  rw AS (
+    SELECT id, rkey, c_shard,
+           sum(weight) OVER (PARTITION BY rkey ORDER BY priority, eligible_at, id
                              ROWS UNBOUNDED PRECEDING) AS cw
-    FROM cand
-    WHERE rn = 1
+    FROM pool
   ),
   heal AS (
     INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
     SELECT k.rkey, cfg.burst, clock_timestamp()
-    FROM (SELECT DISTINCT rkey FROM winners WHERE rkey IS NOT NULL) k
+    FROM (SELECT DISTINCT rkey FROM rw WHERE rkey IS NOT NULL) k
     JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k.rkey, ':', 1)
     WHERE NOT EXISTS (SELECT 1 FROM gen_durable_rate_buckets b WHERE b.key = k.rkey)
     ORDER BY k.rkey
@@ -176,7 +254,7 @@ defmodule GenDurable.Queries do
   locked AS (
     SELECT b.key, b.tokens, b.last_refill, cfg.burst, cfg.rate
     FROM gen_durable_rate_buckets b
-    JOIN (SELECT DISTINCT rkey FROM winners WHERE rkey IS NOT NULL) k ON k.rkey = b.key
+    JOIN (SELECT DISTINCT rkey FROM rw WHERE rkey IS NOT NULL) k ON k.rkey = b.key
     JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(b.key, ':', 1)
     ORDER BY b.key
     FOR UPDATE OF b
@@ -186,7 +264,7 @@ defmodule GenDurable.Queries do
     FROM locked
   ),
   granted AS (
-    SELECT w.id, w.rkey, w.cw FROM winners w JOIN avail a ON a.key = w.rkey WHERE w.cw <= a.avail
+    SELECT w.id, w.rkey, w.cw FROM rw w JOIN avail a ON a.key = w.rkey WHERE w.cw <= a.avail
   ),
   consumed AS (
     SELECT rkey AS key, max(cw) AS consumed FROM granted GROUP BY rkey
@@ -199,18 +277,35 @@ defmodule GenDurable.Queries do
   ),
   claimed AS (
     UPDATE gen_durable g
-    SET status = 'executing', locked_by = $3,
+    SET status = 'executing', locked_by = $3, concurrency_shard = p.c_shard,
         lease_expires_at = now() + $4::int * interval '1 millisecond', updated_at = now()
-    FROM winners w LEFT JOIN granted gr ON gr.id = w.id
-    WHERE g.id = w.id AND (w.rkey IS NULL OR gr.id IS NOT NULL)
-    RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key, g.awaits
+    FROM rw p LEFT JOIN granted gr ON gr.id = p.id
+    WHERE g.id = p.id AND (p.rkey IS NULL OR gr.id IS NOT NULL)
+    RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key,
+              g.awaits, g.concurrency_shard
+  ),
+  c_writeback AS (
+    UPDATE gen_durable_concurrency_buckets b
+    SET available = b.available - d.cnt
+    FROM (SELECT c.concurrency_key AS key, c.concurrency_shard AS shard, count(*) AS cnt
+          FROM claimed c
+          WHERE c.concurrency_shard IS NOT NULL
+          GROUP BY 1, 2) d
+    WHERE b.key = d.key AND b.shard = d.shard
   ),
   throttled AS (
     SELECT w.rkey AS key, count(*) AS wanted, count(gr.id) AS granted
-    FROM winners w LEFT JOIN granted gr ON gr.id = w.id
+    FROM rw w LEFT JOIN granted gr ON gr.id = w.id
     WHERE w.rkey IS NOT NULL
     GROUP BY w.rkey
     HAVING count(*) > count(gr.id)
+  ),
+  c_throttled AS (
+    SELECT w.concurrency_key AS key, count(*) AS wanted, count(a.id) AS admitted
+    FROM winners w LEFT JOIN c_admit a ON a.id = w.id
+    WHERE w.gated
+    GROUP BY 1
+    HAVING count(*) > count(a.id)
   )
   SELECT 0 AS tag, id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits,
          NULL::text AS rkey, NULL::bigint AS wanted, NULL::bigint AS granted
@@ -219,6 +314,10 @@ defmodule GenDurable.Queries do
   SELECT 1, NULL::bigint, NULL::text, NULL::int, NULL::text, NULL::jsonb, NULL::int, NULL::text,
          NULL::text[], key, wanted, granted
   FROM throttled
+  UNION ALL
+  SELECT 2, NULL::bigint, NULL::text, NULL::int, NULL::text, NULL::jsonb, NULL::int, NULL::text,
+         NULL::text[], key, wanted, admitted
+  FROM c_throttled
   """
 
   def pick(repo, queue, batch, worker, lease_ttl_ms),
@@ -234,15 +333,17 @@ defmodule GenDurable.Queries do
   # round claims nothing and the next poll tries again.
   defp pick(repo, queue, batch, worker, lease_ttl_ms, attempts) do
     %{rows: rows} = q!(repo, "pick", @pick_sql, [queue, batch, worker, lease_ttl_ms])
-    {jobs, throttles} = Enum.split_with(rows, fn [tag | _] -> tag == 0 end)
+    jobs = Enum.filter(rows, fn [tag | _] -> tag == 0 end)
 
-    # a bucket that wanted more than it granted is biting — observable.
-    for [_, _, _, _, _, _, _, _, _, key, wanted, granted] <- throttles do
-      :telemetry.execute(
-        [:gen_durable, :rate_limit, :throttled],
-        %{wanted: wanted, granted: granted},
-        %{key: key, queue: queue}
-      )
+    # a limit that wanted more than it admitted is biting — observable.
+    for [tag, _, _, _, _, _, _, _, _, key, wanted, granted] <- rows, tag in [1, 2] do
+      {event, measurements} =
+        case tag do
+          1 -> {[:gen_durable, :rate_limit, :throttled], %{wanted: wanted, granted: granted}}
+          2 -> {[:gen_durable, :concurrency, :throttled], %{wanted: wanted, admitted: granted}}
+        end
+
+      :telemetry.execute(event, measurements, %{key: key, queue: queue})
     end
 
     enrich(repo, Enum.map(jobs, &to_job(&1, worker)))
@@ -557,12 +658,35 @@ defmodule GenDurable.Queries do
   SELECT count(*) FROM terminal
   """
 
+  # The concurrency-gate release, a rider CTE of every outcome: the row is
+  # leaving `executing`, so its slot is credited back to the shard it was drawn
+  # from. The OLD key/shard are read from the TABLE — sibling CTEs see the
+  # statement snapshot, never the outcome UPDATE's writes, so this is the
+  # pre-transition value even when the outcome rewrites the key — and the join
+  # on the guarded CTE (`src`) gates it: a stale outcome credits nothing. A
+  # missing bucket (swept) drops the credit in the conservative direction
+  # (under-admission), healed by the GC reconciler.
+  defp credit_gate(src) do
+    "credit AS (UPDATE gen_durable_concurrency_buckets b " <>
+      "SET available = available + 1 " <>
+      "FROM gen_durable old JOIN #{src} gc ON gc.id = old.id " <>
+      "WHERE old.concurrency_shard IS NOT NULL " <>
+      "AND b.key = old.concurrency_key AND b.shard = old.concurrency_shard)"
+  end
+
   # :next sets the row's rate_limit key ($5, NULL ⇒ not limited) and weight ($6) for the
   # next step, and ensures the bucket exists (full) so the picker's locked reserve
   # never races a missing row. The `ensure` CTE no-ops when $5 is NULL (split_part(NULL,…) is
   # NULL ⇒ matches no config), when the bucket already exists (ON CONFLICT DO
   # NOTHING), or when the ownership guard failed (committed empty).
-  def complete_next(repo, id, worker, step, state_json, consumed_ids, rate_limit, weight) do
+  #
+  # `concurrency_key` is :keep (the default — identity keys persist across
+  # steps), nil (release the key for the next steps), or a new key. The shard is
+  # always cleared (the row leaves executing; a re-claim assigns a fresh one)
+  # and the old slot is credited via the `credit` rider.
+  def complete_next(repo, id, worker, step, state_json, consumed_ids, rate_limit, weight, ck) do
+    {ck_change, ck_value} = if ck == :keep, do: {false, nil}, else: {true, ck}
+
     %{rows: [[n]]} =
       q!(
         repo,
@@ -572,10 +696,13 @@ defmodule GenDurable.Queries do
           UPDATE gen_durable
           SET step = $2, state = $3::text::jsonb, status = 'runnable', eligible_at = now(),
               attempt = 0, awaits = null, rate_limit = $5, weight = $6,
+              concurrency_key = CASE WHEN $8::bool THEN $9 ELSE concurrency_key END,
+              concurrency_shard = null,
               locked_by = null, lease_expires_at = null, updated_at = now()
           WHERE id = $1 AND locked_by = $7 AND status = 'executing'
           RETURNING id
         ),
+        #{credit_gate("committed")},
         ensure AS (
           INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
           SELECT $5, cfg.burst, clock_timestamp()
@@ -589,26 +716,32 @@ defmodule GenDurable.Queries do
         )
         SELECT count(*) FROM committed
         """,
-        [id, step, state_json, consumed_ids, rate_limit, weight, worker]
+        [id, step, state_json, consumed_ids, rate_limit, weight, worker, ck_change, ck_value]
       )
 
     committed?(n)
   end
 
   # :retry redoes the same step, so it consumes nothing and KEEPS `awaits` — the
-  # redo must see the same awaited signals it was handed.
+  # redo must see the same awaited signals it was handed. The gate slot is
+  # released (the row leaves executing); the redo re-claims through admission.
   def complete_retry(repo, id, worker, state_json, delay_ms) do
-    %{num_rows: n} =
+    %{rows: [[n]]} =
       q!(
         repo,
         "complete_retry",
         """
-        UPDATE gen_durable
-        SET state = $2::text::jsonb, status = 'runnable',
-            eligible_at = now() + $3::int * interval '1 millisecond',
-            attempt = attempt + 1, locked_by = null, lease_expires_at = null,
-            updated_at = now()
-        WHERE id = $1 AND locked_by = $4 AND status = 'executing'
+        WITH committed AS (
+          UPDATE gen_durable
+          SET state = $2::text::jsonb, status = 'runnable',
+              eligible_at = now() + $3::int * interval '1 millisecond',
+              attempt = attempt + 1, concurrency_shard = null,
+              locked_by = null, lease_expires_at = null, updated_at = now()
+          WHERE id = $1 AND locked_by = $4 AND status = 'executing'
+          RETURNING id
+        ),
+        #{credit_gate("committed")}
+        SELECT count(*) FROM committed
         """,
         [id, state_json, delay_ms, worker]
       )
@@ -652,17 +785,23 @@ defmodule GenDurable.Queries do
   def complete_await(repo, id, worker, state_json, names, next_step, presented_ids, timeout_ms) do
     {:ok, result} =
       repo.transaction(fn ->
-        %{num_rows: parked} =
+        %{rows: [[parked]]} =
           q!(
             repo,
             "await_park",
             """
-            UPDATE gen_durable
-            SET step = $4, state = $2::text::jsonb, awaits = $3::text[], eligible_at = now(),
-                status = 'awaiting_signal', attempt = 0, rate_limit = null, weight = 1,
-                await_deadline = now() + $6::int * interval '1 millisecond',
-                locked_by = null, lease_expires_at = null, updated_at = now()
-            WHERE id = $1 AND locked_by = $5 AND status = 'executing'
+            WITH park AS (
+              UPDATE gen_durable
+              SET step = $4, state = $2::text::jsonb, awaits = $3::text[], eligible_at = now(),
+                  status = 'awaiting_signal', attempt = 0, rate_limit = null, weight = 1,
+                  concurrency_shard = null,
+                  await_deadline = now() + $6::int * interval '1 millisecond',
+                  locked_by = null, lease_expires_at = null, updated_at = now()
+              WHERE id = $1 AND locked_by = $5 AND status = 'executing'
+              RETURNING id
+            ),
+            #{credit_gate("park")}
+            SELECT count(*) FROM park
             """,
             [id, state_json, names, next_step, worker, timeout_ms]
           )
@@ -702,10 +841,12 @@ defmodule GenDurable.Queries do
         WITH terminal AS (
           UPDATE gen_durable
           SET result = $2::text::jsonb, status = 'done', awaits = null,
+              concurrency_shard = null,
               locked_by = null, lease_expires_at = null, updated_at = now()
           WHERE id = $1 AND locked_by = $3 AND status = 'executing'
           RETURNING id, parent_id
         ),
+        #{credit_gate("terminal")},
         consumed AS (
           DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
         ),
@@ -725,10 +866,12 @@ defmodule GenDurable.Queries do
         WITH terminal AS (
           UPDATE gen_durable
           SET status = 'failed', last_error = $2, awaits = null,
+              concurrency_shard = null,
               locked_by = null, lease_expires_at = null, updated_at = now()
           WHERE id = $1 AND locked_by = $3 AND status = 'executing'
           RETURNING id, parent_id
         ),
+        #{credit_gate("terminal")},
         consumed AS (
           DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
         ),
@@ -753,10 +896,12 @@ defmodule GenDurable.Queries do
           UPDATE gen_durable
           SET step = $2, state = $3::text::jsonb, children_pending = 0, status = 'runnable',
               eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1,
+              concurrency_shard = null,
               locked_by = null, lease_expires_at = null, updated_at = now()
           WHERE id = $1 AND locked_by = $5 AND status = 'executing'
           RETURNING id
         ),
+        #{credit_gate("committed")},
         consumed AS (
           DELETE FROM signals
           WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
@@ -790,11 +935,15 @@ defmodule GenDurable.Queries do
     sql =
       "WITH claim AS (SELECT id FROM gen_durable " <>
         "WHERE id = $1 AND locked_by = $18 AND status = 'executing' FOR UPDATE), " <>
+        credit_gate("claim") <>
+        ", " <>
         "ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
         "SELECT k, cfg.burst, clock_timestamp() FROM unnest($5::text[]) k " <>
         "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
         "WHERE EXISTS (SELECT 1 FROM claim) " <>
         "ORDER BY k ON CONFLICT (key) DO NOTHING), " <>
+        ensure_gates_cte(19) <>
+        ", " <>
         "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
         "AND id = ANY($4::bigint[])), " <>
         "ins AS (INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>
@@ -810,12 +959,13 @@ defmodule GenDurable.Queries do
         "status = (CASE WHEN (SELECT n FROM cnt) = 0 THEN 'runnable' " <>
         "ELSE 'awaiting_children' END)::durable_status, " <>
         "eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1, " <>
+        "concurrency_shard = null, " <>
         "locked_by = null, lease_expires_at = null, updated_at = now() " <>
         "WHERE id IN (SELECT id FROM claim)"
 
     args =
       [parent_id, next_step, state_json, consumed_ids, bucket_keys(children)] ++
-        column_arrays(children) ++ [worker]
+        column_arrays(children) ++ [worker, gate_keys(children)]
 
     %{num_rows: n} = q!(repo, "schedule_childs", sql, args)
     committed?(n)
@@ -906,14 +1056,39 @@ defmodule GenDurable.Queries do
   # ORDER BY k: deterministic insertion order — two statements creating the same new
   # keys via the arbiter index in opposite orders would deadlock.
   defp ensure_buckets_cte(n) do
-    "WITH ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
+    "ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
       "SELECT k, cfg.burst, clock_timestamp() FROM unnest($#{n}::text[]) k " <>
       "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
-      "ORDER BY k ON CONFLICT (key) DO NOTHING) "
+      "ORDER BY k ON CONFLICT (key) DO NOTHING)"
+  end
+
+  # Ensure a gated concurrency_key's bucket shards exist (full) at insert time,
+  # so its first pick can grant without the heal-lag. `$n` is a text[] of the
+  # rows' distinct concurrency keys; unconfigured names simply don't join the
+  # configs and cost nothing. Per-shard cap distributes the remainder to the
+  # low shards. Ordered insert (arbiter-deadlock discipline).
+  defp ensure_gates_cte(n) do
+    "c_ensure AS (INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available) " <>
+      "SELECT k, s.shard, " <>
+      "cc.cap / cc.shards + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END, " <>
+      "cc.cap / cc.shards + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END " <>
+      "FROM unnest($#{n}::text[]) k " <>
+      "JOIN gen_durable_concurrency_configs cc ON cc.name = split_part(k, ':', 1) " <>
+      "CROSS JOIN LATERAL generate_series(0, cc.shards - 1) AS s(shard) " <>
+      "WHERE NOT EXISTS (SELECT 1 FROM gen_durable_concurrency_buckets b WHERE b.key = k) " <>
+      "ORDER BY k, s.shard ON CONFLICT (key, shard) DO NOTHING)"
   end
 
   defp bucket_keys(rows),
     do: rows |> Enum.map(& &1.rate_limit) |> Enum.reject(&is_nil/1) |> Enum.uniq() |> Enum.sort()
+
+  defp gate_keys(rows),
+    do:
+      rows
+      |> Enum.map(& &1.concurrency_key)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.sort()
 
   # Seed/refresh the rate-limit policy table at engine start. `configs` is a list of
   # `%{name, rate, burst}`. Idempotent: re-running with changed numbers updates them.
@@ -941,15 +1116,153 @@ defmodule GenDurable.Queries do
     :ok
   end
 
+  # Seed/refresh the concurrency-gate policy table at engine start. `configs` is
+  # a list of `%{name, cap, shards}`. Sorted by name (DO UPDATE locks rows in
+  # VALUES order — arbiter-deadlock discipline). Bucket rows pick up a changed
+  # cap/shards lazily via the GC reconciler.
+  def upsert_concurrency_configs(_repo, []), do: :ok
+
+  def upsert_concurrency_configs(repo, configs) when is_list(configs) do
+    configs = Enum.sort_by(configs, & &1.name)
+
+    values =
+      configs
+      |> Enum.with_index()
+      |> Enum.map_join(", ", fn {_c, i} -> "($#{i * 3 + 1}, $#{i * 3 + 2}, $#{i * 3 + 3})" end)
+
+    args = Enum.flat_map(configs, &[&1.name, &1.cap, &1.shards])
+
+    repo.query!(
+      "INSERT INTO gen_durable_concurrency_configs (name, cap, shards) VALUES " <>
+        values <>
+        " ON CONFLICT (name) DO UPDATE SET cap = EXCLUDED.cap, shards = EXCLUDED.shards",
+      args
+    )
+
+    :ok
+  end
+
+  # The GC-riding healer for concurrency gates — the counters' source of truth
+  # is the executing rows themselves, so any drift (crash leaks — conservative,
+  # available too low; config cap/shards changes; bugs) is periodically repaired
+  # from it. Exactness needs the park+recheck trick: lock the bucket rows first
+  # (ordered SKIP LOCKED — a busy bucket is being actively debited/credited, skip
+  # it until the next sweep), then, in FRESH-snapshot statements while the locks
+  # are held (claims and credits of the locked keys wait on them), recompute and
+  # repair. The final statement sweeps orphaned buckets (config removed, shard
+  # out of range) and whole idle-full keys — deletable because the ensure/heal
+  # CTEs recreate buckets FULL, which is exactly their idle state; deletion is
+  # all-shards-or-nothing per key, because the pick's heal only recreates keys
+  # with NO bucket rows at all. Returns the number of repaired + deleted rows.
+  def reconcile_concurrency(repo) do
+    {:ok, n} =
+      repo.transaction(fn ->
+        %{rows: locked} =
+          q!(
+            repo,
+            "conc_lock",
+            """
+            SELECT key, shard FROM gen_durable_concurrency_buckets
+            ORDER BY key, shard
+            FOR UPDATE SKIP LOCKED
+            """,
+            []
+          )
+
+        case locked do
+          [] ->
+            0
+
+          pairs ->
+            keys = Enum.map(pairs, &hd/1)
+            shards = Enum.map(pairs, &Enum.at(&1, 1))
+
+            %{num_rows: healed} =
+              q!(
+                repo,
+                "conc_heal",
+                """
+                WITH tgt AS (SELECT k, s FROM unnest($1::text[], $2::int[]) AS t(k, s)),
+                held AS (
+                  SELECT g.concurrency_key AS k, g.concurrency_shard AS s, count(*) AS n
+                  FROM gen_durable g
+                  WHERE g.status = 'executing' AND g.concurrency_shard IS NOT NULL
+                  GROUP BY 1, 2
+                )
+                UPDATE gen_durable_concurrency_buckets b
+                SET cap = calc.cap, available = calc.available
+                FROM (
+                  SELECT t.k, t.s,
+                         (cc.cap / cc.shards +
+                          CASE WHEN t.s < (cc.cap % cc.shards) THEN 1 ELSE 0 END) AS cap,
+                         GREATEST(0, cc.cap / cc.shards +
+                          CASE WHEN t.s < (cc.cap % cc.shards) THEN 1 ELSE 0 END
+                          - coalesce(h.n, 0)) AS available
+                  FROM tgt t
+                  JOIN gen_durable_concurrency_configs cc ON cc.name = split_part(t.k, ':', 1)
+                  LEFT JOIN held h ON h.k = t.k AND h.s = t.s
+                  WHERE t.s < cc.shards
+                ) calc
+                WHERE b.key = calc.k AND b.shard = calc.s
+                  AND (b.cap <> calc.cap OR b.available <> calc.available)
+                """,
+                [keys, shards]
+              )
+
+            %{num_rows: deleted} =
+              q!(
+                repo,
+                "conc_sweep",
+                """
+                WITH tgt AS (SELECT k, s FROM unnest($1::text[], $2::int[]) AS t(k, s)),
+                orphan AS (
+                  SELECT t.k, t.s
+                  FROM tgt t
+                  LEFT JOIN gen_durable_concurrency_configs cc
+                         ON cc.name = split_part(t.k, ':', 1)
+                  WHERE (cc.name IS NULL OR t.s >= cc.shards)
+                    AND NOT EXISTS (SELECT 1 FROM gen_durable g
+                                    WHERE g.status = 'executing'
+                                      AND g.concurrency_key = t.k
+                                      AND g.concurrency_shard = t.s)
+                ),
+                idle AS (
+                  SELECT b.key
+                  FROM gen_durable_concurrency_buckets b
+                  JOIN tgt t ON t.k = b.key AND t.s = b.shard
+                  GROUP BY b.key
+                  HAVING bool_and(b.available = b.cap)
+                     AND count(*) = (SELECT count(*) FROM gen_durable_concurrency_buckets x
+                                     WHERE x.key = b.key)
+                )
+                DELETE FROM gen_durable_concurrency_buckets b
+                USING tgt t
+                WHERE b.key = t.k AND b.shard = t.s
+                  AND ((t.k, t.s) IN (SELECT k, s FROM orphan)
+                       OR t.k IN (SELECT key FROM idle))
+                """,
+                [keys, shards]
+              )
+
+            healed + deleted
+        end
+      end)
+
+    n
+  end
+
   def insert(repo, p) do
     sql =
-      ensure_buckets_cte(12 + 1) <>
-        "INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
+      "WITH " <>
+        ensure_buckets_cte(13) <>
+        ", " <>
+        ensure_gates_cte(14) <>
+        " INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
         "($1, $2, $3, $4::text::jsonb, $5, $6, $7, COALESCE($8::timestamptz, now()), " <>
         "$9, $10::text[]::durable_status[], $11, $12)" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    case q!(repo, "insert", sql, row_args(p) ++ [bucket_keys([p])]) do
+    case q!(repo, "insert", sql, row_args(p) ++ [bucket_keys([p]), gate_keys([p])]) do
       %{rows: [[id]]} -> {:ok, id}
       %{rows: []} -> {:error, :duplicate}
     end
@@ -967,15 +1280,20 @@ defmodule GenDurable.Queries do
   # irrelevant.
   def insert_all(repo, rows) when is_list(rows) do
     sql =
-      ensure_buckets_cte(12 + 1) <>
-        "INSERT INTO gen_durable (#{@insert_cols}) " <>
+      "WITH " <>
+        ensure_buckets_cte(13) <>
+        ", " <>
+        ensure_gates_cte(14) <>
+        " INSERT INTO gen_durable (#{@insert_cols}) " <>
         @unnest_row_select <>
         " " <>
         unnest_from(0) <>
         " ORDER BY t.correlation_key" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    %{rows: out} = q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows)])
+    %{rows: out} =
+      q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows), gate_keys(rows)])
+
     List.flatten(out)
   end
 

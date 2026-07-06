@@ -139,11 +139,149 @@ defmodule GenDurable.QueriesTest do
     end
   end
 
+  describe "concurrency gates (configured concurrency_key)" do
+    setup do
+      Repo.query!("TRUNCATE gen_durable_concurrency_buckets, gen_durable_concurrency_configs")
+      :ok
+    end
+
+    defp seed_gate(name, limit, shards \\ 1),
+      do: Queries.upsert_concurrency_configs(Repo, [%{name: name, cap: limit, shards: shards}])
+
+    defp gate_buckets(key) do
+      %{rows: rows} =
+        Repo.query!(
+          "SELECT shard, cap, available FROM gen_durable_concurrency_buckets WHERE key = $1 ORDER BY shard",
+          [key]
+        )
+
+      rows
+    end
+
+    test "a configured key admits up to `limit` concurrently; a release readmits" do
+      :ok = seed_gate("api", 2)
+      for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+
+      # insert ensured the bucket (full); the pick admits exactly the cap
+      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert length(jobs) == 2
+      assert gate_buckets("api") == [[0, 2, 0]]
+
+      # gated claims carry their shard and stay OUT of the K=1 unique arbiter
+      %{rows: [[shards_set]]} =
+        Repo.query!(
+          "SELECT count(*) FROM gen_durable WHERE concurrency_key = 'api' AND status = 'executing' AND concurrency_shard IS NOT NULL"
+        )
+
+      assert shards_set == 2
+
+      # capacity exhausted ⇒ nothing more
+      assert Queries.pick(Repo, "default", 10, @worker, @ttl) == []
+
+      # a release credits the slot back, addressed — the next pick admits one
+      [j | _] = jobs
+      :ok = Queries.complete_done(Repo, j.id, @worker, ~s({}))
+      assert gate_buckets("api") == [[0, 2, 1]]
+      assert [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    end
+
+    test "a sharded gate splits the cap; releases credit their own shard" do
+      :ok = seed_gate("api", 4, 2)
+      for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+
+      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert length(jobs) == 4
+      assert gate_buckets("api") == [[0, 2, 0], [1, 2, 0]]
+
+      # complete both rows drawn from shard 0: only shard 0 refills
+      %{rows: shard0} =
+        Repo.query!(
+          "SELECT id FROM gen_durable WHERE concurrency_key = 'api' AND concurrency_shard = 0"
+        )
+
+      for [id] <- shard0, do: :ok = Queries.complete_done(Repo, id, @worker, ~s({}))
+      assert gate_buckets("api") == [[0, 2, 2], [1, 2, 0]]
+    end
+
+    test "unconfigured keys keep mutual exclusion beside a gate" do
+      :ok = seed_gate("api", 2)
+      for _ <- 1..2, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+      for _ <- 1..2, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "solo"}))
+
+      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      keys = Enum.map(jobs, & &1.concurrency_key)
+
+      assert Enum.count(keys, &(&1 == "api")) == 2
+      assert Enum.count(keys, &(&1 == "solo")) == 1
+    end
+
+    test "an exhausted gate emits [:gen_durable, :concurrency, :throttled]" do
+      :ok = seed_gate("api", 1)
+      for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+
+      handler = "gate-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:gen_durable, :concurrency, :throttled],
+        &__MODULE__.__fwd__/4,
+        self()
+      )
+
+      Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :telemetry.detach(handler)
+
+      assert_received {:telemetry, %{wanted: 3, admitted: 1}, %{key: "api", queue: "default"}}
+    end
+
+    test "reconcile heals drift from the executing truth and sweeps idle/orphaned buckets" do
+      :ok = seed_gate("api", 2)
+      {:ok, id} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert gate_buckets("api") == [[0, 2, 1]]
+
+      # simulate a crash leak (conservative direction: available too low)
+      Repo.query!("UPDATE gen_durable_concurrency_buckets SET available = 0 WHERE key = 'api'")
+      assert Queries.reconcile_concurrency(Repo) == 1
+      assert gate_buckets("api") == [[0, 2, 1]]
+
+      # an orphaned bucket (no config) with nothing executing is swept
+      Repo.query!(
+        "INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available) VALUES ('ghost:1', 0, 5, 5)"
+      )
+
+      # finish the row: the gate becomes idle-full — the whole key is swept too
+      :ok = Queries.complete_done(Repo, id, @worker, ~s({}))
+      assert Queries.reconcile_concurrency(Repo) == 2
+      assert gate_buckets("api") == []
+      assert gate_buckets("ghost:1") == []
+    end
+
+    test ":next can release or swap the concurrency_key (nil / value; default keeps)" do
+      {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_next(Repo, a, @worker, "tick", ~s({}), [], nil, 1, nil)
+
+      %{rows: [[key]]} = Repo.query!("SELECT concurrency_key FROM gen_durable WHERE id = $1", [a])
+      assert key == nil
+
+      # `a` is runnable again (key released), so the pick returns it too — we
+      # only need `b` claimed for the swap
+      {:ok, b} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
+      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert b in Enum.map(jobs, & &1.id)
+      :ok = Queries.complete_next(Repo, b, @worker, "tick", ~s({}), [], nil, 1, "k2")
+
+      %{rows: [[key]]} = Repo.query!("SELECT concurrency_key FROM gen_durable WHERE id = $1", [b])
+      assert key == "k2"
+    end
+  end
+
   test "complete_next resets attempt and returns to runnable" do
     {:ok, id} = Queries.insert(Repo, params())
     [_job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
 
-    :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({"n":1}), [], nil, 1)
+    :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({"n":1}), [], nil, 1, :keep)
 
     %{rows: [[status, step, attempt, state]]} =
       Repo.query!("SELECT status::text, step, attempt, state FROM gen_durable WHERE id = $1", [id])
@@ -336,7 +474,7 @@ defmodule GenDurable.QueriesTest do
       go = Enum.find(Queries.load_signals(Repo, id), &(&1.name == "go"))
       # progress, consuming exactly the awaited "go" id
       :ok = claim(id)
-      :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({}), [go.id], nil, 1)
+      :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({}), [go.id], nil, 1, :keep)
 
       assert [%{name: "other"}] = Queries.load_signals(Repo, id)
 
@@ -368,7 +506,7 @@ defmodule GenDurable.QueriesTest do
     assert t == "object"
 
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
-    :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({"n":1}), [], nil, 1)
+    :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({"n":1}), [], nil, 1, :keep)
 
     %{rows: [[t, n]]} =
       Repo.query!("SELECT jsonb_typeof(state), state->>'n' FROM gen_durable WHERE id = $1", [id])
@@ -458,7 +596,9 @@ defmodule GenDurable.QueriesTest do
       [_] = Queries.pick(Repo, "default", 10, @worker, -1000)
       [^id] = Queries.reap(Repo)
 
-      assert :stale = Queries.complete_next(Repo, id, @worker, "next", ~s({"n":9}), [], nil, 1)
+      assert :stale =
+               Queries.complete_next(Repo, id, @worker, "next", ~s({"n":9}), [], nil, 1, :keep)
+
       assert :stale = Queries.complete_retry(Repo, id, @worker, ~s({"n":9}), 0)
 
       assert :stale =

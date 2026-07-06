@@ -7,6 +7,23 @@ edited in place until the MVP settles.
 
 ## 0.2.2
 
+### Added
+- **Concurrency gates — `concurrency_key` grew a limit.** A key is now a semaphore of
+  size K: `concurrency_limits: [stripe: [limit: 100, shards: 1]]` caps in-flight
+  executions per key (cluster-wide, `{:stripe, tenant}` partitioning as in rate limits);
+  an unconfigured key keeps the default K = 1 (mutual exclusion, the previous behavior,
+  still enforced by the unique arbiter at zero cost). Gated keys are admitted against
+  sharded slot counters fenced by a database CHECK (over-admission is uncommittable),
+  debited in one batched pass per pick and credited back addressed by every outcome;
+  crash leaks err strict-side and the GC reconciler repairs counters from the
+  executing-rows truth. `shards:` multiplies the per-key completion ceiling (completions
+  serialize per shard row; size `shards ≥ limit × commit_latency / step_duration`).
+  `:next` can release or switch the key per transition (`concurrency_key: nil | value`;
+  absent keeps it). Telemetry: `[:gen_durable, :concurrency, :throttled]`, and
+  `[:gc, :swept]` gained a `gates` measurement. **Careful**: a config name captures every
+  key with that prefix — see the concurrency guide's warning. Schema: `concurrency_shard`
+  column + two gate tables (v1 DDL edited in place — re-create the schema).
+
 ### Changed
 - **`concurrency_key` serialization moved into the database**: the
   `gen_durable_concurrency_active` partial index is now UNIQUE, so a second executing row

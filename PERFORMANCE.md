@@ -254,6 +254,30 @@ concurrent picks acquire them in the same order and cannot deadlock — the sort
 distinct bucket keys of one batch (a handful of rows), not a measurable cost. Numbers are on a
 local Postgres 17 (devcontainer); read the ratios, not absolutes.
 
+### 2c. Concurrency gates: batched grants, per-shard release chains
+
+A configured `concurrency_key` (a gate: at most `limit` in flight) adds its own CTE family
+to the pick, shaped like the rate limiter's: lock the gate's slot-counter rows (ordered),
+admit the winners' prefix against the aggregate `available`, debit in one writeback. Like
+the rate CTEs, all of it is `never executed` when no gated rows are in the window — a
+non-gated queue pays nothing (same EXPLAIN discipline as §2b).
+
+The asymmetry to know about is **grants vs releases**. Grants are batched — one lock pass
+over the gate's shards per pick, amortized over the whole batch. Releases are per-step: the
+outcome's `credit` rider locks the shard row until commit, so completions of one key form a
+commit-latency chain — a per-shard ceiling of roughly `1 / commit_latency` (≈1–3k
+completions/s on local disks, ~300–1000/s on cloud storage; chained transactions cannot
+group-commit). That is what `shards:` is for: `S` shards ⇒ `S` independent chains. Size
+`shards ≥ limit × commit_latency / step_duration`. The self-limiting argument of §2b applies
+on both sides: a gate is only hot if its key is hot, and the cap itself throttles the key —
+a config that saturates its own gate (huge limit, sub-10ms steps) is capping something that
+did not need capping.
+
+Crash paths deliberately under-credit (a leaked slot means *stricter*-than-limit, never
+looser); the GC reconciler repairs the counters from the executing-rows truth each sweep,
+and the `CHECK (0 ≤ available ≤ cap)` makes both over-admission and double-credit
+uncommittable at the schema level.
+
 ---
 
 ## 3. The outcome and point queries (all O(1) by primary key)

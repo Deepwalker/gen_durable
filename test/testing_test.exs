@@ -98,6 +98,22 @@ defmodule GenDurable.TestingTest do
     assert %{id: ^id, status: :done} = durable("order:7")
   end
 
+  test "a concurrency gate admits, credits, and re-admits through drain" do
+    Repo.query!("TRUNCATE gen_durable_concurrency_buckets, gen_durable_concurrency_configs")
+
+    :ok =
+      GenDurable.Queries.upsert_concurrency_configs(Repo, [%{name: "gate", cap: 1, shards: 1}])
+
+    {:ok, a} = GenDurable.insert(GenDurable.Test.Plain, concurrency_key: {:gate, 7}, repo: Repo)
+    {:ok, b} = GenDurable.insert(GenDurable.Test.Plain, concurrency_key: {:gate, 7}, repo: Repo)
+
+    # cap 1: the drain loop admits one, its completion credits the slot back,
+    # the next iteration admits the other — all through the production pick
+    assert %{done: 2} = drain()
+    assert_done(a)
+    assert_done(b)
+  end
+
   test "assert_status flunks helpfully on a missing instance" do
     assert_raise ExUnit.AssertionError, ~r/no gen_durable instance/, fn ->
       assert_status(999_999, :done)
