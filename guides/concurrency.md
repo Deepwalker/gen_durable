@@ -40,6 +40,13 @@ thirty-second calls at once; `limit: 10` never has more than 10 in flight.
 A `NULL` `concurrency_key` (the common case) never serializes and pays nothing for any of
 this machinery.
 
+> **A saturated gate's backlog crowds its queue.** Rows denied by a full gate stay
+> runnable and keep occupying the pick window (unlike K = 1 siblings, which are filtered
+> out for free), so a deep backlog on one saturated key can starve *unrelated*
+> same-priority work behind it until completions free slots. Give a high-volume gated
+> flow its own queue — see the honest-list entry in the
+> [performance notes](../PERFORMANCE.md).
+
 ## Sharding a big gate
 
 Completions of one key serialize on its slot counter (a row lock held to commit), which

@@ -5,6 +5,30 @@ All notable changes to `gen_durable` are documented here. The format follows
 **no backward-compatibility guarantees** — there is one schema version and migrations are
 edited in place until the MVP settles.
 
+## 0.2.4
+
+### Fixed
+- **Rate-limit buckets moved to the zero-lag mint** (the gates' 0.2.3 design; the rate
+  limiter was the last ensure/heal user). The pick admits a cold rate key against its
+  virtual full bucket (`burst` by definition) and inserts the row already debited — a
+  key whose idle bucket the GC swept no longer pays a one-pick lag (and no longer emits
+  a false `:throttled` with granted=0), and drain over a cold bucket completes in one
+  call. The ensure riders on `insert`/`insert_all`/`:next`/`schedule_childs` and the
+  pick's rate `heal` CTE are deleted; inserts are rider-free single statements. Two
+  picks racing the first-ever grant of a key resolve on the bucket's primary key with a
+  bounded retry — observable via the new `[:gen_durable, :rate_limit, :contended]`
+  telemetry event. Measured: every rate scenario within ±3 % of baseline; conservation
+  under 8 racing workers exact (see PERFORMANCE §2b).
+
+### Documentation
+- The `#23`-class EPQ suspicion on the rate writeback was audited under adversarial
+  load and no violation reproduced (ISSUES #26 records the protocol and the tripwires).
+- New honest-list pathology (PERFORMANCE §6 #4, surfaced by that audit): rows denied
+  **after** the candidate window — rate-throttled rows and rows of a saturated
+  configured gate alike — keep occupying the pick's `LIMIT` slots, so a saturated key
+  with a backlog deeper than batch × concurrent picks starves same-priority work behind
+  it. Both guides now say: give heavily capped flows their own queue.
+
 ## 0.2.3
 
 ### Fixed

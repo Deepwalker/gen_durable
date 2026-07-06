@@ -65,6 +65,9 @@ defmodule GenDurable do
     * `[:gen_durable, :rate_limit, :throttled]` — a rate-limit bucket granted fewer rows
       than wanted in a pick. Measurements `%{wanted, granted}`; metadata
       `%{key, queue}`. The signal that a limit is biting.
+    * `[:gen_durable, :rate_limit, :contended]` — two picks raced the first-ever
+      grant of a rate key (cold-bucket mint) and the loser retried. Measurements
+      `%{count}`; metadata `%{queue}`.
     * `[:gen_durable, :rate_limit, :unknown]` — a step named a `rate_limit` whose name has
       no configured policy (the row would stall). Measurements `%{count}`; metadata
       `%{key, name, fsm, step}`.

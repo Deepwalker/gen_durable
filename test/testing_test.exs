@@ -122,6 +122,28 @@ defmodule GenDurable.TestingTest do
     assert_done(b)
   end
 
+  test "a rate limit admits through a cold bucket in one drain" do
+    Repo.query!("TRUNCATE gen_durable_rate_buckets, gen_durable_rate_configs")
+
+    :ok = GenDurable.Queries.upsert_rate_configs(Repo, [%{name: "api", rate: 0.0, burst: 2.0}])
+
+    {:ok, a} = GenDurable.insert(GenDurable.Test.Plain, rate_limit: {:api, 7}, repo: Repo)
+    {:ok, b} = GenDurable.insert(GenDurable.Test.Plain, rate_limit: {:api, 7}, repo: Repo)
+
+    # the bucket is COLD (nothing minted at insert) — the first pick must
+    # mint-and-grant in the same statement, or drain would see an empty pick
+    # and wrongly stop at "quiescence" with runnable work left
+    %{rows: [[buckets]]} =
+      Repo.query!("SELECT count(*) FROM gen_durable_rate_buckets WHERE key = 'api:7'")
+
+    assert buckets == 0
+
+    # burst 2 covers both jobs on the cold pick (rate 0: no refill afterwards)
+    assert %{done: 2} = drain()
+    assert_done(a)
+    assert_done(b)
+  end
+
   test "assert_status flunks helpfully on a missing instance" do
     assert_raise ExUnit.AssertionError, ~r/no gen_durable instance/, fn ->
       assert_status(999_999, :done)

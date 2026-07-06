@@ -511,6 +511,92 @@ throughput bench re-run within noise of the pre-change numbers (baseline
 9 579 jobs/s, uncapped gate 1 shard 0.46×, 8 shards 0.88×), and three
 8-worker/20k conservation runs with exact post-drain slot balance.
 
+### 25. Rate limiter converted to the same zero-lag mint — the last ensure/heal user — FIXED
+
+After #24 the rate limiter was the odd one out: buckets were still minted by
+`ensure` riders on insert / insert_all / `:next` / schedule_childs, with the
+pick's `heal` CTE as the backstop for keys whose idle bucket the GC swept —
+and `heal` had the exact statement-invisibility #24 was about (its mint is
+invisible to its own `locked`, "granted on the NEXT pick"). Reachable through
+a GC-sweep + sleeping-row interleaving in production (one poll of extra
+latency plus a false `:throttled` event with granted=0), and the same
+drain-contract hole in principle. The riders also taxed every insert path for
+a key most transitions never set.
+
+**Fix — same design, one asymmetry:** `r_cold` computes the virtual full
+bucket (a fresh mint is `burst` by definition) for winner keys with no bucket
+row, `avail` admits over `locked ∪ cold`, and `r_mint` INSERTs the cold
+buckets pre-debited (`burst − consumed`). The asymmetry to the gates: a
+racing double-mint cannot MERGE debits — the merge arithmetic needs `burst`,
+which is a config value, not a bucket column, and `ON CONFLICT DO UPDATE`
+sees only the target row and EXCLUDED — so the collision is left to the
+bucket's PRIMARY KEY: the losing claim aborts whole and the pick retries
+against the winner's committed row (rescue extended;
+`[:gen_durable, :rate_limit, :contended]`). DELETED: `ensure_buckets_cte`,
+`bucket_keys`, the `:next` and schedule_childs ensure riders (schedule_childs
+dropped a parameter: 18 → 17), and `heal`. Inserts are now rider-free
+single statements.
+
+Verified: full suite incl. new tests (a cold key admits on the very first
+pick, mint lands pre-debited; `:next` onto a cold rate key granted by the
+very next pick; a swept bucket re-mints with zero lag; drain over a cold
+bucket completes in one call), EXPLAIN (r_cold anti-join and r_mint
+`never executed` / rows=0 on unkeyed batches), throughput bench — every rate
+scenario within the ±3 % noise band of baseline (9 150 jobs/s baseline; hot
+bucket cold 1.02×, warm 1.03×, 100 partitions 0.99×, 2 000 cold keys 0.98×;
+27 mint collisions retried across the run, all jobs drained), and three
+conservation runs (rate 0, burst 5, 100 fresh keys × 10 jobs, 8 workers
+racing the mints): exactly 5 grants per key, every bucket at exactly
+0.0 tokens.
+
+Still open from the #21 batch, deliberately not taken here: insert-time
+`rate_limit` names are unvalidated (a typo'd name stalls the row, visible
+only via throttled telemetry), and the legit-throttle flavor of the drain gap
+— `promote_scheduled` collapses scheduled time but not token-refill time, so
+a drain with more pending weight than burst exits before quiescence.
+
+### 26. Rate writeback under the #23 EPQ lens — AUDITED, no violation reproduced
+
+The #23 forensics left a suspicion: the rate `locked` CTE is the same
+join+ORDER BY+FOR UPDATE shape whose gate sibling emitted a row twice under
+contention, and rate buckets have NO CHECK — a duplicate/stale `avail` row
+would not crash, it would silently commit token debt (writeback from the
+fresh row, grants judged against the stale one) or token inflation (writeback
+from the stale row, the concurrent debit lost).
+
+Audited two ways. (1) Two-session shape experiment (the #23 protocol): a
+session running the locked shape blocks behind a concurrent debit and, on
+commit, returns the row ONCE with the FRESH value — same result as #23's
+control. (2) An adversarial conservation harness on the WARM path: rate 0
+(exact arithmetic), pre-warmed buckets, a permanently-throttled tail as the
+over-admission tripwire (any stale grant would draw from it), neutral
+mutator sessions (`SET tokens = tokens` — new row versions at maximum rate
+with zero balance impact, standing in for the gates' credit riders), pickers
+racing at both batch extremes (8×50 and 16×7, up to ~75k row-version churns
+per scenario). Twelve scenario-runs: `done` per key EXACTLY equal to burst,
+every bucket at exactly 0.0 tokens, nothing negative, nothing inflated.
+
+Structurally consistent: the #23 duplication was only ever observed feeding
+a WINDOW aggregate over the locked scan (the doubled cumulative range);
+the rate path has no window over `locked` — its output goes through a 1:1
+projection (`avail`), a per-candidate join (`granted`), and a by-key UPDATE
+(`writeback`). Not proof — the mechanism was never fully pinned — which is
+why the tripwires stay cheap to re-run (`/tmp/rate_epq_repro.exs` recipe
+recorded here). Verdict: no fix warranted on current evidence.
+
+Byproduct finding, documented as PERFORMANCE §6 pathology #4: rows denied
+AFTER the candidate window — rate-throttled rows and rows of a saturated
+configured gate alike (the `cand` guard only pre-filters K=1 keys; configured
+names pass unconditionally) — OCCUPY the pick window's `LIMIT` slots while
+staying runnable at the head of the sort order. A saturated key with a
+backlog deeper than batch × concurrent picks therefore starves same-priority
+work behind it until the head drains (refill rate for a rate key, completion
+rate for a gate; never, for a head that cannot run — `weight > burst`, an
+unconfigured rate name, which raises the stakes of the #21 no-insert-time-
+validation gap). Surfaced by the first harness variant (key-grouped
+insertion: 5 of 8 keys never entered the window). Mitigation documented in
+both guides: own queue for heavily capped flows, or a less urgent priority.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

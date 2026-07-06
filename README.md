@@ -17,7 +17,7 @@ Idempotency of step effects is the user's responsibility.
 ## Install
 
 ```elixir
-def deps, do: [{:gen_durable, "~> 0.2.3"}]
+def deps, do: [{:gen_durable, "~> 0.2.4"}]
 ```
 
 Add the migration (the DDL lives in the library) and run it:

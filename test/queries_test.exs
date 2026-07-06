@@ -66,6 +66,13 @@ defmodule GenDurable.QueriesTest do
     t
   end
 
+  defp rate_buckets(key) do
+    %{rows: rows} =
+      Repo.query!("SELECT tokens FROM gen_durable_rate_buckets WHERE key = $1", [key])
+
+    List.flatten(rows)
+  end
+
   @doc false
   def __fwd__(_event, measure, meta, pid), do: send(pid, {:telemetry, measure, meta})
 
@@ -936,12 +943,13 @@ defmodule GenDurable.QueriesTest do
       :ok
     end
 
-    test "insert ensures a full bucket; pick grants up to budget, debits, then throttles" do
+    test "insert creates no bucket; the first pick mints it pre-debited and grants up to budget" do
       :ok = seed(0, 5)
       for _ <- 1..10, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))
-      # the ensure CTE created the bucket full at burst
-      assert tokens("api") == 5.0
+      # zero-lag mint: nothing exists until a pick grants from the key
+      assert rate_buckets("api") == []
 
+      # the cold key admits on this very pick; the mint lands already debited
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 5
       assert tokens("api") == 0.0
       # rate 0 ⇒ no refill ⇒ the rest stay parked
@@ -974,7 +982,7 @@ defmodule GenDurable.QueriesTest do
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) >= 1
     end
 
-    test "insert_all ensures buckets and rate-limits the whole batch" do
+    test "insert_all creates no buckets; the pick rate-limits the whole batch cold" do
       :ok = seed(0, 2)
 
       ids =
@@ -985,11 +993,12 @@ defmodule GenDurable.QueriesTest do
         ])
 
       assert length(ids) == 3
-      assert tokens("api") == 2.0
+      assert rate_buckets("api") == []
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 2
+      assert tokens("api") == 0.0
     end
 
-    test "schedule_childs ensures buckets for rate-limited children" do
+    test "rate-limited children admit through a cold bucket on the very next pick" do
       :ok = seed(0, 1)
       {:ok, parent} = Queries.insert(Repo, params())
       [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
@@ -1000,24 +1009,42 @@ defmodule GenDurable.QueriesTest do
       ]
 
       :ok = Queries.complete_schedule_childs(Repo, parent, @worker, "join", ~s({}), children, [])
+      assert rate_buckets("api") == []
 
-      assert tokens("api") == 1.0
-      # both children are runnable; the bucket (burst 1) lets one through
+      # both children are runnable; the cold bucket (burst 1) admits one
+      # immediately and lands debited to zero
       assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+      assert tokens("api") == 0.0
     end
 
-    test "the pick self-heals a swept bucket; the row is grantable on the next pick" do
+    test "a swept bucket costs no lag: the next pick re-mints it, debited, and grants" do
       :ok = seed(0, 5)
       {:ok, id} = Queries.insert(Repo, params(%{rate_limit: "api"}))
+
+      # warm the key (first pick mints and grants), park it back runnable
+      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert tokens("api") == 4.0
+      :ok = Queries.complete_retry(Repo, id, @worker, ~s({}), 0)
+
       # simulate gc_buckets having swept the bucket while the row slept
       Repo.query!("DELETE FROM gen_durable_rate_buckets WHERE key = 'api'")
 
-      # first pick cannot grant (no bucket row) but the heal CTE recreates it full…
-      assert Queries.pick(Repo, "default", 10, @worker, @ttl) == []
-      assert tokens("api") == 5.0
-
-      # …so the next pick grants — no permanent stall
+      # the same pick that finds the key cold mints it and grants — no stall,
+      # and the fresh mint is again full-minus-taken
       assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert tokens("api") == 4.0
+    end
+
+    test "a mid-flight :next onto a cold rate key is granted by the very next pick" do
+      :ok = seed(0, 5)
+      {:ok, id} = Queries.insert(Repo, params())
+      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+      :ok = Queries.complete_next(Repo, id, @worker, "call", ~s({}), [], "api:7", 1, :keep)
+      assert rate_buckets("api:7") == []
+
+      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert tokens("api:7") == 4.0
     end
 
     test "gc_buckets sweeps refilled-idle and orphaned buckets, keeps the rest" do

@@ -223,10 +223,11 @@ all `rate_limit IS NULL`:
 Update on gen_durable g (rows=50)
   CTE cand     -> Index Scan using gen_durable_pick (rows=50)   ← unchanged candidate select
   CTE winners  -> WindowAgg -> Sort (rows=50, 27kB quicksort)   ← the only added work
+  CTE r_cold   -> Anti Join (rows=0); rate_buckets index "never executed"
   CTE locked   -> LockRows (rows=0); rate_buckets index "never executed"
-  CTE avail/granted/writeback -> rows=0 / never executed
+  CTE avail/granted/writeback/r_mint -> rows=0 / never executed
   final        -> Nested Loop -> Index Scan gen_durable_pkey (the PK flip, as before)
-Execution Time: 0.85 ms
+Execution Time: 1.9 ms   (the full production pick, §2c gate CTEs included)
 ```
 
 The candidate scan still rides `gen_durable_pick`, the flip is still the PK update — the
@@ -234,20 +235,33 @@ rate-bucket joins do **nothing** (`never executed`, zero rows). The only additio
 sort to compute the cumulative weight, over the **≤batch** winners (50 rows, ~27 kB,
 sub-millisecond) — bounded by batch, not table size.
 
+**Buckets are minted by the pick itself, pre-debited.** No transition creates bucket rows; the
+first pick that grants from a key admits against the virtual full bucket (a fresh mint is
+`burst` by definition) and INSERTs it already debited — cold keys, including keys whose idle
+bucket the GC swept, admit with **zero lag**. Two picks racing the same cold key collide on the
+bucket's primary key; the loser's claim aborts whole and retries against the winner's committed
+row (`[:gen_durable, :rate_limit, :contended]`, same bounded-retry discipline as the §2c gates).
+
 **Under contention.** A bucket is a single counter row locked with `FOR UPDATE`; concurrent
-pickers serialize on it. Measured drain of 20k jobs, 8 concurrent pickers, infinite budget
-(so we measure lock cost, not throttling):
+pickers serialize on it. Measured drain of 20k jobs, 8 concurrent pickers, batch 50, infinite
+budget (so we measure lock and mint cost, not throttling) — same methodology as §2c:
 
-| path | throughput | vs lockless |
+| path | throughput | vs baseline |
 |---|---|---|
-| no rate limit (lockless) | 17 700 jobs/s | 1.00× |
-| one hot bucket, blocking `FOR UPDATE` | 11 100 jobs/s | 0.63× |
-| 100 buckets (partitioned) | 15 000 jobs/s | 0.85× |
+| no rate limit | 9 150 jobs/s | 1.00× |
+| one hot bucket, cold start | 9 320 jobs/s | 1.02× |
+| one hot bucket, pre-warmed | 9 400 jobs/s | 1.03× |
+| 100 buckets (partitioned), cold | 9 060 jobs/s | 0.99× |
+| 2 000 cold keys, 10 jobs each | 8 960 jobs/s | 0.98× |
 
-11k grants/s through a **single** counter is far above any rate limit you would configure (the
-limit itself throttles lower), so the lock is never the bottleneck for a bucket you have capped.
-Grants are **batched** (one lock acquisition per pick-cycle, not per job), and partitioned
-buckets spread contention to near-baseline. `SKIP LOCKED` on the bucket measured *slower* for a
+Everything is within the run-to-run noise band (repeats of one scenario spread ±3%): the lock is
+taken once per pick — amortized over the whole batch — and held for the statement only, so even
+a single hot bucket doesn't register at batch 50, and the mint-heavy sweep (2 000 cold keys)
+costs the same as warm buckets. The whole run retried 27 cold-mint collisions and drained every
+job. A separate conservation run (rate 0, burst 5, 100 fresh keys × 10 jobs, 8 workers racing
+the mints, 3×) granted **exactly** 5 per key with every bucket landing at exactly 0.0 tokens —
+the collision path loses and leaks nothing. Grants are **batched** (one lock acquisition per
+pick-cycle, not per job). `SKIP LOCKED` on the bucket measured *slower* for a
 single hot bucket (spin-retry with no alternative work), so the picker uses blocking
 `FOR UPDATE`. Buckets are locked in key order (`ORDER BY` sorts before `LockRows`), so
 concurrent picks acquire them in the same order and cannot deadlock — the sort is over the
@@ -519,6 +533,21 @@ The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 14 µs/row`
    — a separate `scheduled` status promoted to `runnable` by a sweeper (Oban's Stager
    shape) — adds a background process and buys nothing until a real workload hits this,
    so it stays unbuilt.
+4. **A denied-after-the-window backlog at the head of a queue caps its visibility.**
+   The K=1 concurrency guard is a `WHERE` filter — skipped rows don't consume the
+   `LIMIT`. But both capacity admissions happen *after* the candidate window: a
+   rate-throttled row and a row of a saturated **configured gate** are picked as
+   candidates, denied (no tokens / no free slots), and left runnable — still occupying
+   their `LIMIT` slots next pick. A saturated key whose backlog is older (earlier
+   `eligible_at`, same priority) than the live work behind it caps the queue's
+   effective visibility at batch × concurrent picks; behind a deep enough denied head,
+   unrelated work starves until the head drains — at the refill rate for a rate key, at
+   the completion rate (`limit / step_duration`) for a gate, and never for a head that
+   cannot run (`weight > burst`, an unconfigured rate name). Mitigations: give heavily
+   capped flows their own queue (the clean cure — queues isolate windows), or a less
+   urgent priority than latency-sensitive work (ordering is priority-first). Observed
+   while adversarially testing the limiter (ISSUES #26): 5 of 8 keys behind a throttled
+   head never entered the window at all.
 
 ---
 
@@ -553,10 +582,11 @@ signals), `ANALYZE`, and run `EXPLAIN (ANALYZE, BUFFERS)` on each statement from
 plan executes without changing the dataset. Run each twice and read the second (warm).
 
 Re-verified after the 0.2.0 hardening on a fresh 1M-row seed (same recipe), warm plans:
-the common-path pick still rides `gen_durable_pick` with the rate CTEs **and the new
-`heal` CTE** at zero rows / `never executed` (~4 ms with a 6k-row executing set — the
+the common-path pick still rides `gen_durable_pick` with the rate CTEs **and the
+cold-mint CTE** (`heal` at the time; since replaced by `r_cold`/`r_mint`, re-verified —
+see §2b) at zero rows / `never executed` (~4 ms with a 6k-row executing set — the
 concurrency guard's hashed scan of the in-flight set is the biggest component; on a
-keyless queue with the full rate machinery active the pick is ~2 ms, heal's
+keyless queue with the full rate machinery active the pick is ~2 ms, the cold-key
 exists-check costing ~0.01 ms); the reworked maintenance statements keep their
 proportionality — reap ≈ 8 µs per expired row including the new ordered SKIP LOCKED
 claim, a 50-row heartbeat ≈ 0.6 ms, both PK/partial-index driven; the one-statement

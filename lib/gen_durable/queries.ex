@@ -169,12 +169,13 @@ defmodule GenDurable.Queries do
   #              with the per-concurrency_key window rank `rn`.
   #   winners  — the concurrency winners (rn = 1); add the cumulative weight `cw` of the urgency
   #              prefix per rate_limit bucket (ROWS, deterministic by id).
-  #   heal     — recreate (full) any winner's bucket that is missing: buckets are minted by the
-  #              ensure CTEs at transition time and swept by gc_buckets when idle, so a row that
-  #              slept past its bucket's refill horizon (far-future schedule, long retry backoff)
-  #              would otherwise be ungrantable forever — the pick self-heals instead. The insert
-  #              is invisible to `locked` in this same statement (CTE snapshot), so the row is
-  #              granted on the NEXT pick; the common path (no rate-limited winners) is a no-op.
+  #   r_cold   — a winner's rate key with NO bucket row (first use of the key,
+  #              or swept by gc_buckets while it slept) is COLD: a fresh bucket
+  #              is full by definition, so its budget is known without reading
+  #              anything — the config's burst. `avail` unions these virtual
+  #              buckets in, so cold admission is immediate (no heal-lag), and
+  #              r_mint below INSERTS them already debited. No-op on the common
+  #              path.
   #   locked   — lock the rate-bucket rows the winners draw from (the cross-node serialization
   #              point), in key order: with ORDER BY the sort happens before LockRows, so every
   #              concurrent pick acquires bucket locks in the same order — no deadlock. Then
@@ -182,6 +183,18 @@ defmodule GenDurable.Queries do
   #   granted  — the prefix whose cumulative weight fits (`cw <= avail`); cw monotonic ⇒ a head
   #              that doesn't fit grants nothing (reservation, no skip-ahead).
   #   writeback — debit each bucket by the weight actually taken (max cw among its granted rows).
+  #              Touches only rows that exist in the statement snapshot, so cold
+  #              keys naturally fall through to r_mint.
+  #   r_mint   — materialize the cold buckets, pre-debited (burst − consumed),
+  #              in key order (two statements minting the same new keys in
+  #              opposite orders would deadlock on the PK index instead of
+  #              erroring cleanly). Two picks can race the same cold key (neither's
+  #              insert is visible to the other); merging the loser's debit onto
+  #              the winner's row would need `burst`, which is not a bucket
+  #              column, so the collision is left to the PRIMARY KEY: the losing
+  #              claim aborts whole and the pick retries against the winner's
+  #              now-committed row — the constraint-equals-correctness
+  #              discipline of the gates, minus the merge (see pick/6's rescue).
   # Final flip: a winner runs iff it has no rate_limit (NULL short-circuits everything above) or
   # it made the fitting prefix. Without any rate-limited rows, locked/avail/granted are empty and
   # this reduces to the plain concurrency pick.
@@ -262,14 +275,11 @@ defmodule GenDurable.Queries do
                              ROWS UNBOUNDED PRECEDING) AS cw
     FROM pool
   ),
-  heal AS (
-    INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
-    SELECT k.rkey, cfg.burst, clock_timestamp()
+  r_cold AS (
+    SELECT k.rkey AS key, cfg.burst
     FROM (SELECT DISTINCT rkey FROM rw WHERE rkey IS NOT NULL) k
     JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k.rkey, ':', 1)
     WHERE NOT EXISTS (SELECT 1 FROM gen_durable_rate_buckets b WHERE b.key = k.rkey)
-    ORDER BY k.rkey
-    ON CONFLICT (key) DO NOTHING
   ),
   locked AS (
     SELECT b.key, b.tokens, b.last_refill, cfg.burst, cfg.rate
@@ -282,6 +292,8 @@ defmodule GenDurable.Queries do
   avail AS (
     SELECT key, LEAST(burst, tokens + extract(epoch from clock_timestamp() - last_refill) * rate) AS avail
     FROM locked
+    UNION ALL
+    SELECT key, burst AS avail FROM r_cold
   ),
   granted AS (
     SELECT w.id, w.rkey, w.cw FROM rw w JOIN avail a ON a.key = w.rkey WHERE w.cw <= a.avail
@@ -294,6 +306,13 @@ defmodule GenDurable.Queries do
     SET tokens = a.avail - coalesce(c.consumed, 0), last_refill = clock_timestamp()
     FROM avail a LEFT JOIN consumed c ON c.key = a.key
     WHERE b.key = a.key
+  ),
+  r_mint AS (
+    INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
+    SELECT c.key, c.burst - coalesce(co.consumed, 0), clock_timestamp()
+    FROM r_cold c
+    LEFT JOIN consumed co ON co.key = c.key
+    ORDER BY c.key
   ),
   claimed AS (
     UPDATE gen_durable g
@@ -383,17 +402,24 @@ defmodule GenDurable.Queries do
     enrich(repo, Enum.map(jobs, &to_job(&1, worker)))
   rescue
     e in Postgrex.Error ->
-      # Two constraint-resolved races, one discipline (constraint = correctness,
-      # retry = resolution): the K=1 unique arbiter, and the gate buckets' CHECK
-      # (a residual over-admission race — see c_ranges' dedup — aborts the whole
-      # claim instead of committing it).
+      # Three constraint-resolved races, one discipline (constraint =
+      # correctness, retry = resolution): the K=1 unique arbiter; the gate
+      # buckets' CHECK (a residual over-admission race — see c_ranges' dedup —
+      # aborts the whole claim instead of committing it); and the rate buckets'
+      # PRIMARY KEY (two picks minting the same cold key — see r_mint). The
+      # retry re-reads the winner's committed row, so it resolves warm.
       constraint = is_map(e.postgres) && e.postgres[:constraint]
 
-      if constraint in [
-           "gen_durable_concurrency_active",
-           "gen_durable_concurrency_buckets_check"
-         ] do
-        :telemetry.execute([:gen_durable, :concurrency, :contended], %{count: 1}, %{queue: queue})
+      event =
+        case constraint do
+          "gen_durable_concurrency_active" -> [:gen_durable, :concurrency, :contended]
+          "gen_durable_concurrency_buckets_check" -> [:gen_durable, :concurrency, :contended]
+          "gen_durable_rate_buckets_pkey" -> [:gen_durable, :rate_limit, :contended]
+          _ -> nil
+        end
+
+      if event do
+        :telemetry.execute(event, %{count: 1}, %{queue: queue})
 
         if attempts > 1,
           do: pick(repo, queue, batch, worker, lease_ttl_ms, attempts - 1),
@@ -612,15 +638,15 @@ defmodule GenDurable.Queries do
 
   # Sweep stale rate buckets — the GC side of partitioned limits
   # (`{name, partition}` mints a bucket row per partition ever seen). A bucket
-  # is deletable when recreating it equals its natural state: buckets are
-  # recreated FULL (by the ensure CTEs at transition time, and by the pick's
-  # `heal` CTE for rows that slept past the refill horizon), so one idle longer
-  # than burst/rate seconds (fully refilled by now anyway) loses nothing.
-  # rate = 0 never qualifies (it never refills, so delete-and-recreate would
-  # grant a fresh burst), and a bucket whose config was removed is unusable
-  # (both the pick and `ensure` join configs) — swept unconditionally. The
-  # ordered SKIP LOCKED claim (see the lease/reaper note) also means a bucket a
-  # concurrent pick holds is simply skipped — it is active, not stale.
+  # is deletable when recreating it equals its natural state: the pick's
+  # `r_mint` recreates a missing bucket at full-minus-taken in the same
+  # statement that grants from it, so one idle longer than burst/rate seconds
+  # (fully refilled by now anyway) loses nothing — the sweep costs the key
+  # neither lag nor budget. rate = 0 never qualifies (it never refills, so
+  # delete-and-recreate would grant a fresh burst), and a bucket whose config
+  # was removed is unusable (the pick joins configs) — swept unconditionally.
+  # The ordered SKIP LOCKED claim (see the lease/reaper note) also means a
+  # bucket a concurrent pick holds is simply skipped — it is active, not stale.
   def gc_buckets(repo) do
     %{num_rows: n} =
       q!(
@@ -718,10 +744,8 @@ defmodule GenDurable.Queries do
   end
 
   # :next sets the row's rate_limit key ($5, NULL ⇒ not limited) and weight ($6) for the
-  # next step, and ensures the bucket exists (full) so the picker's locked reserve
-  # never races a missing row. The `ensure` CTE no-ops when $5 is NULL (split_part(NULL,…) is
-  # NULL ⇒ matches no config), when the bucket already exists (ON CONFLICT DO
-  # NOTHING), or when the ownership guard failed (committed empty).
+  # next step. No bucket rider: a missing bucket is minted, pre-debited, by the
+  # first pick that grants from it (see r_mint) — cold keys admit with zero lag.
   #
   # `concurrency_key` is :keep (the default — identity keys persist across
   # steps), nil (release the key for the next steps), or a new key. The shard is
@@ -746,13 +770,6 @@ defmodule GenDurable.Queries do
           RETURNING id
         ),
         #{credit_gate("committed")},
-        ensure AS (
-          INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill)
-          SELECT $5, cfg.burst, clock_timestamp()
-          FROM gen_durable_rate_configs cfg
-          WHERE cfg.name = split_part($5, ':', 1) AND EXISTS (SELECT 1 FROM committed)
-          ON CONFLICT (key) DO NOTHING
-        ),
         consumed AS (
           DELETE FROM signals
           WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
@@ -957,8 +974,8 @@ defmodule GenDurable.Queries do
     committed?(n)
   end
 
-  # Children ride in as 12 parallel arrays via `unnest` (base 5: $6..$17), so the
-  # parameter count is fixed — 18 for any batch size (the wire protocol caps a
+  # Children ride in as 12 parallel arrays via `unnest` (base 4: $5..$16), so the
+  # parameter count is fixed — 17 for any batch size (the wire protocol caps a
   # statement at 65535 parameters, ~5400 rows in per-row-placeholder form) — and
   # the SQL text is static (statement-cacheable). $1 doubles as the parent_id column.
   # The ownership guard lives in a leading `claim` CTE (SELECT … FOR UPDATE): the
@@ -977,20 +994,15 @@ defmodule GenDurable.Queries do
       ) do
     sql =
       "WITH claim AS (SELECT id FROM gen_durable " <>
-        "WHERE id = $1 AND locked_by = $18 AND status = 'executing' FOR UPDATE), " <>
+        "WHERE id = $1 AND locked_by = $17 AND status = 'executing' FOR UPDATE), " <>
         credit_gate("claim") <>
         ", " <>
-        "ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
-        "SELECT k, cfg.burst, clock_timestamp() FROM unnest($5::text[]) k " <>
-        "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
-        "WHERE EXISTS (SELECT 1 FROM claim) " <>
-        "ORDER BY k ON CONFLICT (key) DO NOTHING), " <>
         "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
         "AND id = ANY($4::bigint[])), " <>
         "ins AS (INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>
         @unnest_row_select <>
         ", $1 " <>
-        unnest_from(5) <>
+        unnest_from(4) <>
         " WHERE EXISTS (SELECT 1 FROM claim)" <>
         " ORDER BY t.correlation_key" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
@@ -1005,7 +1017,7 @@ defmodule GenDurable.Queries do
         "WHERE id IN (SELECT id FROM claim)"
 
     args =
-      [parent_id, next_step, state_json, consumed_ids, bucket_keys(children)] ++
+      [parent_id, next_step, state_json, consumed_ids] ++
         column_arrays(children) ++ [worker]
 
     %{num_rows: n} = q!(repo, "schedule_childs", sql, args)
@@ -1092,20 +1104,6 @@ defmodule GenDurable.Queries do
 
   # --- insert / batch insert -------------------------------------------------
 
-  # Ensures a token bucket exists (full) for each given rate_limit key, as a leading CTE so
-  # the insert stays one statement. `$n` is a text[] of distinct keys; empty ⇒ no-op.
-  # ORDER BY k: deterministic insertion order — two statements creating the same new
-  # keys via the arbiter index in opposite orders would deadlock.
-  defp ensure_buckets_cte(n) do
-    "ensure AS (INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) " <>
-      "SELECT k, cfg.burst, clock_timestamp() FROM unnest($#{n}::text[]) k " <>
-      "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
-      "ORDER BY k ON CONFLICT (key) DO NOTHING)"
-  end
-
-  defp bucket_keys(rows),
-    do: rows |> Enum.map(& &1.rate_limit) |> Enum.reject(&is_nil/1) |> Enum.uniq() |> Enum.sort()
-
   # Seed/refresh the rate-limit policy table at engine start. `configs` is a list of
   # `%{name, rate, burst}`. Idempotent: re-running with changed numbers updates them.
   # Sorted by name: DO UPDATE locks existing rows in VALUES order, and two nodes
@@ -1166,10 +1164,12 @@ defmodule GenDurable.Queries do
   # it until the next sweep), then, in FRESH-snapshot statements while the locks
   # are held (claims and credits of the locked keys wait on them), recompute and
   # repair. The final statement sweeps orphaned buckets (config removed, shard
-  # out of range) and whole idle-full keys — deletable because the ensure/heal
-  # CTEs recreate buckets FULL, which is exactly their idle state; deletion is
-  # all-shards-or-nothing per key, because the pick's heal only recreates keys
-  # with NO bucket rows at all. Returns the number of repaired + deleted rows.
+  # out of range) and whole idle-full keys — deletable because the pick's
+  # c_cold/c_mint recreate buckets FULL (minus what that pick takes), which is
+  # exactly their idle state; deletion is all-shards-or-nothing per key,
+  # because c_cold only fires for keys with NO bucket rows at all (backfill
+  # below restores that invariant after a shards increase). Returns the number
+  # of repaired + deleted rows.
   def reconcile_concurrency(repo) do
     {:ok, n} =
       repo.transaction(fn ->
@@ -1297,14 +1297,12 @@ defmodule GenDurable.Queries do
 
   def insert(repo, p) do
     sql =
-      "WITH " <>
-        ensure_buckets_cte(13) <>
-        " INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
+      "INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
         "($1, $2, $3, $4::text::jsonb, $5, $6, $7, COALESCE($8::timestamptz, now()), " <>
         "$9, $10::text[]::durable_status[], $11, $12)" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    case q!(repo, "insert", sql, row_args(p) ++ [bucket_keys([p])]) do
+    case q!(repo, "insert", sql, row_args(p)) do
       %{rows: [[id]]} -> {:ok, id}
       %{rows: []} -> {:error, :duplicate}
     end
@@ -1322,17 +1320,14 @@ defmodule GenDurable.Queries do
   # irrelevant.
   def insert_all(repo, rows) when is_list(rows) do
     sql =
-      "WITH " <>
-        ensure_buckets_cte(13) <>
-        " INSERT INTO gen_durable (#{@insert_cols}) " <>
+      "INSERT INTO gen_durable (#{@insert_cols}) " <>
         @unnest_row_select <>
         " " <>
         unnest_from(0) <>
         " ORDER BY t.correlation_key" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    %{rows: out} =
-      q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows)])
+    %{rows: out} = q!(repo, "insert_all", sql, column_arrays(rows))
 
     List.flatten(out)
   end

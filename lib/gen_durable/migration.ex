@@ -200,8 +200,9 @@ defmodule GenDurable.Migration do
     execute("CREATE INDEX signals_target ON #{p}.signals (target_id, name)")
 
     # rate limiting. Configs are seeded at engine start from the `rate_limits:`
-    # option; the picker joins them. Buckets are token-bucket counters, one row per distinct
-    # key, ensured (full) by the transition that assigns the key.
+    # option; the picker joins them. Buckets are token-bucket counters, one row
+    # per distinct key, minted pre-debited by the first pick that grants from
+    # the key (see the pick's r_mint CTE) and swept by gc_buckets when idle.
     execute("""
     CREATE TABLE #{p}.gen_durable_rate_configs (
       name  text primary key,
@@ -210,6 +211,9 @@ defmodule GenDurable.Migration do
     )
     """)
 
+    # The primary key doubles as the cold-mint arbiter: two picks minting the
+    # same cold key cannot both commit — the loser aborts and retries against
+    # the winner's row (see pick/6's rescue).
     execute("""
     CREATE TABLE #{p}.gen_durable_rate_buckets (
       key         text primary key,
