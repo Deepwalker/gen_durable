@@ -445,6 +445,36 @@ Note for the future concurrency-cap feature (K > 1): a unique index does not
 count to K; that design needs a slots table — tracked in the design
 discussion, not here.
 
+### 23. Gate over-admission race, caught by its own CHECK under bench load — FIXED
+
+The concurrency-gate throughput bench (20k jobs, 8 pickers, one hot shard)
+crashed on `CHECK (available >= 0)`: `available` went to −1/−2 — the pick
+over-admitted past the fresh availability. Forensics: a trigger-ledger run
+showed exact conservation (the race is timing-sensitive; plpgsql overhead
+masks it), and the overshoot arithmetic matched exactly one mechanism — the
+locked bucket scan (`c_locked`) emitting the SAME bucket row twice under a
+concurrent write (old + EPQ-refreshed version), which duplicates its entry in
+the cumulative ranges and doubles its admission window (available 1 → ranges
+(0,1] and (1,2] → 2 admitted, debit base 1 → −1). A controlled two-session
+experiment confirmed the simple no-join `FOR UPDATE` shape IS
+EPQ-fresh — the duplication needs the join+window plan under contention.
+
+**Fix, two layers:** `c_ranges` deduplicates by `(key, shard)` taking
+`min(available)` (the conservative version wins — worst case a transient
+under-admission, retried next pick), and the pick's constraint-retry rescue
+now also covers `gen_durable_concurrency_buckets_check` — the same
+constraint-equals-correctness discipline as the K=1 arbiter, so any residual
+shape of this race aborts and retries instead of committing or crashing the
+scheduler. Re-ran the bench: three consecutive runs of the crashing scenario
+clean, post-drain slot conservation exact, and the measured numbers landed in
+PERFORMANCE §2c (one hot shard 0.45× of lockless at pure gate traffic, 8
+shards 0.80×).
+
+The meta-lesson goes in the pick's comments: cross-CTE reads of concurrently
+written rows are not trustworthy even under `FOR UPDATE` — accumulate through
+row-resident RMW or fence with constraints, never through values carried
+across CTE boundaries.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

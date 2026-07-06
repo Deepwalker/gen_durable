@@ -134,7 +134,13 @@ defmodule GenDurable.Queries do
   #              of sharding: completions of one key serialize per shard row.
   #   c_ranges — cumulative admission ranges over shards, most-available first,
   #              so claims spread across shards and their release chains stay
-  #              balanced.
+  #              balanced. Deduplicated by (key, shard) with min(available):
+  #              under concurrent bucket writes the locked scan was OBSERVED
+  #              (bench, 8 pickers, one hot shard) to emit a bucket row twice —
+  #              old and EPQ-refreshed version — doubling its range and
+  #              over-admitting by up to its availability; min() keeps the
+  #              conservative value, and the CHECK + pick retry backstop the
+  #              rest.
   #   c_admit  — a gated row is admitted iff its per-key rank rn falls inside
   #              some shard's range; the shard is remembered on the row
   #              (concurrency_shard) so the release can credit it back addressed.
@@ -220,7 +226,11 @@ defmodule GenDurable.Queries do
     SELECT key, shard, available,
            sum(available) OVER (PARTITION BY key ORDER BY available DESC, shard
                                 ROWS UNBOUNDED PRECEDING) AS hi
-    FROM c_locked
+    FROM (
+      SELECT key, shard, min(available) AS available
+      FROM c_locked
+      GROUP BY key, shard
+    ) d
   ),
   c_admit AS (
     SELECT w.id, r.shard
@@ -349,7 +359,16 @@ defmodule GenDurable.Queries do
     enrich(repo, Enum.map(jobs, &to_job(&1, worker)))
   rescue
     e in Postgrex.Error ->
-      if is_map(e.postgres) && e.postgres[:constraint] == "gen_durable_concurrency_active" do
+      # Two constraint-resolved races, one discipline (constraint = correctness,
+      # retry = resolution): the K=1 unique arbiter, and the gate buckets' CHECK
+      # (a residual over-admission race — see c_ranges' dedup — aborts the whole
+      # claim instead of committing it).
+      constraint = is_map(e.postgres) && e.postgres[:constraint]
+
+      if constraint in [
+           "gen_durable_concurrency_active",
+           "gen_durable_concurrency_buckets_check"
+         ] do
         :telemetry.execute([:gen_durable, :concurrency, :contended], %{count: 1}, %{queue: queue})
 
         if attempts > 1,

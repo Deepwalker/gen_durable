@@ -276,7 +276,27 @@ did not need capping.
 Crash paths deliberately under-credit (a leaked slot means *stricter*-than-limit, never
 looser); the GC reconciler repairs the counters from the executing-rows truth each sweep,
 and the `CHECK (0 ≤ available ≤ cap)` makes both over-admission and double-credit
-uncommittable at the schema level.
+uncommittable at the schema level. The CHECK is not decorative: the drain bench below
+caught a real over-admission race through it (a locked bucket scan emitting a row twice
+under concurrent writes — fixed by deduplication in the pick, with the CHECK + retry as
+the remaining backstop).
+
+**Measured** (drain of 20k zero-length jobs, 8 concurrent pickers, batch 50, local
+Postgres 17 — the §2b methodology):
+
+| scenario | throughput | vs baseline |
+|---|---|---|
+| no key (baseline) | 9 965 jobs/s | 1.00× |
+| gate, never throttling, 1 shard | 4 469 jobs/s | 0.45× |
+| gate, never throttling, 8 shards | 8 019 jobs/s | 0.80× |
+
+One hot shard serializes both the batched grants and every per-completion credit on a
+single row — the worst case by construction (zero-length steps = pure gate traffic) —
+and still moves ~4.5k jobs/s through one gate; 8 shards recover to 0.80× of lockless.
+Real workloads sit far from this ceiling: with steps of any real duration, the cap
+itself throttles the key long before the gate's machinery does (the §2b self-limiting
+argument). Capped-scenario numbers are omitted — with zero-length steps they measure
+the drain loop's backoff, not the engine.
 
 ---
 
