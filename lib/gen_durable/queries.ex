@@ -124,23 +124,35 @@ defmodule GenDurable.Queries do
   #   winners  — unconfigured keys keep only their rn=1 row (the K=1 window
   #              dedup); GATED keys (name in concurrency_configs) keep ALL their
   #              candidate rows — their admission is capacity-based, below.
-  #   c_heal   — recreate (full) a gated key's missing bucket shards (swept by
-  #              GC while the key slept); invisible to c_locked this statement,
-  #              admitted next pick. No-op on the common path.
+  #   c_cold   — a gated key with NO bucket rows (first use, or swept by GC
+  #              while the key slept) is COLD: its capacity is known without
+  #              reading anything — a fresh mint is full by definition — so
+  #              this CTE computes the virtual full shards from the config.
+  #              Cold admission is immediate (no heal-lag): the ranges below
+  #              union the virtual shards in, and c_mint at the end INSERTS
+  #              them already debited. No-op on the common path.
   #   c_locked — lock ALL bucket shards of the gated winner keys, ordered
   #              (key, shard): grants are BATCHED — one lock pass per pick over
   #              the aggregate capacity — while releases are addressed per shard
   #              (see the credit riders in complete_*), which is the whole point
   #              of sharding: completions of one key serialize per shard row.
-  #   c_ranges — cumulative admission ranges over shards, most-available first,
-  #              so claims spread across shards and their release chains stay
-  #              balanced. Deduplicated by (key, shard) with min(available):
-  #              under concurrent bucket writes the locked scan was OBSERVED
-  #              (bench, 8 pickers, one hot shard) to emit a bucket row twice —
-  #              old and EPQ-refreshed version — doubling its range and
-  #              over-admitting by up to its availability; min() keeps the
-  #              conservative value, and the CHECK + pick retry backstop the
-  #              rest.
+  #   c_ranges — cumulative admission ranges over shards (locked ∪ cold),
+  #              most-available first, so claims spread across shards and their
+  #              release chains stay balanced. The locked side is deduplicated
+  #              by (key, shard) with min(available): under concurrent bucket
+  #              writes the locked scan was OBSERVED (bench, 8 pickers, one hot
+  #              shard) to emit a bucket row twice — old and EPQ-refreshed
+  #              version — doubling its range and over-admitting; min() keeps
+  #              the conservative value, and the CHECK + pick retry backstop
+  #              the rest.
+  #   c_mint   — materialize the cold shards, pre-debited (cap − taken), in
+  #              key/shard order. Two picks can race the same cold key (both
+  #              see it bucketless — neither's insert is visible to the other):
+  #              ON CONFLICT DO UPDATE merges the loser's debit onto the
+  #              winner's row (available − (EXCLUDED.cap − EXCLUDED.available));
+  #              if the combined debits overdraw the cap, the CHECK aborts the
+  #              losing claim and the pick retries — the same
+  #              constraint-equals-correctness discipline as everywhere else.
   #   c_admit  — a gated row is admitted iff its per-key rank rn falls inside
   #              some shard's range; the shard is remembered on the row
   #              (concurrency_shard) so the release can credit it back addressed.
@@ -201,18 +213,14 @@ defmodule GenDurable.Queries do
            ON cc.name = split_part(c.concurrency_key, ':', 1)
     WHERE c.rn = 1 OR cc.name IS NOT NULL
   ),
-  c_heal AS (
-    INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available)
-    SELECT k.concurrency_key, s.shard,
-           (cc.cap / cc.shards) + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END,
-           (cc.cap / cc.shards) + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END
+  c_cold AS (
+    SELECT k.concurrency_key AS key, s.shard,
+           (cc.cap / cc.shards) + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END AS cap
     FROM (SELECT DISTINCT concurrency_key FROM winners WHERE gated) k
     JOIN gen_durable_concurrency_configs cc ON cc.name = split_part(k.concurrency_key, ':', 1)
     CROSS JOIN LATERAL generate_series(0, cc.shards - 1) AS s(shard)
     WHERE NOT EXISTS (SELECT 1 FROM gen_durable_concurrency_buckets b
                       WHERE b.key = k.concurrency_key)
-    ORDER BY k.concurrency_key, s.shard
-    ON CONFLICT (key, shard) DO NOTHING
   ),
   c_locked AS (
     SELECT b.key, b.shard, b.available
@@ -230,6 +238,8 @@ defmodule GenDurable.Queries do
       SELECT key, shard, min(available) AS available
       FROM c_locked
       GROUP BY key, shard
+      UNION ALL
+      SELECT key, shard, cap AS available FROM c_cold
     ) d
   ),
   c_admit AS (
@@ -302,6 +312,20 @@ defmodule GenDurable.Queries do
           WHERE c.concurrency_shard IS NOT NULL
           GROUP BY 1, 2) d
     WHERE b.key = d.key AND b.shard = d.shard
+  ),
+  c_mint AS (
+    INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available)
+    SELECT c.key, c.shard, c.cap, c.cap - coalesce(d.cnt, 0)
+    FROM c_cold c
+    LEFT JOIN (SELECT cl.concurrency_key AS key, cl.concurrency_shard AS shard, count(*) AS cnt
+               FROM claimed cl
+               WHERE cl.concurrency_shard IS NOT NULL
+               GROUP BY 1, 2) d
+      ON d.key = c.key AND d.shard = c.shard
+    ORDER BY c.key, c.shard
+    ON CONFLICT (key, shard) DO UPDATE
+      SET available = gen_durable_concurrency_buckets.available
+                      - (EXCLUDED.cap - EXCLUDED.available)
   ),
   throttled AS (
     SELECT w.rkey AS key, count(*) AS wanted, count(gr.id) AS granted
@@ -961,8 +985,6 @@ defmodule GenDurable.Queries do
         "JOIN gen_durable_rate_configs cfg ON cfg.name = split_part(k, ':', 1) " <>
         "WHERE EXISTS (SELECT 1 FROM claim) " <>
         "ORDER BY k ON CONFLICT (key) DO NOTHING), " <>
-        ensure_gates_cte(19) <>
-        ", " <>
         "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
         "AND id = ANY($4::bigint[])), " <>
         "ins AS (INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>
@@ -984,7 +1006,7 @@ defmodule GenDurable.Queries do
 
     args =
       [parent_id, next_step, state_json, consumed_ids, bucket_keys(children)] ++
-        column_arrays(children) ++ [worker, gate_keys(children)]
+        column_arrays(children) ++ [worker]
 
     %{num_rows: n} = q!(repo, "schedule_childs", sql, args)
     committed?(n)
@@ -1081,33 +1103,8 @@ defmodule GenDurable.Queries do
       "ORDER BY k ON CONFLICT (key) DO NOTHING)"
   end
 
-  # Ensure a gated concurrency_key's bucket shards exist (full) at insert time,
-  # so its first pick can grant without the heal-lag. `$n` is a text[] of the
-  # rows' distinct concurrency keys; unconfigured names simply don't join the
-  # configs and cost nothing. Per-shard cap distributes the remainder to the
-  # low shards. Ordered insert (arbiter-deadlock discipline).
-  defp ensure_gates_cte(n) do
-    "c_ensure AS (INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available) " <>
-      "SELECT k, s.shard, " <>
-      "cc.cap / cc.shards + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END, " <>
-      "cc.cap / cc.shards + CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END " <>
-      "FROM unnest($#{n}::text[]) k " <>
-      "JOIN gen_durable_concurrency_configs cc ON cc.name = split_part(k, ':', 1) " <>
-      "CROSS JOIN LATERAL generate_series(0, cc.shards - 1) AS s(shard) " <>
-      "WHERE NOT EXISTS (SELECT 1 FROM gen_durable_concurrency_buckets b WHERE b.key = k) " <>
-      "ORDER BY k, s.shard ON CONFLICT (key, shard) DO NOTHING)"
-  end
-
   defp bucket_keys(rows),
     do: rows |> Enum.map(& &1.rate_limit) |> Enum.reject(&is_nil/1) |> Enum.uniq() |> Enum.sort()
-
-  defp gate_keys(rows),
-    do:
-      rows
-      |> Enum.map(& &1.concurrency_key)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.uniq()
-      |> Enum.sort()
 
   # Seed/refresh the rate-limit policy table at engine start. `configs` is a list of
   # `%{name, rate, burst}`. Idempotent: re-running with changed numbers updates them.
@@ -1263,7 +1260,35 @@ defmodule GenDurable.Queries do
                 [keys, shards]
               )
 
-            healed + deleted
+            # Restore the all-or-nothing shard invariant: a shards-count
+            # increase leaves existing gates with missing high shards (silently
+            # shrunk capacity), and the pick's cold-mint fires only for keys
+            # with NO buckets at all — so mint the missing in-range shards here,
+            # full (a never-existed shard has nothing executing against it).
+            # ON CONFLICT DO NOTHING: a racing pick-mint's debited row wins.
+            %{num_rows: minted} =
+              q!(
+                repo,
+                "conc_backfill",
+                """
+                INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available)
+                SELECT k.key, s.shard,
+                       (cc.cap / cc.shards +
+                        CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END),
+                       (cc.cap / cc.shards +
+                        CASE WHEN s.shard < (cc.cap % cc.shards) THEN 1 ELSE 0 END)
+                FROM (SELECT DISTINCT key FROM gen_durable_concurrency_buckets) k
+                JOIN gen_durable_concurrency_configs cc ON cc.name = split_part(k.key, ':', 1)
+                CROSS JOIN LATERAL generate_series(0, cc.shards - 1) AS s(shard)
+                WHERE NOT EXISTS (SELECT 1 FROM gen_durable_concurrency_buckets b
+                                  WHERE b.key = k.key AND b.shard = s.shard)
+                ORDER BY k.key, s.shard
+                ON CONFLICT (key, shard) DO NOTHING
+                """,
+                []
+              )
+
+            healed + deleted + minted
         end
       end)
 
@@ -1274,14 +1299,12 @@ defmodule GenDurable.Queries do
     sql =
       "WITH " <>
         ensure_buckets_cte(13) <>
-        ", " <>
-        ensure_gates_cte(14) <>
         " INSERT INTO gen_durable (#{@insert_cols}) VALUES " <>
         "($1, $2, $3, $4::text::jsonb, $5, $6, $7, COALESCE($8::timestamptz, now()), " <>
         "$9, $10::text[]::durable_status[], $11, $12)" <>
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
-    case q!(repo, "insert", sql, row_args(p) ++ [bucket_keys([p]), gate_keys([p])]) do
+    case q!(repo, "insert", sql, row_args(p) ++ [bucket_keys([p])]) do
       %{rows: [[id]]} -> {:ok, id}
       %{rows: []} -> {:error, :duplicate}
     end
@@ -1301,8 +1324,6 @@ defmodule GenDurable.Queries do
     sql =
       "WITH " <>
         ensure_buckets_cte(13) <>
-        ", " <>
-        ensure_gates_cte(14) <>
         " INSERT INTO gen_durable (#{@insert_cols}) " <>
         @unnest_row_select <>
         " " <>
@@ -1311,7 +1332,7 @@ defmodule GenDurable.Queries do
         " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING id"
 
     %{rows: out} =
-      q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows), gate_keys(rows)])
+      q!(repo, "insert_all", sql, column_arrays(rows) ++ [bucket_keys(rows)])
 
     List.flatten(out)
   end

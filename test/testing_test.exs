@@ -107,6 +107,14 @@ defmodule GenDurable.TestingTest do
     {:ok, a} = GenDurable.insert(GenDurable.Test.Plain, concurrency_key: {:gate, 7}, repo: Repo)
     {:ok, b} = GenDurable.insert(GenDurable.Test.Plain, concurrency_key: {:gate, 7}, repo: Repo)
 
+    # the gate is COLD (no bucket rows exist yet) — the first pick must
+    # mint-and-admit in the same statement, or drain would see an empty pick
+    # and wrongly stop at "quiescence" with runnable work left
+    %{rows: [[buckets]]} =
+      Repo.query!("SELECT count(*) FROM gen_durable_concurrency_buckets WHERE key = 'gate:7'")
+
+    assert buckets == 0
+
     # cap 1: the drain loop admits one, its completion credits the slot back,
     # the next iteration admits the other — all through the production pick
     assert %{done: 2} = drain()

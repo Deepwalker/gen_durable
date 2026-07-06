@@ -5,6 +5,20 @@ All notable changes to `gen_durable` are documented here. The format follows
 **no backward-compatibility guarantees** — there is one schema version and migrations are
 edited in place until the MVP settles.
 
+## 0.2.3
+
+### Fixed
+- **Cold gates admit with zero lag** (external report: a mid-flight `concurrency_key`
+  switch onto a bucketless gate returned an empty pick, breaking
+  `GenDurable.Testing.drain/1`'s quiescence contract and stretching the production
+  scheduler's idle backoff). The mint is now part of admission: the pick computes a cold
+  gate's virtual full shards from the config, admits against them, and materializes the
+  buckets pre-debited in the same statement; racing double-mints merge via ON CONFLICT
+  with the CHECK + retry backstop. The gate ensure riders on the insert paths and the
+  pick's heal CTE are deleted — "no buckets" is indistinguishable from "buckets full".
+  The GC reconciler also backfills missing in-range shards, so a `shards:` increase no
+  longer silently shrinks a live gate's capacity.
+
 ## 0.2.2
 
 ### Added

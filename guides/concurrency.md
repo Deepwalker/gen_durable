@@ -30,7 +30,9 @@ thirty-second calls at once; `limit: 10` never has more than 10 in flight.
   dies. No per-step locks, no pinned connections.
 - **Gates (configured)**: per-key slot counters with a database `CHECK` — over-admission
   is uncommittable. The pick debits slots in one batched pass; every outcome credits its
-  slot back. Crash paths under-credit (the safe direction: temporarily stricter than K)
+  slot back. Counters are minted lazily, **pre-debited, by the first claim itself** — a
+  cold gate (first use, or swept by GC after the key went idle) admits with zero lag.
+  Crash paths under-credit (the safe direction: temporarily stricter than K)
   and the GC reconciler repairs the counters from the executing-rows truth each sweep.
 - An await **releases** the slot (parking is not executing); the woken step re-admits
   through the gate. Prefetch-buffered rows hold slots (they are claimed).

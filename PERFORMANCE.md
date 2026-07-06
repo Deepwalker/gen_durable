@@ -286,13 +286,16 @@ Postgres 17 — the §2b methodology):
 
 | scenario | throughput | vs baseline |
 |---|---|---|
-| no key (baseline) | 9 965 jobs/s | 1.00× |
-| gate, never throttling, 1 shard | 4 469 jobs/s | 0.45× |
-| gate, never throttling, 8 shards | 8 019 jobs/s | 0.80× |
+| no key (baseline) | 9 579 jobs/s | 1.00× |
+| gate, never throttling, 1 shard | 4 389 jobs/s | 0.46× |
+| gate, never throttling, 8 shards | 8 428 jobs/s | 0.88× |
 
 One hot shard serializes both the batched grants and every per-completion credit on a
 single row — the worst case by construction (zero-length steps = pure gate traffic) —
-and still moves ~4.5k jobs/s through one gate; 8 shards recover to 0.80× of lockless.
+and still moves ~4.4k jobs/s through one gate; 8 shards recover to ~0.9× of lockless.
+Cold gates cost nothing extra: the first claim mints the counters pre-debited in the
+same statement (a racing double-mint merges via ON CONFLICT, overdraft aborted by the
+CHECK and retried), so "no buckets yet" is indistinguishable from "buckets full".
 Real workloads sit far from this ceiling: with steps of any real duration, the cap
 itself throttles the key long before the gate's machinery does (the §2b self-limiting
 argument). Capped-scenario numbers are omitted — with zero-length steps they measure

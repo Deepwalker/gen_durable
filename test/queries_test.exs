@@ -162,7 +162,12 @@ defmodule GenDurable.QueriesTest do
       :ok = seed_gate("api", 2)
       for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
 
-      # insert ensured the bucket (full); the pick admits exactly the cap
+      # buckets are minted lazily — a cold gate is the normal state before the
+      # first claim…
+      assert gate_buckets("api") == []
+
+      # …and the FIRST pick both mints them (pre-debited) and admits the cap —
+      # zero cold-gate lag
       jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
       assert length(jobs) == 2
       assert gate_buckets("api") == [[0, 2, 0]]
@@ -255,6 +260,36 @@ defmodule GenDurable.QueriesTest do
       assert Queries.reconcile_concurrency(Repo) == 2
       assert gate_buckets("api") == []
       assert gate_buckets("ghost:1") == []
+    end
+
+    test "a mid-flight key switch onto a cold gate is admitted by the very next pick" do
+      # the report that motivated the zero-lag mint: a step transitions onto a
+      # gated key whose buckets don't exist yet (no insert ever ensured them) —
+      # the next pick must mint-and-admit in one statement, or a drain-style
+      # caller sees an empty pick and wrongly concludes quiescence
+      :ok = seed_gate("fever", 1)
+
+      {:ok, id} = Queries.insert(Repo, params())
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      :ok = Queries.complete_next(Repo, id, @worker, "commit", ~s({}), [], nil, 1, "fever:7")
+
+      assert gate_buckets("fever:7") == []
+      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert gate_buckets("fever:7") == [[0, 1, 0]]
+    end
+
+    test "reconcile backfills missing shards after a shards-count increase" do
+      :ok = seed_gate("api", 4, 2)
+      {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [[0, 2, _], [1, 2, _]] = gate_buckets("api")
+
+      # config grows to 4 shards: existing gates are missing shards 2..3 (the
+      # pick's cold-mint only fires for fully bucketless keys) — capacity is
+      # silently shrunk until the reconciler restores the invariant
+      :ok = seed_gate("api", 4, 4)
+      assert Queries.reconcile_concurrency(Repo) > 0
+      assert [[0, 1, _], [1, 1, _], [2, 1, 1], [3, 1, 1]] = gate_buckets("api")
     end
 
     test ":next can release or swap the concurrency_key (nil / value; default keeps)" do

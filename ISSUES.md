@@ -475,6 +475,42 @@ written rows are not trustworthy even under `FOR UPDATE` — accumulate through
 row-resident RMW or fence with constraints, never through values carried
 across CTE boundaries.
 
+### 24. Cold-gate heal-lag broke drain's quiescence contract (external report) — FIXED
+
+Reported from a host app: a step switched its `concurrency_key` mid-flight
+onto a gate whose buckets did not exist; the pick's `c_heal` minted them
+invisibly-to-itself ("admitted next pick"), returned an empty batch, and
+`GenDurable.Testing.drain/1` — whose contract is "until quiescence, nothing
+left that can run" — treated the empty pick as done and exited with a runnable
+row stranded. Deterministic under the Ecto sandbox (minted buckets roll back
+every test, so the cold path reproduces on the first transition to every
+gate). Two root causes stacked: (1) the ensure riders covered insert /
+insert_all / schedule_childs but NOT the `:next` key-switch — a documented
+"acceptable one-pick lag" that wasn't; (2) the lag itself made "empty pick" an
+untruthful signal for every caller — including the production scheduler, whose
+idle backoff would stretch a cold gate's wake-up toward `max_poll_interval`.
+
+**Fix — the mint became part of admission (the zero-lag design):** a cold
+gate's capacity is known without reading anything (a fresh mint is full by
+definition), so the pick computes virtual full shards from the config
+(`c_cold`), admits against `locked ∪ cold`, and materializes the cold shards
+**pre-debited** (`c_mint`: `available = cap − taken`). Two picks racing the
+same cold key merge via `ON CONFLICT DO UPDATE` (the loser's debit lands on
+the winner's row); a combined overdraft is uncommittable (CHECK) and retried —
+the standing discipline. This DELETED the gate ensure riders from all three
+insert paths and the pick's `c_heal`: fewer mechanisms, no special cold state,
+"no buckets" is now indistinguishable from "buckets full". The reconciler
+additionally backfills missing in-range shards (a `shards:` increase used to
+silently shrink capacity — the all-or-nothing invariant `c_cold` relies on is
+now actively restored each sweep).
+
+Verified: full suite (incl. the reporter's exact scenario: key-switch onto a
+cold gate → admitted by the very next pick; drain over a cold gate completes
+in one call), EXPLAIN (cold CTEs `never executed` on unkeyed batches), the
+throughput bench re-run within noise of the pre-change numbers (baseline
+9 579 jobs/s, uncapped gate 1 shard 0.46×, 8 shards 0.88×), and three
+8-worker/20k conservation runs with exact post-drain slot balance.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;
