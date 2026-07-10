@@ -3,13 +3,14 @@ defmodule GenDurable.GC do
   Periodically deletes terminal (`done`/`failed`) instances older than the
   retention window — the engine's built-in pruner.
 
-  Each sweep removes at most `:gc_batch` rows (`Queries.gc/3`); if it fills the
+  Each sweep removes at most `batch` rows (`Queries.gc/3`); if it fills the
   batch, more remain, so it re-sweeps immediately to drain a backlog rather than
   waiting a full interval. A terminal child whose parent is still mid-join is
   spared — see `Queries.gc/3`.
 
-  Disable by passing `gc_interval: nil` to the engine; the GC process is then not
-  started and terminal rows accumulate until pruned externally.
+  Configured per node via the engine's `:gc` option (`[interval:, retention:,
+  batch:]`, or `false` to not run GC on this node — at least one node in the
+  cluster must, or terminal rows and stale limiter counters accumulate forever).
   """
 
   use GenServer

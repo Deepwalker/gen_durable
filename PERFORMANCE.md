@@ -410,7 +410,7 @@ what you want.
 
 ## 4b. The GC sweep (must scale with the batch, not the table)
 
-GC (`GenDurable.GC`) deletes terminal rows older than `:gc_retention` in bounded
+GC (`GenDurable.GC`) deletes terminal rows older than the configured `retention` in bounded
 batches. The naïve form is a trap — measured on a **1,000,000-row** table (800k old
 terminal, 100k terminal children of active parents, 100k active), retention 1 day,
 batch 10k:

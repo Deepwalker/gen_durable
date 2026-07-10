@@ -16,7 +16,7 @@ defmodule GenDurable.EngineTest do
       poll_interval: 25,
       lease_ttl: 1_000,
       heartbeat_interval: 300,
-      reap_interval: 150
+      reaper: [interval: 150]
     ]
 
     start_supervised!({GenDurable, Keyword.merge(defaults, opts)})
@@ -123,7 +123,7 @@ defmodule GenDurable.EngineTest do
 
   test "an await timeout wakes the step with empty awaited (not a failure)" do
     attach_telemetry([[:gen_durable, :await, :timeout]])
-    start_engine(reap_interval: 50)
+    start_engine(reaper: [interval: 50])
     {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitTimeout)
 
     row = wait_status(id, "done")
@@ -134,7 +134,7 @@ defmodule GenDurable.EngineTest do
   end
 
   test "a signal delivered before the deadline beats the await timeout" do
-    start_engine(reap_interval: 50)
+    start_engine(reaper: [interval: 50])
     {:ok, id} = GenDurable.insert(GenDurable.Test.AwaitTimeout)
 
     wait_status(id, "awaiting_signal")
@@ -271,7 +271,7 @@ defmodule GenDurable.EngineTest do
   end
 
   test "worker crash with no outcome is recovered by the reaper (attempt + 1)" do
-    start_engine(lease_ttl: 500, heartbeat_interval: 250, reap_interval: 100)
+    start_engine(lease_ttl: 500, heartbeat_interval: 250, reaper: [interval: 100])
     {:ok, id} = GenDurable.insert(GenDurable.Test.Reborn)
 
     row = wait_status(id, "done")
@@ -370,7 +370,7 @@ defmodule GenDurable.EngineTest do
   end
 
   test "heartbeat keeps a long step's lease alive (no spurious reap)" do
-    start_engine(lease_ttl: 400, heartbeat_interval: 100, reap_interval: 100)
+    start_engine(lease_ttl: 400, heartbeat_interval: 100, reaper: [interval: 100])
     {:ok, id} = GenDurable.insert(GenDurable.Test.Sleeper, state: %{"ms" => 900})
 
     row = wait_status(id, "done")
@@ -389,7 +389,7 @@ defmodule GenDurable.EngineTest do
       prefetch: 5,
       lease_ttl: 300,
       heartbeat_interval: 100,
-      reap_interval: 100,
+      reaper: [interval: 100],
       poll_interval: 25
     )
 
@@ -525,7 +525,7 @@ defmodule GenDurable.EngineTest do
   test "GC deletes a completed instance after retention and emits :swept" do
     attach_telemetry([[:gen_durable, :gc, :swept]])
     # retention 0 ⇒ a terminated row is collectible at once; sweep often.
-    start_engine(gc_interval: 30, gc_retention: 0)
+    start_engine(gc: [interval: 30, retention: 0])
     {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
 
     eventually(fn -> if row_count(id) == 0, do: {:ok, :gone}, else: :retry end)
@@ -534,15 +534,49 @@ defmodule GenDurable.EngineTest do
     assert c >= 1
   end
 
-  test "gc_interval: nil disables the GC process; terminal rows persist" do
-    start_engine(gc_interval: nil, gc_retention: 0)
-    refute Process.whereis(GenDurable.GC)
+  test "gc: false runs no GC on this node; terminal rows persist" do
+    sup = start_engine(gc: false)
+    ids = for {id, _, _, _} <- Supervisor.which_children(sup), do: id
+    refute GenDurable.GC in ids
+    assert GenDurable.Reaper in ids
 
     {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
     wait_status(id, "done")
 
     Process.sleep(100)
     assert row_count(id) == 1
+  end
+
+  test "reaper: false runs no reaper on this node" do
+    sup = start_engine(reaper: false)
+    ids = for {id, _, _, _} <- Supervisor.which_children(sup), do: id
+    refute GenDurable.Reaper in ids
+    assert GenDurable.GC in ids
+  end
+
+  test "a web-only node (queues: [], gc/reaper off) still inserts and signals" do
+    sup = start_engine(queues: [], gc: false, reaper: false)
+    ids = for {id, _, _, _} <- Supervisor.which_children(sup), do: id
+    refute Enum.any?(ids, &match?({GenDurable.Scheduler, _}, &1))
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain, correlation_key: "web:1")
+    assert :ok = GenDurable.signal("web:1", "ping", %{})
+
+    # nothing on this node executes it - the row waits for a worker node
+    Process.sleep(150)
+    assert %{status: "runnable"} = status(id)
+  end
+
+  test "a bad component option fails the boot loudly" do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {%ArgumentError{message: msg}, _stack}} =
+             GenDurable.Supervisor.start_link(name: BadBoot, repo: Repo, gc: [foo: 1])
+
+    assert msg =~ "unknown :gc option"
+
+    assert {:error, {%ArgumentError{}, _stack}} =
+             GenDurable.Supervisor.start_link(name: BadBoot, repo: Repo, reaper: true)
   end
 
   test "a :next naming an unconfigured rate_limit emits :rate_limit :unknown (spec §12)" do
@@ -571,7 +605,7 @@ defmodule GenDurable.EngineTest do
          poll_interval: 25,
          lease_ttl: 1_000,
          heartbeat_interval: 300,
-         reap_interval: 150
+         reaper: [interval: 150]
        ]}
     )
 

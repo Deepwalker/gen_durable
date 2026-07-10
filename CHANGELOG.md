@@ -5,6 +5,23 @@ All notable changes to `gen_durable` are documented here. The format follows
 **no backward-compatibility guarantees** — there is one schema version and migrations are
 edited in place until the MVP settles.
 
+## 0.2.5
+
+### Added
+- **Per-node runtime topology.** `reaper: false` / `gc: false` skip those processes on a
+  node; `queues: []` (as before) runs no schedulers. Together they express worker-only,
+  web-only (insert/signal only), and maintenance-only nodes — the operations guide gained
+  a Topologies section with the three configs and the cluster invariant (at least one
+  node must run each sweeper; duplicates are safe, sweeps claim via `SKIP LOCKED`).
+  Disabled components log one line at boot. Invalid component options fail the boot with
+  an `ArgumentError` before any side effect.
+
+### Changed
+- **GC/reaper options consolidated** (breaking, pre-1.0): `reap_interval` →
+  `reaper: [interval:]`; `gc_interval`/`gc_retention`/`gc_batch` →
+  `gc: [interval:, retention:, batch:]`; `gc_interval: nil` → `gc: false`. Partial
+  keywords merge over defaults.
+
 ## 0.2.4
 
 ### Fixed

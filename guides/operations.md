@@ -61,9 +61,12 @@ instance+queue on the same VM go straight back to `runnable` instead of waiting 
 Terminal (`done`/`failed`) rows are deleted by a built-in GC sweep, so finished work doesn't
 accumulate forever. The delete scales with the batch, not the table size.
 
-- `:gc_interval` (default `60_000` ms) — time between sweeps; `nil` disables GC entirely.
-- `:gc_retention` (default `86_400_000` ms ≈ 1 day) — how long a row is kept after it terminates.
-- `:gc_batch` (default `10_000`) — max rows per sweep; it re-sweeps at once when a sweep fills.
+Configured by the `:gc` option — `[interval:, retention:, batch:]`, or `false` to not run GC
+on this node (see [Topologies](#topologies)):
+
+- `interval` (default `60_000` ms) — time between sweeps.
+- `retention` (default `86_400_000` ms ≈ 1 day) — how long a row is kept after it terminates.
+- `batch` (default `10_000`) — max rows per sweep; it re-sweeps at once when a sweep fills.
 
 A terminal child whose parent is still mid-join is spared until the parent finishes.
 
@@ -88,10 +91,8 @@ The engine is started as `{GenDurable, opts}`:
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows |
 | `:poll_interval` | `1_000` | base ms between idle polls |
-| `:reap_interval` | `30_000` | ms between reaper sweeps (also the [await-timeout](signals.md#timeouts) resolution) |
-| `:gc_interval` | `60_000` | ms between GC sweeps; `nil` disables GC |
-| `:gc_retention` | `86_400_000` | ms a terminal row is kept before GC may delete it |
-| `:gc_batch` | `10_000` | max rows deleted per GC sweep |
+| `:reaper` | `[interval: 30_000]` | reaper sweeps (the interval is also the [await-timeout](signals.md#timeouts) resolution); `false` = none on this node |
+| `:gc` | `[interval: 60_000, retention: 86_400_000, batch: 10_000]` | GC sweeps; `false` = none on this node |
 | `:prefetch` | `0` | rows each queue buffers beyond its running slots |
 | `:min_demand` | `1` | skip picking unless at least this many slots are free |
 | `:max_poll_interval` | `5_000` | idle-backoff ceiling for the poll interval |
@@ -106,6 +107,36 @@ Defaults are conservative (fair across nodes, low idle DB chatter). Raising `:pr
 work ahead into an in-memory buffer — buffered rows are heartbeated, so depth is safe against
 `:lease_ttl`, but a deep buffer trades off cross-node fairness, priority freshness, and crash
 blast radius.
+
+## Topologies
+
+Every node runs the full engine by default. Three knobs shape a node's role: `:queues`
+(schedulers), `:reaper`, and `:gc`.
+
+```elixir
+# worker node — executes; maintenance left to others
+{GenDurable, repo: MyApp.Repo, queues: [default: 10], reaper: false, gc: false}
+
+# web node — only inserts and signals; runs nothing
+{GenDurable, repo: MyApp.Repo, queues: [], reaper: false, gc: false}
+
+# maintenance node — reaper + GC, no execution
+{GenDurable, repo: MyApp.Repo, queues: []}
+```
+
+> **The cluster must run at least one reaper and one GC somewhere.** Without a reaper, a
+> crashed worker's rows stay `executing` forever — no retry, and a K = 1 `concurrency_key`
+> they hold stays blocked. Without GC, terminal rows accumulate, stale rate buckets are never
+> pruned, and concurrency-gate counters are never reconciled after crash leaks. These are
+> per-node placement knobs, not feature switches.
+
+Running reaper/GC on **several** nodes is safe — the sweeps claim via ordered
+`SKIP LOCKED`, so concurrent sweeps skip each other's work — just redundant. There is no
+leader election, deliberately: correctness never depends on "exactly one".
+
+Seeding of `rate_limits:` / `concurrency_limits:` follows the config itself: a node seeds
+what it declares and touches nothing else. Keep the declarations on the nodes that own them
+(two nodes declaring the *same name* differently last-write-win on every boot).
 
 ## Telemetry
 

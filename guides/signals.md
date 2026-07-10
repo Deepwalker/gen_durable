@@ -76,7 +76,7 @@ def step("decide", ctx), do: {:next, "ship", ctx.state}                      # s
 For a fresh await, empty `ctx.awaited` on wake means the deadline fired. In the
 [accumulate pattern](#accumulating-a-pack), a timeout wakes you with the **partial pack** —
 "proceed with what arrived" falls out naturally. Timeout resolution is bounded by
-`:reap_interval` (the sweep that fires them; default 30s), so treat the deadline as
+the reaper's `interval` (the sweep that fires them; default 30s), so treat the deadline as
 "at least this long", not a precise timer.
 
 ## Under the hood

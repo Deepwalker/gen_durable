@@ -6,7 +6,11 @@ defmodule GenDurable.Reaper do
 
   The same tick also fires await timeouts: parked rows whose `await_deadline`
   passed go back to `runnable` (a wake, not a failure — `attempt` untouched),
-  so timeout resolution is bounded by `:reap_interval`.
+  so timeout resolution is bounded by the sweep interval.
+
+  Configured per node via the engine's `:reaper` option (`[interval: 30_000]`,
+  or `false` to not run a reaper on this node — at least one node in the
+  cluster must, or the leases of crashed workers are never reclaimed).
   """
 
   use GenServer

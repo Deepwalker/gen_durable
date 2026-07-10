@@ -50,6 +50,6 @@ GenDurable.insert(Checkout, correlation_key: "order:42", correlation_scope: [])
 > terminal inbox). Keep terminal statuses out of the scope unless you specifically want the
 > key reserved after the instance ends — and note the reservation lasts only as long as the
 > row does: [GC](operations.md) deletes terminal rows after the retention window, freeing the
-> key. For a longer reservation, raise `:gc_retention` (or disable GC).
+> key. For a longer reservation, raise the GC `retention` (or disable GC on every node).
 
 With no `correlation_key`, an instance is neither addressable nor deduplicated.
