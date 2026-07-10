@@ -45,6 +45,7 @@ defmodule GenDurable.MixProject do
         "guides/scheduling.md": [title: "Scheduling & queues"],
         "guides/testing.md": [title: "Testing"],
         "guides/operations.md": [title: "Operations"],
+        "guides/internals.md": [title: "Database internals"],
         "PERFORMANCE.md": [title: "Performance"],
         "CHANGELOG.md": [title: "Changelog"]
       ],

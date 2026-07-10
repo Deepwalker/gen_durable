@@ -22,6 +22,11 @@ edited in place until the MVP settles.
   `gc: [interval:, retention:, batch:]`; `gc_interval: nil` → `gc: false`. Partial
   keywords merge over defaults.
 
+### Documentation
+- New guide: **Database internals** — the schema map (every table and index and what it
+  serves), who reads and writes what per statement family, the locking discipline, and
+  constraints as the cross-node protocol.
+
 ## 0.2.4
 
 ### Fixed

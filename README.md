@@ -82,6 +82,7 @@ For the trivial "run once and finish" case, define [`perform/1`](guides/jobs.md)
 | [Scheduling & queues](guides/scheduling.md) | delays, priority, queues, recurring work |
 | [Testing](guides/testing.md) | inline synchronous execution (`drain`), assertions, sandbox-friendly |
 | [Operations](guides/operations.md) | migration, crash recovery, GC, the config reference, telemetry |
+| [Database internals](guides/internals.md) | the schema map — tables, indexes, who reads/writes what, locking |
 
 ## Documentation
 
