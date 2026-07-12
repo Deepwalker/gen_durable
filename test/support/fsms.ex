@@ -204,6 +204,23 @@ defmodule GenDurable.Test.Parent do
   end
 end
 
+defmodule GenDurable.Test.CrossQueueParent do
+  @moduledoc "Fans children into ANOTHER queue — proves fan-out pokes across queues."
+  use GenDurable.FSM, name: "xparent", version: 1, initial: "fan"
+
+  @impl true
+  def step("fan", %{state: s}) do
+    kids =
+      for x <- 1..Map.get(s, "n", 2),
+          do: {GenDurable.Test.Child, state: %{x: x}, queue: "kids"}
+
+    {:schedule_childs, "join", kids, s}
+  end
+
+  def step("join", %{childs: childs}),
+    do: {:done, %{"done" => Enum.count(childs, &(&1.status == "done"))}}
+end
+
 defmodule GenDurable.Test.Sleeper do
   @moduledoc "Sleeps `state[\"ms\"]` then completes — used to test heartbeat & parallelism."
   use GenDurable.FSM, name: "sleeper", version: 1, initial: "sleep"
@@ -325,6 +342,7 @@ defmodule GenDurable.Test.FSMs do
       GenDurable.Test.Plain,
       GenDurable.Test.Child,
       GenDurable.Test.Parent,
+      GenDurable.Test.CrossQueueParent,
       GenDurable.Test.Sleeper,
       GenDurable.Test.Recorder,
       GenDurable.Test.Overlap

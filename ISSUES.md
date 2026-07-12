@@ -379,7 +379,9 @@ its rows via `SELECT … ORDER BY … FOR UPDATE SKIP LOCKED` and then
 updates/deletes the claimed set — never waits, deterministic order, no cycles
 possible. SKIP LOCKED is also semantically better: a locked row is being
 actively worked (outcome committing, beat extending) — exactly when
-maintenance should skip it until the next tick.
+maintenance should skip it until the next tick. (Since 0.2.6 the
+*instance-row* statements use `FOR NO KEY UPDATE SKIP LOCKED` — same ordering
+and skip discipline, weaker strength; bucket locks stay `FOR UPDATE`.)
 
 ### 18. Window-partition collision between a numeric concurrency_key and an id — FIXED
 

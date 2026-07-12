@@ -6,7 +6,7 @@ defmodule GenDurable.MixProject do
   def project do
     [
       app: :gen_durable,
-      version: "0.2.5",
+      version: "0.2.6",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -63,6 +63,8 @@ defmodule GenDurable.MixProject do
         Runtime: [
           GenDurable.Supervisor,
           GenDurable.Scheduler,
+          GenDurable.Poke,
+          GenDurable.Await,
           GenDurable.Reaper,
           GenDurable.GC,
           GenDurable.Registry,
@@ -87,6 +89,8 @@ defmodule GenDurable.MixProject do
       {:ecto_sql, "~> 3.12"},
       {:postgrex, "~> 0.19"},
       {:jason, "~> 1.4"},
+      # only for the poke: {:redis, _} transport — see GenDurable.Poke
+      {:redix, "~> 1.2", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

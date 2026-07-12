@@ -87,7 +87,7 @@ defmodule GenDurable.Queries do
   # in a batch, and never claim a key that is already being processed — without
   # the wasted claim→violation→retry churn that prefetch would amplify on hot keys.
   #
-  # Shape: the canonical Postgres claim (one `SELECT … FOR UPDATE SKIP LOCKED
+  # Shape: the canonical Postgres claim (one `SELECT … FOR NO KEY UPDATE SKIP LOCKED
   # LIMIT`, then one `UPDATE`) plus an in-batch dedup that needs no extra pass.
   #
   #   locked — the top `$2` runnable rows by (priority, eligible_at) via the
@@ -165,7 +165,8 @@ defmodule GenDurable.Queries do
   #              writebacks are computed from the FINAL claimed set, so a row
   #              admitted by the gate but denied by its rate limit debits
   #              neither.
-  #   cand     — top-$2 runnable rows, locked once (FOR UPDATE SKIP LOCKED via gen_durable_pick),
+  #   cand     — top-$2 runnable rows, locked once (FOR NO KEY UPDATE SKIP LOCKED via
+  #              gen_durable_pick; NO KEY: see the lease/reaper locking note),
   #              with the per-concurrency_key window rank `rn`.
   #   winners  — the concurrency winners (rn = 1); add the cumulative weight `cw` of the urgency
   #              prefix per rate_limit bucket (ROWS, deterministic by id).
@@ -214,7 +215,7 @@ defmodule GenDurable.Queries do
                SELECT 1 FROM gen_durable e
                WHERE e.concurrency_key = g.concurrency_key AND e.status = 'executing'))
       ORDER BY g.priority, g.eligible_at
-      FOR UPDATE SKIP LOCKED
+      FOR NO KEY UPDATE SKIP LOCKED
       LIMIT $2
     ) s
   ),
@@ -508,14 +509,30 @@ defmodule GenDurable.Queries do
   #
   # Every multi-row maintenance statement (heartbeat, reap, release, startup
   # reclaim, bucket GC) claims its rows first via
-  # `SELECT … ORDER BY … FOR UPDATE SKIP LOCKED`, then updates/deletes the
-  # claimed set. Never waiting (SKIP LOCKED) plus deterministic order means no
-  # two maintenance statements can deadlock against each other — an unordered
+  # `SELECT … ORDER BY … FOR [NO KEY] UPDATE SKIP LOCKED`, then updates/deletes
+  # the claimed set. Never waiting (SKIP LOCKED) plus deterministic order means
+  # no two maintenance statements can deadlock against each other — an unordered
   # multi-row UPDATE locks rows in plan order, and e.g. a late heartbeat
   # (id order) overlapping the reaper (lease-index order) on two expired rows
   # would cycle. A row that is locked right now is being actively worked (its
   # outcome committing, a beat extending it) — exactly when maintenance should
   # leave it alone until the next tick.
+  #
+  # gen_durable claims lock with FOR NO KEY UPDATE — strong enough for mutual
+  # exclusion between claims and outcomes (writer-vs-writer locks conflict as
+  # before), but compatible with the FOR KEY SHARE that FK checks take on the
+  # target row (every `INSERT INTO signals`). With plain FOR UPDATE an
+  # in-flight signal insert's KEY SHARE made the pick skip its target row
+  # (SKIP LOCKED) — pure friction, no correctness. What this does NOT change:
+  # signal delivery still queues behind a claim at its wake UPDATE, which
+  # writes the row — no lock strength avoids that. Safe from lock-upgrade
+  # deadlocks BY SCHEMA: Postgres strengthens an UPDATE's row lock only when it
+  # modifies columns of a FULL unique index, our only full unique index is the
+  # immutable PK (correlation/concurrency uniques are partial — excluded), so
+  # no statement ever escalates past NO KEY strength. Adding a full unique
+  # index over a MUTABLE column would break this — revisit these locks then.
+  # Bucket-table locks stay FOR UPDATE: no FKs point at buckets, so there is
+  # no KEY SHARE traffic to coexist with.
 
   def heartbeat(_repo, [], _worker, _ttl), do: :ok
 
@@ -528,7 +545,7 @@ defmodule GenDurable.Queries do
         SELECT id FROM gen_durable
         WHERE id = ANY($1) AND locked_by = $2
         ORDER BY id
-        FOR UPDATE SKIP LOCKED
+        FOR NO KEY UPDATE SKIP LOCKED
       )
       UPDATE gen_durable g
       SET lease_expires_at = now() + $3::int * interval '1 millisecond', updated_at = now()
@@ -551,7 +568,7 @@ defmodule GenDurable.Queries do
           SELECT id FROM gen_durable
           WHERE status = 'executing' AND lease_expires_at < now()
           ORDER BY id
-          FOR UPDATE SKIP LOCKED
+          FOR NO KEY UPDATE SKIP LOCKED
         )
         UPDATE gen_durable g
         SET status = 'runnable', locked_by = null, lease_expires_at = null,
@@ -580,7 +597,7 @@ defmodule GenDurable.Queries do
           SELECT id FROM gen_durable
           WHERE status = 'awaiting_signal' AND await_deadline < now()
           ORDER BY id
-          FOR UPDATE SKIP LOCKED
+          FOR NO KEY UPDATE SKIP LOCKED
         )
         UPDATE gen_durable g
         SET status = 'runnable', eligible_at = now(), await_deadline = null, updated_at = now()
@@ -712,6 +729,9 @@ defmodule GenDurable.Queries do
   # lock. `terminal` updates the child; this updates the parent (a different
   # row), so the two table-modifications never touch the same row. The final
   # SELECT reports whether the outcome committed (1) or was stale (0).
+  # RETURNING reads the post-update row: a parent whose join just completed
+  # comes back 'runnable' — its queue is surfaced so the executor can poke it
+  # (the parent may live in a different queue than the child that woke it).
   @notify_parent """
   notify AS (
     UPDATE gen_durable p
@@ -723,8 +743,10 @@ defmodule GenDurable.Queries do
         updated_at = now()
     FROM terminal c
     WHERE c.parent_id = p.id
+    RETURNING p.status, p.queue
   )
-  SELECT count(*) FROM terminal
+  SELECT (SELECT count(*) FROM terminal),
+         (SELECT n.queue FROM notify n WHERE n.status = 'runnable' LIMIT 1)
   """
 
   # The concurrency-gate release, a rider CTE of every outcome: the row is
@@ -892,8 +914,10 @@ defmodule GenDurable.Queries do
     result
   end
 
+  # Returns {:ok, woken_parent_queue | nil} | :stale — the queue rides back so
+  # the executor can poke a parent whose join this completion satisfied.
   def complete_done(repo, id, worker, result_json) do
-    %{rows: [[n]]} =
+    %{rows: [[n, wake]]} =
       q!(
         repo,
         "complete_done",
@@ -914,11 +938,11 @@ defmodule GenDurable.Queries do
         [id, result_json, worker]
       )
 
-    committed?(n)
+    if n == 1, do: {:ok, wake}, else: :stale
   end
 
   def complete_stop(repo, id, worker, reason_text) do
-    %{rows: [[n]]} =
+    %{rows: [[n, wake]]} =
       q!(
         repo,
         "complete_stop",
@@ -939,7 +963,7 @@ defmodule GenDurable.Queries do
         [id, reason_text, worker]
       )
 
-    committed?(n)
+    if n == 1, do: {:ok, wake}, else: :stale
   end
 
   # :schedule_childs — spawn the batch and park the parent on the join
@@ -994,7 +1018,7 @@ defmodule GenDurable.Queries do
       ) do
     sql =
       "WITH claim AS (SELECT id FROM gen_durable " <>
-        "WHERE id = $1 AND locked_by = $17 AND status = 'executing' FOR UPDATE), " <>
+        "WHERE id = $1 AND locked_by = $17 AND status = 'executing' FOR NO KEY UPDATE), " <>
         credit_gate("claim") <>
         ", " <>
         "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
@@ -1040,6 +1064,60 @@ defmodule GenDurable.Queries do
     end)
   end
 
+  # --- await -----------------------------------------------------------------
+
+  # One instance's await-relevant snapshot; nil when the row does not exist
+  # (never did, or GC swept it). Plain MVCC read — takes no locks, sees the
+  # last committed version, cannot block or be blocked by claims and outcomes.
+  def await_status(repo, id) do
+    %{rows: rows} =
+      q!(
+        repo,
+        "await_status",
+        "SELECT status::text, step, attempt, result, last_error FROM gen_durable WHERE id = $1",
+        [id]
+      )
+
+    case rows do
+      [[status, step, attempt, result, last_error]] ->
+        %{
+          status: status,
+          step: step,
+          attempt: attempt,
+          result: decode_json(result),
+          error: last_error
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  # The Watcher's batched probe: of `ids`, which are worth nudging their
+  # waiters about, as `{id, status}` pairs — settled (nothing left to do
+  # without external input) or missing (swept; status nil). The status lets
+  # the Watcher skip `until: :terminal` waiters of merely-parked rows. Plain
+  # read, one statement for every waiter on this node.
+  def await_probe(repo, ids) do
+    %{rows: rows} =
+      q!(
+        repo,
+        "await_probe",
+        "SELECT id, status::text FROM gen_durable WHERE id = ANY($1::bigint[])",
+        [ids]
+      )
+
+    found = Map.new(rows, fn [id, status] -> {id, status} end)
+    settled = ~w(done failed awaiting_signal awaiting_children)
+
+    Enum.flat_map(ids, fn id ->
+      case Map.get(found, id) do
+        nil -> [{id, nil}]
+        status -> if status in settled, do: [{id, status}], else: []
+      end
+    end)
+  end
+
   # Deliver a signal in ONE statement (was BEGIN + resolve + INSERT + wake +
   # COMMIT = up to 5 round trips on the user-facing hot path). `target` is either
   # an internal id (integer) or a correlation_key (string, resolved via
@@ -1058,8 +1136,13 @@ defmodule GenDurable.Queries do
   #            parked row. A status-guarded WHERE would skip the not-yet-parked
   #            row without locking or waiting — the lost wakeup.
   # ins and wake commit atomically (one statement), so the park's recheck sees
-  # the signal exactly when the wake also happened. Returns :ok, or
-  # {:error, :no_target} when the target does not resolve to a live instance.
+  # the signal exactly when the wake also happened. Returns {:ok, queue} when
+  # the target is runnable AFTER delivery — woken by this signal, or already
+  # runnable (RETURNING sees only the post-image; filtering on a pre-image read
+  # in an earlier CTE would be EPQ-unsafe and could miss a real wake). The
+  # caller pokes that queue: a spurious poke costs one empty pick, a missed
+  # wake would cost a poll interval. {:ok, nil} otherwise, {:error, :no_target}
+  # when the target does not resolve to a live instance.
   @signal_sql_body """
   ),
   ins AS (
@@ -1077,8 +1160,10 @@ defmodule GenDurable.Queries do
                           THEN now() ELSE g.updated_at END
     FROM target t
     WHERE g.id = t.id
+    RETURNING g.status, g.queue
   )
-  SELECT count(*) FROM target
+  SELECT (SELECT count(*) FROM target),
+         (SELECT w.queue FROM wake w WHERE w.status = 'runnable' LIMIT 1)
   """
 
   @signal_by_id """
@@ -1098,8 +1183,8 @@ defmodule GenDurable.Queries do
         do: {"signal_by_id", @signal_by_id},
         else: {"signal_by_key", @signal_by_key}
 
-    %{rows: [[n]]} = q!(repo, stmt, sql, [target, name, payload_json, dedup_key])
-    if n == 1, do: :ok, else: {:error, :no_target}
+    %{rows: [[n, woken]]} = q!(repo, stmt, sql, [target, name, payload_json, dedup_key])
+    if n == 1, do: {:ok, woken}, else: {:error, :no_target}
   end
 
   # --- insert / batch insert -------------------------------------------------
@@ -1376,7 +1461,7 @@ defmodule GenDurable.Queries do
             AND left(locked_by, char_length($2)) = $2
             AND lease_expires_at < now() + $3::int * interval '1 millisecond'
           ORDER BY id
-          FOR UPDATE SKIP LOCKED
+          FOR NO KEY UPDATE SKIP LOCKED
         )
         UPDATE gen_durable g
         SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
@@ -1403,7 +1488,7 @@ defmodule GenDurable.Queries do
         SELECT id FROM gen_durable
         WHERE id = ANY($1) AND locked_by = $2 AND status = 'executing'
         ORDER BY id
-        FOR UPDATE SKIP LOCKED
+        FOR NO KEY UPDATE SKIP LOCKED
       )
       UPDATE gen_durable g
       SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()

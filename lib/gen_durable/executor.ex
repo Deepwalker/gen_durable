@@ -59,7 +59,7 @@ defmodule GenDurable.Executor do
 
     started = System.monotonic_time()
     {outcome, consumed} = invoke(module, state_module, ctx)
-    apply_outcome(repo, job, outcome, consumed)
+    apply_outcome(config, repo, job, outcome, consumed)
     warn_unknown_rate_limit(config, job, outcome)
 
     :telemetry.execute(
@@ -161,7 +161,7 @@ defmodule GenDurable.Executor do
   # guard): a `:stale` return means the lease expired and the row was reclaimed
   # while this step ran — the outcome is dropped (the new claimant redoes the
   # work) and the drop is made observable via telemetry.
-  defp apply_outcome(repo, job, outcome, consumed) do
+  defp apply_outcome(config, repo, job, outcome, consumed) do
     %{id: id, worker: worker} = job
 
     result =
@@ -212,12 +212,44 @@ defmodule GenDurable.Executor do
           Queries.complete_stop(repo, id, worker, reason_text)
       end
 
-    if result == :stale do
-      :telemetry.execute(
-        [:gen_durable, :outcome, :stale],
-        %{count: 1},
-        %{id: id, fsm: job.fsm, step: job.step, kind: Outcome.kind(outcome)}
-      )
+    case result do
+      :stale ->
+        :telemetry.execute(
+          [:gen_durable, :outcome, :stale],
+          %{count: 1},
+          %{id: id, fsm: job.fsm, step: job.step, kind: Outcome.kind(outcome)}
+        )
+
+      committed ->
+        # The committed outcome may have settled the instance (terminal or
+        # parked) — nudge this node's awaiters. A hint only: awaiters re-check
+        # the row, so over-nudging (e.g. an empty schedule_childs that left the
+        # row runnable) costs one read, never correctness.
+        if Outcome.kind(outcome) in [:await, :done, :stop, :schedule_childs] do
+          GenDurable.Await.notify_local(config.name, id)
+        end
+
+        # Cross-queue wakes ride the poke transport like inserts do. Same-queue
+        # runnable rows need none of this — the scheduler that ran this step
+        # refills on its completion.
+        case outcome do
+          # freshly-inserted children may live in other queues
+          {:schedule_childs, _next, child_params, _state} ->
+            GenDurable.Poke.dispatch_rows(config.name, child_params)
+
+          _ ->
+            :ok
+        end
+
+        # a parent whose join this terminal completion satisfied (its queue
+        # rides back in the outcome's result — see Queries.complete_done)
+        case committed do
+          {:ok, parent_queue} when is_binary(parent_queue) ->
+            GenDurable.Poke.dispatch(config.name, parent_queue)
+
+          _ ->
+            :ok
+        end
     end
 
     :ok

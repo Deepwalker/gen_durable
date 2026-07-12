@@ -111,7 +111,12 @@ defmodule GenDurable do
   With no `:correlation_key` the instance is neither addressable nor deduplicated.
   """
   def insert(fsm_module, opts \\ []) do
-    Queries.insert(repo(opts), build_params(fsm_module, opts))
+    params = build_params(fsm_module, opts)
+
+    with {:ok, id} <- Queries.insert(repo(opts), params) do
+      poke_local([params], opts)
+      {:ok, id}
+    end
   end
 
   @doc """
@@ -121,7 +126,56 @@ defmodule GenDurable do
   `correlation_key` order, so the list has no positional mapping to `entries`.
   """
   def insert_all(fsm_module, entries, opts \\ []) do
-    Queries.insert_all(repo(opts), Enum.map(entries, &build_params(fsm_module, &1)))
+    params = Enum.map(entries, &build_params(fsm_module, &1))
+    ids = Queries.insert_all(repo(opts), params)
+    if ids != [], do: poke_local(params, opts)
+    ids
+  end
+
+  @doc """
+  Wait for the instance to **settle** — the sync-over-async bridge: insert,
+  poke does the discovery, `await/3` holds the caller until there is something
+  to report or the deadline passes.
+
+      case GenDurable.await(id, 1_000) do
+        {:done, result}   -> # finished; result is the FSM's result map
+        {:failed, error}  -> # terminal failure (retries exhausted)
+        {:awaiting, snap} -> # parked: waiting on a signal / children
+        {:busy, snap}     -> # deadline hit, still working — hand the client
+                             # the id as a retry token (HTTP 202 + Retry-After)
+        :not_found        -> # no such row (never existed, or GC-swept)
+      end
+
+  Calling `await/3` again with the same id is the retry protocol — a row that
+  finished in the meantime answers immediately. Retry tokens live as long as
+  the row: terminal rows are swept `retention` after finishing (a day by
+  default), in-progress rows are never swept.
+
+  Semantics to know:
+
+    * **A timeout is not a failure.** `{:busy, _}` means the work continues;
+      map it to "in progress", never to an error.
+    * **The row is the truth.** The executor's completion push and the batched
+      watcher only shorten the wait; the reply is always read back from the
+      database. Same-node completions answer in ~ms; cross-node ones within
+      the watcher tick (`await: [tick: 25]` engine option).
+    * A **retryable error is not `failed`**: a step in backoff shows as
+      `{:busy, %{status: :runnable, attempt: n}}`; `{:failed, _}` is terminal.
+    * `until: :terminal` waits through parked states instead of returning
+      `{:awaiting, _}` (default `until: :settled`).
+    * `snap` is `%{status, step, attempt}` — enough to show progress.
+
+  Options: `:until` (above), `:name`/`:repo` as everywhere. With no running
+  instance (bare `:repo`), falls back to a plain poll loop.
+  """
+  def await(id, timeout \\ 5_000, opts \\ []) when is_integer(id) and timeout >= 0 do
+    GenDurable.Await.await(
+      repo(opts),
+      Keyword.get(opts, :name, GenDurable),
+      id,
+      timeout,
+      Keyword.get(opts, :until, :settled)
+    )
   end
 
   @doc """
@@ -136,13 +190,24 @@ defmodule GenDurable do
   not held for an instance that does not exist. Returns `:ok` otherwise.
   """
   def signal(target, name, payload \\ %{}, opts \\ []) do
-    Queries.deliver_signal(
-      repo(opts),
-      target,
-      to_string(name),
-      Jason.encode!(payload),
-      opts[:dedup_key]
-    )
+    case Queries.deliver_signal(
+           repo(opts),
+           target,
+           to_string(name),
+           Jason.encode!(payload),
+           opts[:dedup_key]
+         ) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, woken_queue} ->
+        # the wake flipped the target to runnable — announce it like an insert
+        GenDurable.Poke.dispatch(Keyword.get(opts, :name, GenDurable), woken_queue)
+        :ok
+
+      {:error, _} = err ->
+        err
+    end
   end
 
   # --- helpers ---------------------------------------------------------------
@@ -195,6 +260,15 @@ defmodule GenDurable do
       true -> nil
     end
   end
+
+  # Poke the schedulers of every queue that just received a row due NOW, so the
+  # work is discovered immediately instead of on the next poll tick. Routed
+  # through the instance's configured transport (local node / cluster / Redis —
+  # see `GenDurable.Poke`); best-effort in every mode. A node with nobody to
+  # poke (web-only topology, foreign queue, no engine at all — the Testing
+  # path) is a no-op and the insert is discovered by whoever polls.
+  defp poke_local(params, opts),
+    do: GenDurable.Poke.dispatch_rows(Keyword.get(opts, :name, GenDurable), params)
 
   # Resolve the repo for an API call: an explicit `:repo` wins, else the config
   # of the `:name`d instance (default `GenDurable`).

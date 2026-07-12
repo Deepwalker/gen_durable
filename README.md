@@ -17,7 +17,7 @@ Idempotency of step effects is the user's responsibility.
 ## Install
 
 ```elixir
-def deps, do: [{:gen_durable, "~> 0.2.5"}]
+def deps, do: [{:gen_durable, "~> 0.2.6"}]
 ```
 
 Add the migration (the DDL lives in the library) and run it:
@@ -72,7 +72,7 @@ For the trivial "run once and finish" case, define [`perform/1`](guides/jobs.md)
 
 | Guide | What |
 |---|---|
-| [Jobs](guides/jobs.md) | one-shot durable jobs (`perform/1\|2`) with retries and backoff |
+| [Jobs](guides/jobs.md) | one-shot durable jobs (`perform/1\|2`) with retries, backoff, and `await/3` to wait for a result |
 | [State machines](guides/machines.md) | `step/2`, typed `State`, the outcome contract, error handling |
 | [Signals & await](guides/signals.md) | park on external events; durable, at-least-once, sets and packs |
 | [Child fan-out](guides/children.md) | `schedule_childs` — fan work out, join on all of it |
@@ -81,7 +81,7 @@ For the trivial "run once and finish" case, define [`perform/1`](guides/jobs.md)
 | [Instance identity](guides/identity.md) | `correlation_key` — address a signal by business key + dedup |
 | [Scheduling & queues](guides/scheduling.md) | delays, priority, queues, recurring work |
 | [Testing](guides/testing.md) | inline synchronous execution (`drain`), assertions, sandbox-friendly |
-| [Operations](guides/operations.md) | migration, crash recovery, GC, the config reference, telemetry |
+| [Operations](guides/operations.md) | migration, crash recovery, GC, node topologies, the config reference, telemetry |
 | [Database internals](guides/internals.md) | the schema map — tables, indexes, who reads/writes what, locking |
 
 ## Documentation

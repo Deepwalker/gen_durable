@@ -554,6 +554,280 @@ defmodule GenDurable.EngineTest do
     assert GenDurable.GC in ids
   end
 
+  test "a local insert pokes the queue's scheduler — no waiting for the poll" do
+    # the startup poll fires once at 0; after that the next poll is a minute
+    # away, so only the poke can get this job executed within the 5s deadline
+    start_engine(poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    assert %{status: "done"} = wait_status(id, "done")
+  end
+
+  test "a future-scheduled insert pokes nobody" do
+    attach_telemetry([[:gen_durable, :pick, :stop]])
+    start_engine(poll_interval: 60_000, max_poll_interval: 60_000)
+
+    # swallow the startup poll's pick event
+    assert_receive {:telemetry, [:gen_durable, :pick, :stop], _, _}, 1_000
+
+    {:ok, _} = GenDurable.insert(GenDurable.Test.Plain, schedule_in: 60_000)
+    refute_receive {:telemetry, [:gen_durable, :pick, :stop], _, _}, 300
+  end
+
+  defp redis_url, do: System.get_env("REDIS_URL", "redis://localhost:6379")
+
+  test "poke: :cluster fans out to every member of the queue's pg group" do
+    start_engine(poke: :cluster, poll_interval: 60_000, max_poll_interval: 60_000)
+
+    # a stand-in for a remote node's scheduler: a real one differs only in
+    # living on another node, and delivery over distribution is OTP's contract
+    :ok = :pg.join(GenDurable.Poke.scope(GenDurable), "default", self())
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    assert_receive :poke, 1_000
+    assert %{status: "done"} = wait_status(id, "done")
+  end
+
+  test "poke: {:redis, _} executes a local insert immediately (the direct leg)" do
+    start_engine(poke: {:redis, redis_url()}, poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    assert %{status: "done"} = wait_status(id, "done")
+  end
+
+  test "a foreign-origin redis publish pokes this node's schedulers" do
+    start_engine(poke: {:redis, redis_url()}, poll_interval: 60_000, max_poll_interval: 60_000)
+    # let the startup poll (scheduled at 0) pass — only the publish may
+    # deliver this row within the deadline
+    Process.sleep(100)
+
+    # a row inserted "on another node": straight through Queries, no poke here
+    {:ok, id} =
+      GenDurable.Queries.insert(Repo, GenDurable.build_params(GenDurable.Test.Plain, []))
+
+    # publish as another VM would; retried so the test doesn't race the
+    # listener's subscribe handshake
+    {:ok, redix} = Redix.start_link(redis_url())
+
+    eventually(fn ->
+      Redix.command!(redix, [
+        "PUBLISH",
+        GenDurable.Poke.channel(GenDurable),
+        "other-vm#1|default"
+      ])
+
+      if status(id).status == "done", do: {:ok, :done}, else: :retry
+    end)
+  end
+
+  test "a self-originated redis publish is dropped (the direct leg already ran)" do
+    start_engine(poke: {:redis, redis_url()}, poll_interval: 60_000, max_poll_interval: 60_000)
+    # let the startup poll (scheduled at 0) pass before the row exists
+    Process.sleep(100)
+
+    {:ok, id} =
+      GenDurable.Queries.insert(Repo, GenDurable.build_params(GenDurable.Test.Plain, []))
+
+    token = GenDurable.Scheduler.vm_id()
+    {:ok, redix} = Redix.start_link(redis_url())
+
+    # the later publishes certainly hit a live subscription; a broken origin
+    # check would run the job and fail the final assert
+    for _ <- 1..10 do
+      Redix.command!(redix, ["PUBLISH", GenDurable.Poke.channel(GenDurable), token <> "|default"])
+      Process.sleep(50)
+    end
+
+    assert %{status: "runnable"} = status(id)
+  end
+
+  test "await: a fresh insert answers {:done, result} within the call (local push)" do
+    # poll 60s: only poke discovers the row, only the executor's nudge (or the
+    # 25ms watcher) can answer the await this fast
+    start_engine(poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    assert {:done, %{}} = GenDurable.await(id, 3_000)
+  end
+
+  test "await: deadline hit returns {:busy, snap}; a later await is the retry protocol" do
+    start_engine(poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Sleeper, state: %{ms: 400})
+
+    assert {:busy, %{status: status}} = GenDurable.await(id, 100)
+    assert status in [:runnable, :executing]
+
+    # the client came back with the id token — the work finished meanwhile
+    assert {:done, %{"slept" => 400}} = GenDurable.await(id, 3_000)
+  end
+
+  test "await: a parked instance settles as {:awaiting, snap}; :terminal waits through it" do
+    # poll 60s end to end: the insert reaches "parked" via the insert poke, and
+    # the resume after the signal is reachable only via the signal-wake poke
+    start_engine(poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Awaiter)
+    assert {:awaiting, %{status: :awaiting_signal}} = GenDurable.await(id, 3_000)
+
+    # until: :terminal treats the park as still-pending
+    assert {:busy, %{status: :awaiting_signal}} = GenDurable.await(id, 200, until: :terminal)
+
+    :ok = GenDurable.signal(id, "go", %{n: 1})
+    assert {:done, %{"got" => %{"n" => 1}}} = GenDurable.await(id, 3_000)
+  end
+
+  test "a cross-queue fan-out completes with 60s polls: children and the join wake are poked" do
+    # parent on "default", children on "kids": the insert poke starts the
+    # parent, the schedule_childs poke starts the children in THEIR queue, and
+    # the last child's completion pokes the woken parent's queue — three
+    # different poke paths, no poll assistance
+    start_engine(
+      queues: [default: 5, kids: 5],
+      poll_interval: 60_000,
+      max_poll_interval: 60_000
+    )
+
+    Process.sleep(100)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.CrossQueueParent, state: %{n: 3})
+    # until: :terminal — the fan-out parks the parent (awaiting_children is a
+    # settled state), and we want the whole round trip
+    assert {:done, %{"done" => 3}} = GenDurable.await(id, 5_000, until: :terminal)
+  end
+
+  test "await: unknown id is :not_found immediately" do
+    start_engine()
+    assert :not_found = GenDurable.await(999_999_999, 5_000)
+  end
+
+  test "await: a result committed by 'another node' arrives via the watcher tick" do
+    # queues: [] — nothing executes locally, so no executor nudge can fire;
+    # the batched watcher is the only wake-up source
+    start_engine(queues: [], poll_interval: 60_000, max_poll_interval: 60_000)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    waiter = Task.async(fn -> GenDurable.await(id, 3_000) end)
+    Process.sleep(100)
+
+    # complete the row as a foreign worker would
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'executing', locked_by = 'foreign' WHERE id = $1",
+      [id]
+    )
+
+    {:ok, _} = GenDurable.Queries.complete_done(Repo, id, "foreign", ~s({"via": "watcher"}))
+
+    assert {:done, %{"via" => "watcher"}} = Task.await(waiter)
+  end
+
+  test "await: works with a bare repo and no running engine (poll loop)" do
+    {:ok, id} =
+      GenDurable.Queries.insert(Repo, GenDurable.build_params(GenDurable.Test.Plain, []))
+
+    waiter = Task.async(fn -> GenDurable.await(id, 3_000, repo: Repo) end)
+    Process.sleep(80)
+
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'executing', locked_by = 'bare' WHERE id = $1",
+      [id]
+    )
+
+    {:ok, _} = GenDurable.Queries.complete_done(Repo, id, "bare", ~s({}))
+
+    assert {:done, %{}} = Task.await(waiter)
+  end
+
+  test "await: the engine stopping mid-wait returns {:busy}, never crashes the caller" do
+    # queues: [] — the row stays runnable, so the waiter is parked in its
+    # receive when the whole engine (Watcher, waiter table) goes down; the reply
+    # and the after-block cleanup must both survive that
+    start_engine(queues: [], gc: false, reaper: false)
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+
+    waiter = Task.async(fn -> GenDurable.await(id, 600) end)
+    Process.sleep(150)
+    :ok = stop_supervised(GenDurable)
+
+    assert {:busy, %{status: :runnable}} = Task.await(waiter)
+  end
+
+  test "await: a Watcher restart mid-wait costs the re-arm cadence, not the deadline" do
+    # queues: [] — no executor nudge; the kill empties the Watcher's waiters
+    # map, so only the waiter's own re-arm re-check can see the completion
+    start_engine(queues: [], poll_interval: 60_000, max_poll_interval: 60_000)
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    started = System.monotonic_time(:millisecond)
+    waiter = Task.async(fn -> GenDurable.await(id, 10_000) end)
+    Process.sleep(100)
+
+    Process.exit(Process.whereis(GenDurable.Await.watcher(GenDurable)), :kill)
+    Process.sleep(50)
+
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'executing', locked_by = 'foreign' WHERE id = $1",
+      [id]
+    )
+
+    {:ok, _} = GenDurable.Queries.complete_done(Repo, id, "foreign", ~s({"via": "rearm"}))
+
+    assert {:done, %{"via" => "rearm"}} = Task.await(waiter, 11_000)
+    # well under the deadline: the re-arm pass (≤1s) picked it up
+    assert System.monotonic_time(:millisecond) - started < 5_000
+  end
+
+  test "poke survives a :pg scope restart: schedulers re-join the restarted scope" do
+    start_engine(poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    scope = GenDurable.Poke.scope(GenDurable)
+    old = Process.whereis(scope)
+    Process.exit(old, :kill)
+
+    # the RESTARTED scope starts empty; wait for the schedulers' monitors to
+    # re-join it (the old pid's ETS can linger for a beat — don't trust it)
+    eventually(fn ->
+      try do
+        new = Process.whereis(scope)
+
+        if new && new != old && :pg.get_local_members(scope, "default") != [],
+          do: {:ok, :joined},
+          else: :retry
+      catch
+        # the membership table vanished mid-read (old scope mid-death)
+        _, _ -> :retry
+      end
+    end)
+
+    # with 60s polls, only a working poke can run this within the await window
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    assert {:done, %{}} = GenDurable.await(id, 3_000)
+  end
+
+  test "await: [tick: 0] fails the boot loudly" do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {%ArgumentError{message: msg}, _stack}} =
+             GenDurable.Supervisor.start_link(name: BadTick, repo: Repo, await: [tick: 0])
+
+    assert msg =~ ":await tick"
+  end
+
+  test "a bad :poke option fails the boot loudly" do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {%ArgumentError{message: msg}, _stack}} =
+             GenDurable.Supervisor.start_link(name: BadPoke, repo: Repo, poke: :multicast)
+
+    assert msg =~ ":poke must be"
+  end
+
   test "a web-only node (queues: [], gc/reaper off) still inserts and signals" do
     sup = start_engine(queues: [], gc: false, reaper: false)
     ids = for {id, _, _, _} <- Supervisor.which_children(sup), do: id

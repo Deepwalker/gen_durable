@@ -90,7 +90,9 @@ The engine is started as `{GenDurable, opts}`:
 | `:concurrency_limits` | `[]` | named [concurrency gates](concurrency.md) for `concurrency_key` (`[api: [limit: 100, shards: 1]]`) |
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows |
-| `:poll_interval` | `1_000` | base ms between idle polls |
+| `:poll_interval` | `1_000` | base ms between idle polls (inserts, signal wakes, and fan-out transitions are discovered immediately via the poke transport — see `:poke`; the poll covers retry backoffs and the reaper's wakes) |
+| `:poke` | `:local` | how inserts and engine-driven wakes announce runnable work: `:local` (same node), `:cluster` (all nodes, Erlang distribution), `{:redis, url_or_opts}` (Redis Pub/Sub; optional `:redix` dep). Best-effort — the poll is the floor |
+| `:await` | `[tick: 25]` | `GenDurable.await/3` watcher probe interval — the latency granularity for results committed on other nodes (same-node results push instantly) |
 | `:reaper` | `[interval: 30_000]` | reaper sweeps (the interval is also the [await-timeout](signals.md#timeouts) resolution); `false` = none on this node |
 | `:gc` | `[interval: 60_000, retention: 86_400_000, batch: 10_000]` | GC sweeps; `false` = none on this node |
 | `:prefetch` | `0` | rows each queue buffers beyond its running slots |
@@ -133,6 +135,12 @@ Every node runs the full engine by default. Three knobs shape a node's role: `:q
 Running reaper/GC on **several** nodes is safe — the sweeps claim via ordered
 `SKIP LOCKED`, so concurrent sweeps skip each other's work — just redundant. There is no
 leader election, deliberately: correctness never depends on "exactly one".
+
+In a split topology, pair the queues with a `:poke` transport: with the default
+`poke: :local` a web node has nobody to poke, and workers discover its inserts on their
+next poll. `poke: :cluster` (Erlang distribution) or `poke: {:redis, url}` (no
+distribution required) delivers the nudge to the worker nodes immediately — see
+`GenDurable.Poke`.
 
 Seeding of `rate_limits:` / `concurrency_limits:` follows the config itself: a node seeds
 what it declares and touches nothing else. Keep the declarations on the nodes that own them

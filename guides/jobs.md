@@ -58,6 +58,30 @@ end
 
 `ctx.attempt` (0-based) is available in `perform/2` and `backoff/1`.
 
+## Waiting for a result (sync-over-async)
+
+`GenDurable.await/3` holds the caller until the instance settles or a deadline passes —
+insert, then wait a beat, and either hand the client the answer or a retry token:
+
+```elixir
+{:ok, id} = GenDurable.insert(Charge, args: %{amount: 100})
+
+case GenDurable.await(id, 1_000) do
+  {:done, result}  -> json(conn, 200, result)
+  {:failed, error} -> json(conn, 422, %{error: error})
+  {:busy, _snap}   -> conn |> put_resp_header("retry-after", "1") |> json(202, %{id: id})
+  # {:awaiting, _} / :not_found — see the await/3 docs
+end
+```
+
+Calling `await(id, …)` again with the same id **is** the retry protocol — a job that
+finished in the meantime answers immediately. A timeout is *not* a failure (the work
+continues), and a step in retry-backoff shows as `{:busy, %{status: :runnable, attempt: n}}`
+— `{:failed, _}` means retries are exhausted. Same-node results answer in milliseconds
+(the executor nudges waiters directly); results committed on other nodes land within the
+watcher tick (`await: [tick: 25]` engine option). Retry tokens live as long as the row —
+terminal rows are GC-swept `retention` after finishing (a day by default).
+
 ## When you outgrow a job
 
 A job is a degenerate one-step machine. The moment you need to wait for an external event,

@@ -11,9 +11,18 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: gen_durable_test
+      REDIS_URL: redis://redis:6379
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
+
+  # For the poke: {:redis, _} transport tests only — the engine itself never
+  # requires Redis.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
 
   db:
     image: postgres:17

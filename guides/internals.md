@@ -89,7 +89,7 @@ pick's business.
 The engine's most complex statement (`Queries.pick/5`), a single CTE chain over four tables:
 
 1. `cand` — up to `batch` runnable rows via `gen_durable_pick`, locked in-scan with
-   `FOR UPDATE SKIP LOCKED`. The K = 1 guard rides in the `WHERE` (keyed rows with an
+   `FOR NO KEY UPDATE SKIP LOCKED`. The K = 1 guard rides in the `WHERE` (keyed rows with an
    executing sibling are filtered *before* the `LIMIT`); configured-gate and rate rows pass
    through — their admission is capacity math below.
 2. gate CTEs — lock the winner keys' slot shards (`FOR UPDATE`, ordered), compute cumulative
@@ -152,9 +152,16 @@ not-yet-parked row without waiting.
 
 ## The locking discipline
 
-- **Instance rows are only ever claimed with `SKIP LOCKED`** (pick, reaper, GC, startup
-  reclaim). A claim never waits, so instance-row locks cannot appear in any deadlock cycle —
-  contention costs a skip, not a queue.
+- **Instance rows are only ever claimed with `FOR NO KEY UPDATE SKIP LOCKED`** (pick, reaper,
+  GC, startup reclaim). A claim never waits, so instance-row locks cannot appear in any
+  deadlock cycle — contention costs a skip, not a queue. NO KEY strength keeps claims
+  compatible with the `FOR KEY SHARE` that FK checks (signal inserts) take on the target row
+  — an in-flight signal insert no longer makes the pick skip its target row (the wake
+  `UPDATE` inside signal delivery still queues behind a claim, as any write must). This is safe
+  from lock-upgrade deadlocks *by schema*: lock strength escalates only when an UPDATE
+  modifies columns of a **full** unique index, and the only full unique index is the
+  immutable PK (the correlation/concurrency uniques are partial, which Postgres excludes) —
+  adding a full unique index over a mutable column would invalidate this.
 - **Counter rows use blocking `FOR UPDATE`, always acquired in sorted key order.** Every
   pick, credit rider, and the reconciler sort before locking, so all lock acquisition
   sequences are compatible. Blocking is deliberate: for one hot bucket, `SKIP LOCKED`

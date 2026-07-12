@@ -25,6 +25,16 @@ defmodule GenDurable.Supervisor do
       retention: 86_400_000, batch: 10_000]` (ms between sweeps; ms a
       `done`/`failed` row is kept after it terminates; max rows deleted per
       sweep), or `false` to not run one on this node.
+    * `:poke` — how an insert announces new work to schedulers (see
+      `GenDurable.Poke`): `:local` (default) — the caller's node only;
+      `:cluster` — every node, over Erlang distribution; `{:redis, url_or_opts}`
+      — Redis Pub/Sub, for clusters without distribution (requires the optional
+      `:redix` dependency; the value is passed to `Redix.start_link/1`).
+      Best-effort in every mode — the poll interval is the discovery floor.
+    * `:await` — tuning for `GenDurable.await/3`: `[tick: 25]` (ms between the
+      batched watcher's probes — the latency granularity for results committed
+      on OTHER nodes; same-node results are pushed instantly). Idle-free, so
+      there is no `false`.
 
   `reaper: false` / `gc: false` are **per-node** knobs for topology (a web-only
   or worker-only node), not switches you may flip everywhere: the cluster needs
@@ -70,6 +80,8 @@ defmodule GenDurable.Supervisor do
     poll_interval: 1_000,
     reaper: [],
     gc: [],
+    poke: :local,
+    await: [],
     prefetch: 0,
     min_demand: 1,
     max_poll_interval: 5_000,
@@ -80,6 +92,7 @@ defmodule GenDurable.Supervisor do
 
   @reaper_defaults [interval: 30_000]
   @gc_defaults [interval: 60_000, retention: 86_400_000, batch: 10_000]
+  @await_defaults [tick: 25]
 
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, GenDurable))
@@ -94,6 +107,22 @@ defmodule GenDurable.Supervisor do
     # Validate before any side effect (persistent_term, config seeding).
     reaper_cfg = component_opts(opts, :reaper, @reaper_defaults)
     gc_cfg = component_opts(opts, :gc, @gc_defaults)
+    poke = validate_poke!(Keyword.fetch!(opts, :poke))
+
+    await_cfg =
+      case component_opts(opts, :await, @await_defaults) do
+        # await is idle-free (no waiters -> no timer, no queries), so there is
+        # nothing to disable
+        false ->
+          raise ArgumentError, ":await cannot be false — pass [tick: ms] to tune it"
+
+        cfg ->
+          # tick: 0 would be a hot loop (one probe per scheduler pass)
+          if cfg[:tick] < 1,
+            do: raise(ArgumentError, ":await tick must be at least 1 ms, got: #{cfg[:tick]}")
+
+          cfg
+      end
 
     rate_configs = parse_rate_limits(Keyword.fetch!(opts, :rate_limits))
 
@@ -104,7 +133,11 @@ defmodule GenDurable.Supervisor do
       # and dies with the instance, and executors reach it through the config.
       registry: GenDurable.Registry.new(Keyword.fetch!(opts, :fsms)),
       lease_ttl_ms: Keyword.fetch!(opts, :lease_ttl),
-      rate_limit_names: MapSet.new(rate_configs, & &1.name)
+      rate_limit_names: MapSet.new(rate_configs, & &1.name),
+      poke: poke,
+      # origin tag for cross-node pokes: lets a subscriber drop messages this
+      # VM published (its schedulers were already poked directly)
+      poke_token: GenDurable.Scheduler.vm_id()
     }
 
     # Keyed by the instance name, so engines coexist. Not erased on shutdown (a
@@ -131,6 +164,7 @@ defmodule GenDurable.Supervisor do
 
         spec = %{
           config: config,
+          scope: GenDurable.Poke.scope(name),
           queue: queue,
           concurrency: concurrency,
           prefetch: Keyword.fetch!(opts, :prefetch),
@@ -151,10 +185,77 @@ defmodule GenDurable.Supervisor do
       end
 
     children =
-      [{Task.Supervisor, name: task_sup}] ++
+      [
+        # The instance's :pg scope (schedulers join their queue's group) — how
+        # a poke finds the schedulers to nudge, locally or across the cluster.
+        # Started even with no queues so the poke path is uniform: an empty
+        # group = nobody to poke.
+        %{id: {:pg, name}, start: {:pg, :start_link, [GenDurable.Poke.scope(name)]}},
+        # await machinery: the Watcher owns both the executor-facing waiter
+        # table (same-node push nudges) and the batched cross-node poller.
+        # Idle-free; started even with no queues — await is called wherever
+        # inserts happen.
+        %{
+          id: GenDurable.Await.Watcher,
+          start:
+            {GenDurable.Await.Watcher, :start_link,
+             [
+               %{
+                 name: GenDurable.Await.watcher(name),
+                 table: GenDurable.Await.table(name),
+                 repo: repo,
+                 tick: await_cfg[:tick]
+               }
+             ]}
+        },
+        {Task.Supervisor, name: task_sup}
+      ] ++
+        poke_children(name, poke) ++
         reaper_child(repo, name, reaper_cfg) ++ gc_child(repo, name, gc_cfg) ++ schedulers
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  # The {:redis, _} transport needs two processes: a publisher connection (the
+  # insert side) and the Pub/Sub listener (the subscriber side). :local and
+  # :cluster need nothing beyond the :pg scope.
+  defp poke_children(name, {:redis, redis}) do
+    publisher = GenDurable.Poke.publisher(name)
+
+    publisher_arg =
+      case redis do
+        url when is_binary(url) -> {url, [name: publisher]}
+        opts when is_list(opts) -> Keyword.put(opts, :name, publisher)
+      end
+
+    [
+      Supervisor.child_spec({Redix, publisher_arg}, id: {Redix, publisher}),
+      %{
+        id: GenDurable.Poke.Listener,
+        start:
+          {GenDurable.Poke.Listener, :start_link,
+           [%{name: name, redis: redis, token: GenDurable.Scheduler.vm_id()}]}
+      }
+    ]
+  end
+
+  defp poke_children(_name, _mode), do: []
+
+  defp validate_poke!(mode) when mode in [:local, :cluster], do: mode
+
+  defp validate_poke!({:redis, redis} = mode) when is_binary(redis) or is_list(redis) do
+    if Code.ensure_loaded?(Redix) do
+      mode
+    else
+      raise ArgumentError,
+            "poke: {:redis, _} requires the optional :redix dependency — " <>
+              "add {:redix, \"~> 1.2\"} to your deps"
+    end
+  end
+
+  defp validate_poke!(other) do
+    raise ArgumentError,
+          ":poke must be :local, :cluster, or {:redis, url_or_opts}, got: #{inspect(other)}"
   end
 
   defp reaper_child(repo, name, cfg) do

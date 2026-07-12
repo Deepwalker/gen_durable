@@ -5,6 +5,50 @@ All notable changes to `gen_durable` are documented here. The format follows
 **no backward-compatibility guarantees** — there is one schema version and migrations are
 edited in place until the MVP settles.
 
+## 0.2.6
+
+### Added
+- **`GenDurable.await/3` — the sync-over-async bridge.** Insert, poke does the discovery,
+  `await(id, timeout)` holds the caller until the instance settles: `{:done, result}`,
+  `{:failed, error}`, `{:awaiting, snap}` (parked; `until: :terminal` waits through it),
+  `{:busy, snap}` on deadline (the work continues — hand the client the id as a retry
+  token; calling `await` again with it is the whole retry protocol), `:not_found`. The
+  answer is always read from the row; a same-node result is pushed to waiters by the
+  executor within milliseconds, cross-node results land within the batched watcher's
+  tick (`await: [tick: 25]` engine option — one probe query per tick covers every waiter
+  on the node; idle costs nothing). Works with a bare repo too (plain poll loop).
+
+- **Poke-on-insert: zero discovery latency, three transports.** `insert`/`insert_all`
+  nudge the schedulers of the queues that just received due rows, so work is picked
+  immediately instead of waiting out `poll_interval`. Configured per instance with
+  `poke:` — `:local` (default, caller's node only), `:cluster` (every node over Erlang
+  distribution; membership via an OTP `:pg` scope, so only nodes actually running the
+  queue are reached), or `{:redis, url_or_opts}` (Redis Pub/Sub for clusters without
+  distribution; requires the new **optional** `:redix` dependency; the caller's node is
+  poked directly and publishes are origin-tagged so a node never double-pokes itself).
+  Pokes also announce every engine-driven wake: a signal flipping a parked row (the
+  wake's queue rides back out of the delivery statement), a fan-out's children in their
+  own queues, and a parent whose join the last child completed — a cross-queue fan-out
+  round trip needs no poll at any hop. Best-effort in every mode — a lost poke costs one
+  poll interval, never correctness; the poll remains the floor for retry backoffs and
+  the reaper's wakes (await timeouts, crash reclaims). Future-scheduled rows wake
+  nobody. Poke bursts coalesce into one pick, go through the
+  normal demand gates, and never stretch the idle backoff on a miss. See
+  `GenDurable.Poke`.
+
+### Changed
+- **Instance-row claims lock with `FOR NO KEY UPDATE`** (pick, heartbeat, reaper, await
+  sweeps, startup reclaim, shutdown release, the schedule_childs guard). Strong enough
+  for the claim/outcome mutual exclusion, but compatible with the `FOR KEY SHARE` that
+  signal-insert FK checks take on the target row — an in-flight signal insert no longer
+  makes the pick skip its target row. (Signal *delivery* still queues behind the claim
+  at its wake `UPDATE`, as any write to the row must.) Safe from
+  lock-upgrade deadlocks by schema (the only *full* unique index is the immutable PK;
+  the correlation/concurrency uniques are partial, which Postgres excludes from lock
+  strengthening — revisit if a full unique index over a mutable column is ever added).
+  A/B-benched: throughput identical within noise. Bucket locks stay `FOR UPDATE` (no FK
+  traffic exists there).
+
 ## 0.2.5
 
 ### Added

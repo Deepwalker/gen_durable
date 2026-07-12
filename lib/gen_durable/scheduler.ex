@@ -27,7 +27,14 @@ defmodule GenDurable.Scheduler do
       empty pick on a fully idle queue doubles the interval up to this cap, then a
       non-empty pick (or any in-flight work) snaps back to the base. This is the
       lever that cuts idle DB load. (LISTEN/NOTIFY is banned, so polling is the
-      only discovery path — the point is to poll *adaptively*, not constantly.)
+      discovery path — the point is to poll *adaptively*, not constantly.)
+
+  **Inserts, signal wakes, and fan-out transitions poke the queue's schedulers
+  directly** (see `GenDurable.Poke`): a row that just became runnable is
+  discovered immediately, not on the next poll tick — same-node always,
+  cross-node with the `:cluster` or `{:redis, _}` transports. Polling covers
+  what a poke cannot see — retry backoffs, the reaper's wakes, and remote
+  events under the default `:local` transport.
 
   Buffered and in-flight rows are both `executing` + leased; the heartbeat (one
   batched UPDATE per tick over `buffer ++ in_flight`) keeps every claimed row
@@ -45,6 +52,9 @@ defmodule GenDurable.Scheduler do
 
   alias GenDurable.{Executor, Queries}
 
+  # Retry cadence for re-joining the poke scope while it restarts.
+  @rejoin_retry 100
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @doc false
@@ -56,7 +66,11 @@ defmodule GenDurable.Scheduler do
   # "nonode@nohost" and reclaim each other's live claims).
   def claim_prefix(name, queue), do: "#{inspect(name)}:#{queue}@#{vm_id()}-"
 
-  defp vm_id do
+  @doc false
+  # A token unique per LIVE VM: the node name when distributed, else
+  # hostname + OS pid. Shared by the claim identity (above) and the poke
+  # transport (origin tagging — see GenDurable.Poke).
+  def vm_id do
     if Node.alive?() do
       Atom.to_string(node())
     else
@@ -86,6 +100,22 @@ defmodule GenDurable.Scheduler do
     margin_ms = max(opts.config.lease_ttl_ms - 2 * opts.heartbeat_interval, 0)
     reclaimed = Queries.reclaim_orphans(opts.config.repo, opts.queue, prefix, margin_ms)
 
+    # Join the instance's poke scope under the queue name, so inserts can find
+    # this scheduler (locally, or from any node in :cluster mode). Membership
+    # is cleaned up by :pg when this process dies — and dies with the scope
+    # process (its ETS table), so the scope is monitored and re-joined if it
+    # ever restarts; otherwise every poke on this node would silently no-op
+    # until the schedulers themselves restarted.
+    scope_ref =
+      case join_scope(opts.scope, opts.queue) do
+        {:ok, ref} ->
+          ref
+
+        :retry ->
+          Process.send_after(self(), :rejoin_scope, @rejoin_retry)
+          nil
+      end
+
     if reclaimed > 0 do
       :telemetry.execute(
         [:gen_durable, :scheduler, :reclaimed],
@@ -96,6 +126,8 @@ defmodule GenDurable.Scheduler do
 
     state = %{
       config: opts.config,
+      scope: opts.scope,
+      scope_ref: scope_ref,
       queue: opts.queue,
       concurrency: opts.concurrency,
       prefetch: opts.prefetch,
@@ -134,6 +166,19 @@ defmodule GenDurable.Scheduler do
     {:noreply, state}
   end
 
+  # A local insert nudged us: runnable work exists NOW. Coalesce any burst of
+  # pokes already in the mailbox into one refill, then go through the normal
+  # demand gates (ceiling, min_demand) — a poke is discovery, not admission.
+  # A fetch snaps the idle backoff to base; a miss (row raced away to another
+  # node, or throttled) leaves the poll cadence untouched — unlike an empty
+  # poll, an empty poke is not evidence of continued idleness.
+  def handle_info(:poke, state) do
+    flush_pokes()
+    {state, fetched} = fill(state)
+    state = if fetched > 0, do: %{state | cur_poll: state.poll_interval}, else: state
+    {:noreply, state}
+  end
+
   # Task finished and returned a value: success path (outcome committed). Refill
   # immediately — draining the buffer is a no-op on the DB; only an empty buffer
   # triggers a pick.
@@ -153,7 +198,46 @@ defmodule GenDurable.Scheduler do
     {:noreply, adapt(state, fetched)}
   end
 
+  # The poke scope died and took the membership ETS with it; re-join once the
+  # supervisor has it back up. The poll covers the gap.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{scope_ref: ref} = state) do
+    Process.send_after(self(), :rejoin_scope, @rejoin_retry)
+    {:noreply, %{state | scope_ref: nil}}
+  end
+
+  def handle_info(:rejoin_scope, state) do
+    case join_scope(state.scope, state.queue) do
+      {:ok, ref} ->
+        {:noreply, %{state | scope_ref: ref}}
+
+      :retry ->
+        Process.send_after(self(), :rejoin_scope, @rejoin_retry)
+        {:noreply, state}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Monitor-then-join, tolerating the scope dying at any point in between —
+  # the caller retries on :retry.
+  defp join_scope(scope, queue) do
+    case Process.whereis(scope) do
+      nil ->
+        :retry
+
+      pid ->
+        ref = Process.monitor(pid)
+
+        try do
+          :ok = :pg.join(scope, queue, self())
+          {:ok, ref}
+        catch
+          _, _ ->
+            Process.demonitor(ref, [:flush])
+            :retry
+        end
+    end
+  end
 
   # Graceful shutdown: stop claiming, hand the buffered (un-started)
   # rows straight back to `runnable` so they are picked up immediately instead of
@@ -273,6 +357,14 @@ defmodule GenDurable.Scheduler do
       },
       %{queue: state.queue}
     )
+  end
+
+  defp flush_pokes do
+    receive do
+      :poke -> flush_pokes()
+    after
+      0 -> :ok
+    end
   end
 
   defp buffer_ids(buffer), do: Enum.map(buffer, & &1.id)

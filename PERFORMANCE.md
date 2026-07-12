@@ -84,7 +84,8 @@ Execution Time: 0.725 ms
 
 ### 2.2 Full plan of the picker (`batch = 50`)
 
-The picker is the canonical Postgres claim — one `SELECT … FOR UPDATE SKIP LOCKED LIMIT`,
+The picker is the canonical Postgres claim — one `SELECT … FOR NO KEY UPDATE SKIP LOCKED
+LIMIT` (NO KEY: claims coexist with the `FOR KEY SHARE` that signal-insert FK checks take),
 then one `UPDATE` — with the concurrency_key dedup folded in as a window function over the
 locked set, so there is **exactly one nested loop** (the `UPDATE` join):
 
@@ -95,7 +96,7 @@ Update on gen_durable g (actual time=0.400..0.983 rows=50 loops=1)
     ->  WindowAgg (rows=50)                                     ← dedup: row_number() per key
           ->  Sort  Sort Key: COALESCE(concurrency_key, id::text), priority, eligible_at  (27kB)
                 ->  Limit (rows=50)
-                      ->  LockRows (rows=50)                    ← FOR UPDATE SKIP LOCKED, in-scan
+                      ->  LockRows (rows=50)                    ← FOR NO KEY UPDATE SKIP LOCKED, in-scan
                             ->  Index Scan using gen_durable_pick (rows=50)
                                   Index Cond: ((queue = 'default') AND (eligible_at <= now()))
                                   Filter: ((concurrency_key IS NULL) OR (NOT (… hashed SubPlan 2)))
@@ -158,7 +159,7 @@ without writing it**, so ~11–16 µs/row is close to the floor for this schema.
 Two consequences worth designing around:
 
 - A pick of 5000 is a **70 ms synchronous statement** in the scheduler GenServer and holds
-  `FOR UPDATE` over 5000 rows. Past ~a few hundred, batch size buys no amortization (the
+  row locks over 5000 rows. Past ~a few hundred, batch size buys no amortization (the
   fixed cost is already gone) and only adds blocking. If you push `prefetch` very high,
   prefer many medium picks over one giant one.
 - Per-row cost is **aggregate DB CPU**: at 10k steps/s that floor is ~0.15 s/s of CPU on
@@ -184,7 +185,7 @@ million-row table** to find the batch:
 | 5000 | 56 ms | 195 ms |
 
 ~10× slower. The nested loop is the canonical Postgres-queue claim, and it is the floor:
-`UPDATE` cannot `LIMIT`, so the claim must be `SELECT … FOR UPDATE … LIMIT` then `UPDATE`
+`UPDATE` cannot `LIMIT`, so the claim must be a locking `SELECT … LIMIT` then `UPDATE`
 joined by id; and updating N rows means writing N rows regardless of how they are reached.
 
 ### 2.6 What did *not* help (measured, rejected)
@@ -504,7 +505,9 @@ The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 14 µs/row`
   w.r.t. `lease_ttl`. Cost of depth: cross-node fairness, crash blip (bounded by TTL).
 - **`min_demand`** — batch gate: fetch fat, not one row per freed slot.
 - **`poll_interval` / `max_poll_interval`** — idle backoff cuts the polling load on an
-  empty queue to near-zero without hurting busy-queue latency.
+  empty queue to near-zero without hurting busy-queue latency. Locally-inserted work
+  doesn't wait on either: the insert pokes the queue's scheduler on its own node, so the
+  poll only bounds discovery of *remote* inserts, wakes, and retry backoffs.
 
 ### Known limits / pathologies (honest list)
 

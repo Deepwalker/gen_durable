@@ -2,6 +2,8 @@
 
 `await` parks an instance until a signal arrives from the outside — a webhook, a human
 approval, a partner callback. It is the durable answer to "wait for an external event."
+(Distinct from `GenDurable.await/3`, which is the *caller* waiting for an instance's
+result — see [the jobs guide](jobs.md#waiting-for-a-result-sync-over-async).)
 
 ```elixir
 def step("start", ctx), do: {:await, "payment_confirmed", "ship", ctx.state}
