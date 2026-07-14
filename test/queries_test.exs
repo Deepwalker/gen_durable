@@ -38,6 +38,18 @@ defmodule GenDurable.QueriesTest do
     n == 1
   end
 
+  # Mirror the engine: the picker is TOLD which names are configured gates (in production,
+  # `config.concurrency_limit_names`). Since the pick no longer reads
+  # `gen_durable_bucket_configs` itself, these Queries-level tests read the conc names from
+  # the policy table — the same set the supervisor/Testing build — and thread them into pick.
+  defp conc_gate_names do
+    %{rows: rows} = Repo.query!("SELECT name FROM gen_durable_bucket_configs WHERE kind = 'conc'")
+    List.flatten(rows)
+  end
+
+  defp pick(queue, batch, worker, ttl),
+    do: Queries.pick(Repo, queue, batch, worker, ttl, nil, conc_gate_names())
+
   # Put a row into the claimed state (executing + locked_by @worker) without going
   # through pick — the outcome queries commit only for the claim's owner.
   defp claim(id) do
@@ -88,7 +100,7 @@ defmodule GenDurable.QueriesTest do
   test "insert then pick flips to executing and returns the job" do
     {:ok, id} = Queries.insert(Repo, params())
 
-    [job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [job] = pick("default", 10, @worker, @ttl)
     assert job.id == id
     assert job.fsm == "counter"
     assert job.step == "tick"
@@ -122,7 +134,7 @@ defmodule GenDurable.QueriesTest do
     assert_receive :locked, 1_000
 
     # FOR UPDATE in cand would SKIP the row here; FOR NO KEY UPDATE claims it
-    assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
 
     send(task.pid, :release)
     Task.await(task)
@@ -132,9 +144,9 @@ defmodule GenDurable.QueriesTest do
     {:ok, _} = Queries.insert(Repo, params(%{queue: "a"}))
     {:ok, _} = Queries.insert(Repo, params(%{queue: "b"}))
 
-    assert [%{}] = Queries.pick(Repo, "a", 10, @worker, @ttl)
-    assert [] = Queries.pick(Repo, "a", 10, @worker, @ttl)
-    assert [%{}] = Queries.pick(Repo, "b", 10, @worker, @ttl)
+    assert [%{}] = pick("a", 10, @worker, @ttl)
+    assert [] = pick("a", 10, @worker, @ttl)
+    assert [%{}] = pick("b", 10, @worker, @ttl)
   end
 
   describe "concurrency_key dedup in the picker (spec §6)" do
@@ -142,7 +154,7 @@ defmodule GenDurable.QueriesTest do
       for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
       {:ok, other} = Queries.insert(Repo, params(%{concurrency_key: "k2"}))
 
-      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      jobs = pick("default", 10, @worker, @ttl)
       keys = Enum.map(jobs, & &1.concurrency_key)
 
       assert Enum.count(keys, &(&1 == "k")) == 1
@@ -156,16 +168,16 @@ defmodule GenDurable.QueriesTest do
       {:ok, _b} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
 
       # Claim one row for "k"; it becomes executing and holds the key.
-      assert [%{id: ^a}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [%{id: ^a}] = pick("default", 10, @worker, @ttl)
 
       # The sibling is runnable, but "k" is executing => not picked (no bounce).
-      assert [] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [] = pick("default", 10, @worker, @ttl)
     end
 
     test "NULL concurrency_key rows are never deduped against each other" do
       for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params())
 
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 3
+      assert length(pick("default", 10, @worker, @ttl)) == 3
     end
 
     test "the unique arbiter makes a second executing row per key uncommittable" do
@@ -219,7 +231,7 @@ defmodule GenDurable.QueriesTest do
 
       # …and the FIRST pick both mints them (pre-debited) and admits the cap —
       # zero cold-gate lag
-      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      jobs = pick("default", 10, @worker, @ttl)
       assert length(jobs) == 2
       assert gate_buckets("api") == [[0, 2, 0]]
 
@@ -232,7 +244,7 @@ defmodule GenDurable.QueriesTest do
       assert shards_set == 2
 
       # capacity exhausted ⇒ nothing more
-      assert Queries.pick(Repo, "default", 10, @worker, @ttl) == []
+      assert pick("default", 10, @worker, @ttl) == []
 
       # a release credits the slot back, addressed — the next pick admits one
       [j | _] = jobs
@@ -240,14 +252,14 @@ defmodule GenDurable.QueriesTest do
       {key, shard} = j.slot
       :ok = credit_slot(key, shard)
       assert gate_buckets("api") == [[0, 2, 1]]
-      assert [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [_] = pick("default", 10, @worker, @ttl)
     end
 
     test "a sharded gate splits the cap; releases credit their own shard" do
       :ok = seed_gate("api", 4, 2)
       for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
 
-      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      jobs = pick("default", 10, @worker, @ttl)
       assert length(jobs) == 4
       assert gate_buckets("api") == [[0, 2, 0], [1, 2, 0]]
 
@@ -270,7 +282,7 @@ defmodule GenDurable.QueriesTest do
       for _ <- 1..2, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
       for _ <- 1..2, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "solo"}))
 
-      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      jobs = pick("default", 10, @worker, @ttl)
       keys = Enum.map(jobs, & &1.concurrency_key)
 
       assert Enum.count(keys, &(&1 == "api")) == 2
@@ -291,7 +303,7 @@ defmodule GenDurable.QueriesTest do
               )
 
       # all 3 fit the gate (cap 5), but rate cumulative 2,4,6 vs budget 3 admits only the first
-      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      jobs = pick("default", 10, @worker, @ttl)
       assert length(jobs) == 1
 
       # the gate slot was taken for the 1 finally-admitted, NOT for the 2 rate-denied rows
@@ -312,7 +324,7 @@ defmodule GenDurable.QueriesTest do
         self()
       )
 
-      Queries.pick(Repo, "default", 10, @worker, @ttl)
+      pick("default", 10, @worker, @ttl)
       :telemetry.detach(handler)
 
       assert_received {:telemetry, %{wanted: 3, admitted: 1}, %{key: "api", queue: "default"}}
@@ -321,7 +333,7 @@ defmodule GenDurable.QueriesTest do
     test "reconcile heals drift from the executing truth and sweeps idle/orphaned buckets" do
       :ok = seed_gate("api", 2)
       {:ok, id} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       assert gate_buckets("api") == [[0, 2, 1]]
 
       # simulate a crash leak (conservative direction: available too low)
@@ -353,18 +365,18 @@ defmodule GenDurable.QueriesTest do
       :ok = seed_gate("fever", 1)
 
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_next(Repo, id, @worker, "commit", ~s({}), [], nil, 1, "fever:7")
 
       assert gate_buckets("fever:7") == []
-      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
       assert gate_buckets("fever:7") == [[0, 1, 0]]
     end
 
     test "reconcile backfills missing shards after a shards-count increase" do
       :ok = seed_gate("api", 4, 2)
       {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       assert [[0, 2, _], [1, 2, _]] = gate_buckets("api")
 
       # config grows to 4 shards: existing gates are missing shards 2..3 (the
@@ -377,7 +389,7 @@ defmodule GenDurable.QueriesTest do
 
     test ":next can release or swap the concurrency_key (nil / value; default keeps)" do
       {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_next(Repo, a, @worker, "tick", ~s({}), [], nil, 1, nil)
 
       %{rows: [[key]]} = Repo.query!("SELECT concurrency_key FROM gen_durable WHERE id = $1", [a])
@@ -386,7 +398,7 @@ defmodule GenDurable.QueriesTest do
       # `a` is runnable again (key released), so the pick returns it too — we
       # only need `b` claimed for the swap
       {:ok, b} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
-      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      jobs = pick("default", 10, @worker, @ttl)
       assert b in Enum.map(jobs, & &1.id)
       :ok = Queries.complete_next(Repo, b, @worker, "tick", ~s({}), [], nil, 1, "k2")
 
@@ -407,7 +419,7 @@ defmodule GenDurable.QueriesTest do
       {:ok, _b} = Queries.insert(Repo, params(%{concurrency_key: "stripe:1"}))
 
       # K=1 mutual exclusion: exactly one of the two runs
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+      assert length(pick("default", 10, @worker, @ttl)) == 1
     end
 
     test "a picker skips a shard another holds (SKIP LOCKED) and admits from the rest" do
@@ -415,7 +427,7 @@ defmodule GenDurable.QueriesTest do
 
       # cold-mint both shards; the lone pick admits 1 to shard 0
       {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
-      assert [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [_] = pick("default", 10, @worker, @ttl)
       assert gate_buckets("api") == [[0, 2, 1], [1, 2, 2]]
 
       for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
@@ -436,7 +448,7 @@ defmodule GenDurable.QueriesTest do
         end)
 
       assert_receive :locked, 2000
-      claimed = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      claimed = pick("default", 10, @worker, @ttl)
       send(holder, :release)
 
       # shard 0 is skipped (held), not waited on: the pick admits only shard 1's
@@ -448,7 +460,7 @@ defmodule GenDurable.QueriesTest do
 
   test "complete_next resets attempt and returns to runnable" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_job] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_job] = pick("default", 10, @worker, @ttl)
 
     :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({"n":1}), [], nil, 1, :keep)
 
@@ -463,7 +475,7 @@ defmodule GenDurable.QueriesTest do
 
   test "continue_next advances the step while KEEPING the row executing and owned" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
 
     # :keep posture — set neither key nor shard.
     assert :ok =
@@ -502,7 +514,7 @@ defmodule GenDurable.QueriesTest do
 
   test "continue_next is guarded — a non-owner gets :stale and commits nothing" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
 
     assert :stale =
              Queries.continue_next(
@@ -527,7 +539,7 @@ defmodule GenDurable.QueriesTest do
 
   test "continue_next releasing the key nulls concurrency_key and shard, and consumes signals" do
     {:ok, id} = Queries.insert(Repo, params(%{concurrency_key: "lock:x"}))
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
     {:ok, _} = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
     %{rows: [[sig]]} = Repo.query!("SELECT id FROM signals WHERE target_id = $1", [id])
 
@@ -559,11 +571,11 @@ defmodule GenDurable.QueriesTest do
   test "continue_next onto a held unconfigured key trips K=1 → :contended, nothing committed" do
     # A holds the unconfigured key, executing.
     {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "lock:solo"}))
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
 
     # B is separately claimed, then tries to adopt the same key inline.
     {:ok, b} = Queries.insert(Repo, params())
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
 
     assert :contended =
              Queries.continue_next(
@@ -593,7 +605,7 @@ defmodule GenDurable.QueriesTest do
 
   test "complete_retry bumps attempt and delays eligibility" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
 
     :ok = Queries.complete_retry(Repo, id, @worker, ~s({"n":0}), 50_000)
 
@@ -610,10 +622,10 @@ defmodule GenDurable.QueriesTest do
 
   test "complete_retry keeps awaits and consumes nothing (redo sees the same inputs)" do
     {:ok, id} = Queries.insert(Repo, params())
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
     :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [], nil)
     {:ok, _} = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
 
     :ok = Queries.complete_retry(Repo, id, @worker, ~s({}), 0)
 
@@ -651,7 +663,7 @@ defmodule GenDurable.QueriesTest do
   test "reaper returns expired-lease executing rows to runnable with attempt+1" do
     {:ok, id} = Queries.insert(Repo, params())
     # Pick with a negative TTL so the lease is already expired.
-    [_] = Queries.pick(Repo, "default", 10, @worker, -1000)
+    [_] = pick("default", 10, @worker, -1000)
 
     assert Queries.reap(Repo) == [id]
 
@@ -666,7 +678,7 @@ defmodule GenDurable.QueriesTest do
   describe "signals" do
     test "deliver wakes a matching await and keeps the awaited set" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [], nil)
 
       {:ok, _} = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
@@ -683,7 +695,7 @@ defmodule GenDurable.QueriesTest do
 
     test "a signal outside the awaited set does not wake the instance" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [], nil)
 
       {:ok, _} = Queries.deliver_signal(Repo, id, "other", ~s({}), nil)
@@ -699,7 +711,7 @@ defmodule GenDurable.QueriesTest do
       # signal arrives while the instance is still runnable (not yet awaiting)
       {:ok, _} = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
 
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go", "stop"], "woke", [], nil)
 
       %{rows: [[status, step]]} =
@@ -716,7 +728,7 @@ defmodule GenDurable.QueriesTest do
       {:ok, _} = Queries.deliver_signal(Repo, id, "a", ~s({}), nil)
       [sig] = Queries.load_signals(Repo, id)
 
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
 
       # The accumulate pattern: the step was HANDED sig ("a") and re-awaits the
       # full set. The recheck must NOT re-wake on it — that would spin
@@ -764,7 +776,7 @@ defmodule GenDurable.QueriesTest do
 
     test "progress consumes exactly the passed ids; other signals survive" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [], nil)
 
       {:ok, _} = Queries.deliver_signal(Repo, id, "go", ~s({}), nil)
@@ -783,7 +795,7 @@ defmodule GenDurable.QueriesTest do
 
     test "a terminal outcome deletes the whole inbox (cleanup)" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       {:ok, _} = Queries.deliver_signal(Repo, id, "a", ~s({}), nil)
       {:ok, _} = Queries.deliver_signal(Repo, id, "b", ~s({}), nil)
 
@@ -804,7 +816,7 @@ defmodule GenDurable.QueriesTest do
 
     assert t == "object"
 
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
     :ok = Queries.complete_next(Repo, id, @worker, "tick", ~s({"n":1}), [], nil, 1, :keep)
 
     %{rows: [[t, n]]} =
@@ -826,7 +838,7 @@ defmodule GenDurable.QueriesTest do
     assert t == "object"
     assert v == "7"
 
-    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    [_] = pick("default", 10, @worker, @ttl)
     {:ok, _} = Queries.complete_done(Repo, id, @worker, ~s({"ok":true}))
 
     %{rows: [[t, ok]]} =
@@ -850,17 +862,17 @@ defmodule GenDurable.QueriesTest do
     test "expire_awaits wakes only parks past their deadline, keeping awaits" do
       # expired: deadline armed at ~now
       {:ok, expired} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, expired, @worker, ~s({}), ["go"], "woke", [], 1)
 
       # future deadline: not to be touched
       {:ok, later} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, later, @worker, ~s({}), ["go"], "woke", [], 60_000)
 
       # no timeout at all: never swept
       {:ok, forever} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, forever, @worker, ~s({}), ["go"], "woke", [], nil)
 
       Process.sleep(5)
@@ -892,7 +904,7 @@ defmodule GenDurable.QueriesTest do
     test "a reclaimed row rejects every outcome from its old worker" do
       {:ok, id} = Queries.insert(Repo, params())
       # claim with an already-expired lease, then let the reaper hand it over
-      [_] = Queries.pick(Repo, "default", 10, @worker, -1000)
+      [_] = pick("default", 10, @worker, -1000)
       [^id] = Queries.reap(Repo)
 
       assert :stale =
@@ -919,7 +931,7 @@ defmodule GenDurable.QueriesTest do
 
     test "a stale terminal outcome touches neither the inbox nor the parent join barrier" do
       {:ok, parent} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
 
       :ok =
         Queries.complete_schedule_childs(
@@ -933,7 +945,7 @@ defmodule GenDurable.QueriesTest do
         )
 
       # claim the child with an expired lease, give it a signal, let the reaper reclaim
-      [%{id: child}] = Queries.pick(Repo, "default", 10, "old-worker", -1000)
+      [%{id: child}] = pick("default", 10, "old-worker", -1000)
       {:ok, _} = Queries.deliver_signal(Repo, child, "keep", ~s({}), nil)
       [^child] = Queries.reap(Repo)
 
@@ -954,7 +966,7 @@ defmodule GenDurable.QueriesTest do
 
     test "a stale schedule_childs spawns no children and consumes nothing" do
       {:ok, id} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, -1000)
+      [_] = pick("default", 10, @worker, -1000)
       {:ok, _} = Queries.deliver_signal(Repo, id, "keep", ~s({}), nil)
       [sig] = Queries.load_signals(Repo, id)
       [^id] = Queries.reap(Repo)
@@ -986,7 +998,7 @@ defmodule GenDurable.QueriesTest do
           params(%{correlation_key: "order:7", correlation_scope: @live_scope})
         )
 
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, id, @worker, ~s({}), ["go"], "woke", [], nil)
 
       assert {:ok, _} = Queries.deliver_signal(Repo, "order:7", "go", ~s({"v":1}), nil)
@@ -1022,7 +1034,7 @@ defmodule GenDurable.QueriesTest do
           params(%{correlation_key: "order:9", correlation_scope: @live_scope})
         )
 
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
       :ok = Queries.complete_await(Repo, fresh, @worker, ~s({}), ["go"], "woke", [], nil)
       assert {:ok, _} = Queries.deliver_signal(Repo, "order:9", "go", ~s({}), nil)
 
@@ -1207,24 +1219,24 @@ defmodule GenDurable.QueriesTest do
       assert rate_buckets("api") == []
 
       # the cold key admits on this very pick; the mint lands already debited
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 5
+      assert length(pick("default", 10, @worker, @ttl)) == 5
       assert tokens("api") == 0.0
       # rate 0 ⇒ no refill ⇒ the rest stay parked
-      assert Queries.pick(Repo, "default", 10, @worker, @ttl) == []
+      assert pick("default", 10, @worker, @ttl) == []
     end
 
     test "weight: a step consuming N units takes N from the budget" do
       :ok = seed(0, 5)
       for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api", weight: 2}))
       # cumulative weight 2,4,6,8 vs avail 5 ⇒ only the first two fit
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 2
+      assert length(pick("default", 10, @worker, @ttl)) == 2
       assert tokens("api") == 1.0
     end
 
     test "NULL rate_limit bypasses the limiter entirely" do
       :ok = seed(0, 0)
       for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params())
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 3
+      assert length(pick("default", 10, @worker, @ttl)) == 3
     end
 
     test "refill restores budget over elapsed time" do
@@ -1232,11 +1244,11 @@ defmodule GenDurable.QueriesTest do
       for _ <- 1..5, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))
 
       # burst 1 ⇒ first pick grants 1, bucket ~0
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+      assert length(pick("default", 10, @worker, @ttl)) == 1
 
       # rate 100/s ⇒ ~30 ms later ≥1 token refilled ⇒ another grant
       Process.sleep(30)
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) >= 1
+      assert length(pick("default", 10, @worker, @ttl)) >= 1
     end
 
     test "insert_all creates no buckets; the pick rate-limits the whole batch cold" do
@@ -1251,14 +1263,14 @@ defmodule GenDurable.QueriesTest do
 
       assert length(ids) == 3
       assert rate_buckets("api") == []
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 2
+      assert length(pick("default", 10, @worker, @ttl)) == 2
       assert tokens("api") == 0.0
     end
 
     test "rate-limited children admit through a cold bucket on the very next pick" do
       :ok = seed(0, 1)
       {:ok, parent} = Queries.insert(Repo, params())
-      [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      [_] = pick("default", 10, @worker, @ttl)
 
       children = [
         params(%{fsm: "child", rate_limit: "api"}),
@@ -1270,7 +1282,7 @@ defmodule GenDurable.QueriesTest do
 
       # both children are runnable; the cold bucket (burst 1) admits one
       # immediately and lands debited to zero
-      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+      assert length(pick("default", 10, @worker, @ttl)) == 1
       assert tokens("api") == 0.0
     end
 
@@ -1279,7 +1291,7 @@ defmodule GenDurable.QueriesTest do
       {:ok, id} = Queries.insert(Repo, params(%{rate_limit: "api"}))
 
       # warm the key (first pick mints and grants), park it back runnable
-      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
       assert tokens("api") == 4.0
       :ok = Queries.complete_retry(Repo, id, @worker, ~s({}), 0)
 
@@ -1288,19 +1300,19 @@ defmodule GenDurable.QueriesTest do
 
       # the same pick that finds the key cold mints it and grants — no stall,
       # and the fresh mint is again full-minus-taken
-      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
       assert tokens("api") == 4.0
     end
 
     test "a mid-flight :next onto a cold rate key is granted by the very next pick" do
       :ok = seed(0, 5)
       {:ok, id} = Queries.insert(Repo, params())
-      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
 
       :ok = Queries.complete_next(Repo, id, @worker, "call", ~s({}), [], "api:7", 1, :keep)
       assert rate_buckets("api:7") == []
 
-      assert [%{id: ^id}] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
       assert tokens("api:7") == 4.0
     end
 
@@ -1344,7 +1356,7 @@ defmodule GenDurable.QueriesTest do
         self()
       )
 
-      Queries.pick(Repo, "default", 10, @worker, @ttl)
+      pick("default", 10, @worker, @ttl)
       :telemetry.detach(handler)
 
       assert_received {:telemetry, %{wanted: 5, granted: 2}, %{key: "api", queue: "default"}}

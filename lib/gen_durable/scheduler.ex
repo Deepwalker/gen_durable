@@ -352,7 +352,8 @@ defmodule GenDurable.Scheduler do
           demand,
           state.worker,
           config.lease_ttl_ms,
-          config.limiter
+          config.limiter,
+          MapSet.to_list(config.concurrency_limit_names)
         )
 
       :telemetry.execute(

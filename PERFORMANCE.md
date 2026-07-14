@@ -115,18 +115,18 @@ locked set, so there is **exactly one nested loop** (the `UPDATE` join):
 ```
 Update on gen_durable g (actual time=0.400..0.983 rows=50 loops=1)
   Buffers: shared hit=868
-  CTE locked
+  CTE cand
     ->  WindowAgg (rows=50)                                     ← dedup: row_number() per key
-          ->  Sort  Sort Key: COALESCE(concurrency_key, id::text), priority, eligible_at  (27kB)
+          ->  Sort  Sort Key: concurrency_key, priority, eligible_at  (27kB)  ← raw key, no synth
                 ->  Limit (rows=50)
                       ->  LockRows (rows=50)                    ← FOR NO KEY UPDATE SKIP LOCKED, in-scan
                             ->  Index Scan using gen_durable_pick (rows=50)
                                   Index Cond: ((queue = 'default') AND (eligible_at <= now()))
-                                  Filter: ((concurrency_key IS NULL) OR (NOT (… hashed SubPlan 2)))
+                                  Filter: ((concurrency_key IS NULL) OR (concurrency_name = ANY($5)) OR (NOT (… hashed SubPlan 2)))
                                   SubPlan 2
                                     ->  Index Scan using gen_durable_lease (never executed)
   ->  Nested Loop (rows=50)                                     ← the one, optimal join
-        ->  CTE Scan on locked l (rows=50)  Filter: (rn = 1)
+        ->  CTE Scan on cand  Filter: ((concurrency_key IS NULL) OR (rn = 1) OR gated)
         ->  Index Scan using gen_durable_pkey on gen_durable g (rows=1 loops=50)
 Planning Time: 0.582 ms
 Execution Time: 1.122 ms
@@ -147,6 +147,13 @@ What to read here:
   rows *are* in the window, the guard probes `gen_durable_concurrency_active` — a partial
   index over only the executing rows with a **non-null** `concurrency_key`, so a
   non-keyed claim never even writes to it.
+- **Gate membership is a column comparison, not a per-row parse.** `concurrency_name = ANY($5)`
+  reads the STORED generated split of `concurrency_key` (materialized once per write, see
+  `Migration` change(3)) against the configured-gate array threaded from the caller. The pick
+  does **no `split_part(...)` and no join to `gen_durable_bucket_configs`** — see §2.7 for the
+  measured cost this removed. The window `PARTITION BY concurrency_key` is over the **raw** key;
+  all-NULL keys land in one partition but are kept wholesale by the `concurrency_key IS NULL`
+  branch of `winners`, so there is no synthetic per-row partition string either.
 - **The single `Nested Loop` is the `UPDATE` join, and it is optimal** — outer = `batch`
   rows, inner = one primary-key point lookup each (`loops=50, rows=1`). That is O(batch)
   point updates, the textbook-best way to update N rows by id; see §2.5 for the proof
@@ -232,6 +239,38 @@ translate to time when they are all cache hits. The real lever is **round-trips 
 (§7), not the pick query. Beware benchmarking on a bloated table — rolled-back
 `EXPLAIN ANALYZE` runs accumulate dead tuples and inflate timings by ~20%; `VACUUM` and
 take the median of several runs before believing a delta.
+
+### 2.7 Gate membership without a per-row string parse (measured)
+
+Before: the claim decided "is this a configured concurrency gate?" per candidate row with
+`split_part(concurrency_key, ':', 1)` (a substring allocation) tested via a correlated
+`EXISTS` **and** a `LEFT JOIN` to `gen_durable_bucket_configs` — plus a synthetic partition
+string `coalesce('k:' || concurrency_key, 'i:' || id::text)` so NULL keys stayed distinct.
+All of it per row, in the hottest query.
+
+Now: `concurrency_key` carries a STORED generated column `concurrency_name`
+(`split_part(concurrency_key, ':', 1)`, computed **once per write** by Postgres). The claim
+tests `concurrency_name = ANY($5)` against the configured-gate array the caller already holds
+(`config.concurrency_limit_names` — the set the executor trusts too), and partitions by the
+**raw** `concurrency_key`. The configs table leaves the hot path entirely (it stays the source
+of truth for the limiter and GC, not the claim).
+
+Measured on Postgres 17, 50k runnable rows (80 % plain / 10 % gated / 10 % unconfigured, 500
+executing to exercise the arbiter probe):
+
+| | claim, batch 200 | isolated window+filter over all 50k (no LIMIT) | per candidate row |
+|---|---|---|---|
+| before (`split_part` ×2 + configs join + `‖` partition) | 2.25 ms | 285 ms | ~5.7 µs |
+| after (`concurrency_name = ANY` + partition by key) | **1.98 ms** | **173 ms** | **~3.5 µs** |
+
+The per-pick win is modest (~12 %) because `LIMIT $2` caps the parsed rows and the claim's
+`UPDATE` dominates a single pick (§2.4). The real saving is **~1.5–2 µs of CPU per candidate
+row**, and it scales with `batch × pick-frequency`: at the §2.4 reference of ~10k picked
+rows/s that is a measurable slice of the ~0.15 s/s picking floor, burned on string work the
+column removed. Statement counts are unchanged (claim is still one statement; `test/perf_test.exs`
+holds at 1 / 3). The cost paid once: `change(3)`'s `ADD COLUMN … STORED` rewrites the table
+under `ACCESS EXCLUSIVE` (~125 ms / 50k rows here; scales with row count — a maintenance-window
+migration on a large install).
 
 ---
 

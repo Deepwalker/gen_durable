@@ -37,17 +37,17 @@ death.
 | `Context` (`context.ex`) | The `ctx` struct handed to `step/2`: id, step, state, `awaited`/`all` (signals), `childs`. |
 | `Outcome` (`outcome.ex`) | Validates/normalizes a step's return: `:next` / `:retry` / `:await` / `:done` / `:stop` / `:schedule_childs`. |
 | `Registry` (`registry.ex`) | FSM-module resolution (dynamic by `fsm` column, or explicit `:fsms`); the supervisor-owned ETS table. |
-| `Migration` (`migration.ex`) | The DDL. `up/1` applies only the version increments an install is missing (`@latest_version = 2`). |
+| `Migration` (`migration.ex`) | The DDL. `up/1` applies only the version increments an install is missing (`@latest_version = 3`). |
 | `Testing` (`testing.ex`) | Inline synchronous `drain/1` for host tests (runs the real pick/executor in the calling process). |
 
-## Data model (schema v2)
+## Data model (schema v3)
 
 Four tables. `gen_durable` is the instance; the rest support it.
 
 - **`gen_durable`** — one row per FSM instance. Drives everything through `status`
   (`runnable` → `executing` → `awaiting_signal`/`awaiting_children` → `done`/`failed`).
   Key columns: `fsm`/`fsm_version`/`step`/`state`(jsonb); `queue`/`priority`/`eligible_at`
-  (scheduling); `concurrency_key`/`concurrency_shard`/`rate_limit`/`weight` (limits);
+  (scheduling); `concurrency_key`/`concurrency_name`(stored generated gate-name split)/`concurrency_shard`/`rate_limit`/`weight` (limits);
   `locked_by`/`lease_expires_at`/`attempt` (claim + leasing); `awaits`/`await_deadline`
   (signals); `parent_id`/`children_pending` (fan-out join); `correlation_key`/`_guard`/`_scope`
   (identity/dedup); `result`/`last_error`.

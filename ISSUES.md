@@ -387,7 +387,10 @@ and skip discipline, weaker strength; bucket locks stay `FOR UPDATE`.)
 
 `coalesce(concurrency_key, id::text)` collapsed a key `"42"` with an
 unrelated row of id 42 into one dedup partition (transient underfill only).
-Now `coalesce('k:' || concurrency_key, 'i:' || id::text)`.
+Then `coalesce('k:' || concurrency_key, 'i:' || id::text)`. **Superseded by item 29:**
+the partition is now the raw `concurrency_key` (NULL keys kept wholesale by an `IS NULL`
+branch, not by an id-synthesized partition), so id no longer participates and the collision
+is impossible by construction — the prefix trick is removed.
 
 ### 19. `min_demand` above the claim ceiling silently disabled refill — FIXED
 
@@ -677,6 +680,32 @@ goes `:stale`; the token leaks in the safe direction (throughput slightly under 
 refills by time. This is the same leak-on-crash the out-of-band admit already has (0.2.9); a
 mid-chain `:stale` requires the lease to expire *during* a step, which is already a degenerate
 (scheduler-dead) case. Not worth a rollback round-trip.
+
+### 29. Per-row string parsing in the hot claim (`split_part` + configs join + synthetic partition) — FIXED
+
+The claim decided gate membership per candidate row with `split_part(concurrency_key, ':', 1)`
+(a substring allocation) tested via a correlated `EXISTS` **and** a `LEFT JOIN` to
+`gen_durable_bucket_configs`, and dedup-partitioned by a synthetic string
+`coalesce('k:' || concurrency_key, 'i:' || id::text)` (item 18's collision fix). All per row,
+in the hottest query — CPU that scales with `batch × pick-frequency`.
+
+Fix (schema `change(3)`, `mix.exs` 0.2.11): a STORED generated column
+`concurrency_name = split_part(concurrency_key, ':', 1)` materializes the gate name **once per
+write**; the claim tests `concurrency_name = ANY($5)` against the configured-gate array threaded
+from the caller (`config.concurrency_limit_names` — the `conc`-only set the executor already
+trusts, so the pick reads no config table at all) and partitions by the **raw** `concurrency_key`.
+
+This also **supersedes item 18's mechanism**: `id` no longer participates in the partition, so a
+numeric key can't collide with an id by construction — all-NULL keys share one partition but are
+kept wholesale by the `concurrency_key IS NULL` branch of `winners`, never dropped. The `'k:'/'i:'`
+prefix trick is gone.
+
+Verified: full suite 181/0 (gate tests thread the names via a test helper mirroring the engine);
+`test/perf_test.exs` statement counts unchanged (claim still 1 statement, empty pick 1, batch pick
+3). Measured on 50k runnable (Postgres 17): claim batch-200 **2.25 → 1.98 ms** (~12 %), isolated
+full-scan **1.65×**, **~1.5–2 µs/candidate-row** of string CPU removed (PERFORMANCE.md §2.7). Cost
+paid once: the `ADD COLUMN … STORED` rewrites the table under `ACCESS EXCLUSIVE` (~125 ms/50k rows;
+a maintenance-window migration on a large install).
 
 ## Verified sound (checked deliberately)
 

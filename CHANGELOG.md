@@ -6,6 +6,36 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.11
+
+### Changed
+- **Picker: gate membership is a stored column, not a per-row string parse (hot path).** The
+  claim used to decide "is this concurrency_key a configured gate?" per candidate row with
+  `split_part(concurrency_key, ':', 1)` (a substring allocation) tested via a correlated
+  `EXISTS` **and** a `LEFT JOIN` to `gen_durable_bucket_configs`, plus a synthetic dedup
+  partition string `coalesce('k:' || concurrency_key, 'i:' || id::text)`. That is now a STORED
+  generated column `concurrency_name` (`split_part(...)`, materialized **once per write** by
+  Postgres); the claim tests `concurrency_name = ANY($5)` against the configured-gate array
+  threaded from the caller (`config.concurrency_limit_names` — the `conc`-only set the executor
+  already trusts) and partitions by the **raw** `concurrency_key`. The pick reads **no config
+  table** and does **no per-row `split_part`**.
+
+  **Schema (`change(3)`, migration required).** `ADD COLUMN concurrency_name text GENERATED
+  ALWAYS AS (split_part(concurrency_key, ':', 1)) STORED`. This rewrites the table once under
+  `ACCESS EXCLUSIVE` (~125 ms / 50k rows measured; scales with row count — a maintenance-window
+  migration on a large install). `GenDurable.Migration.up/1` applies it as the v2→v3 increment.
+
+  **Tradeoff / why.** Round-trips and statement counts are unchanged (claim is still one
+  statement; `test/perf_test.exs` holds at 1 / 3). The per-pick win is modest (~12 %, 2.25 →
+  1.98 ms at batch 200) because `LIMIT` caps the parsed rows and the `UPDATE` dominates a single
+  pick — the real saving is **~1.5–2 µs of CPU per candidate row**, which scales with
+  `batch × pick-frequency` (a visible slice of the picking floor at high throughput). Also
+  removes the per-batch join to `gen_durable_bucket_configs` (cleaner plan) and **supersedes**
+  the item-18 `'k:'/'i:'` partition-prefix collision fix (`id` no longer participates in the
+  partition, so a numeric key can't collide with an id by construction). `Queries.pick/6 →
+  pick/7` (new trailing `gate_names` arg, defaulting to `[]`). See `PERFORMANCE.md` §2.7 and
+  `ISSUES.md` #29.
+
 ## 0.2.10
 
 ### Added

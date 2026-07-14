@@ -88,12 +88,23 @@ defmodule GenDurable.Queries do
   # (`GenDurable.Limiter`); only the K=1 dedup of UNCONFIGURED concurrency keys stays here,
   # as the `cand` NOT EXISTS guard plus the `gen_durable_concurrency_active` unique arbiter.
   #
+  # NO per-row string work: gate membership is `concurrency_name = ANY($5)`, where
+  # `concurrency_name` is the STORED generated split of `concurrency_key` (parsed ONCE at
+  # write, see Migration change(3)) and $5 is the configured-gate name array threaded from
+  # the caller's `config.concurrency_limit_names` — the same set the executor already trusts.
+  # This replaced a per-candidate `split_part(...)` + a join to `gen_durable_bucket_configs`
+  # (measured ~1.5 µs/candidate-row; PERFORMANCE.md §3). The pick no longer reads the configs
+  # table at all — it stays the source of truth for the limiter/GC, not the hot claim.
+  #
   #   cand    — top-$2 runnable rows by (priority, eligible_at), locked once
   #             (FOR NO KEY UPDATE SKIP LOCKED). A row whose concurrency_key is already
   #             executing is excluded UNLESS the key is a configured gate; NULL keys
-  #             short-circuit. `row_number()` marks the most-urgent row per key.
-  #   winners — unconfigured keys keep only their rn=1 row (K=1 window dedup); a CONFIGURED
-  #             gate keeps ALL its candidates (the limiter trims them by capacity).
+  #             short-circuit. `row_number()` over the raw `concurrency_key` marks the
+  #             most-urgent row per key (all-NULL keys land in one partition but are kept
+  #             wholesale by the `IS NULL` branch below — no synthetic partition string).
+  #   winners — keep a row when: its key is NULL (all pass), OR it is the rn=1 row of its
+  #             key (unconfigured K=1 window dedup), OR it is `gated` (a CONFIGURED gate
+  #             keeps ALL its candidates; the limiter trims them by capacity).
   #   claimed — flip winners to `executing`. This over-claims a saturated gate up to $2;
   #             the limiter denies the excess and `pick_claim` releases it back to runnable.
   #             The alternative — holding the row locks across the admit round-trip — is the
@@ -103,16 +114,16 @@ defmodule GenDurable.Queries do
   # Returns the job fields plus the admission inputs (gated?, rate_limit, weight).
   @claim_sql """
   WITH cand AS (
-    SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at,
-           row_number() OVER (PARTITION BY coalesce('k:' || concurrency_key, 'i:' || id::text)
+    SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at, gated,
+           row_number() OVER (PARTITION BY concurrency_key
                               ORDER BY priority, eligible_at) AS rn
     FROM (
-      SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at
+      SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at,
+             (concurrency_name IS NOT NULL AND concurrency_name = ANY($5::text[])) AS gated
       FROM gen_durable g
       WHERE g.status = 'runnable' AND g.eligible_at <= now() AND g.queue = $1
         AND (g.concurrency_key IS NULL
-             OR EXISTS (SELECT 1 FROM gen_durable_bucket_configs cc
-                        WHERE cc.kind = 'conc' AND cc.name = split_part(g.concurrency_key, ':', 1))
+             OR g.concurrency_name = ANY($5::text[])
              OR NOT EXISTS (
                SELECT 1 FROM gen_durable e
                WHERE e.concurrency_key = g.concurrency_key AND e.status = 'executing'))
@@ -122,12 +133,9 @@ defmodule GenDurable.Queries do
     ) s
   ),
   winners AS (
-    SELECT c.id, c.concurrency_key, c.rate_limit, c.weight, c.priority, c.eligible_at,
-           (cc.name IS NOT NULL) AS gated
-    FROM cand c
-    LEFT JOIN gen_durable_bucket_configs cc
-           ON cc.kind = 'conc' AND cc.name = split_part(c.concurrency_key, ':', 1)
-    WHERE c.rn = 1 OR cc.name IS NOT NULL
+    SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at, gated
+    FROM cand
+    WHERE concurrency_key IS NULL OR rn = 1 OR gated
   ),
   claimed AS (
     UPDATE gen_durable g
@@ -148,9 +156,13 @@ defmodule GenDurable.Queries do
   ORDER BY w.priority, w.eligible_at, c.id
   """
 
-  def pick(repo, queue, batch, worker, lease_ttl_ms, limiter \\ nil) do
+  # `gate_names` — the configured concurrency-gate names (`config.concurrency_limit_names`,
+  # a list), bound as $5 for the `concurrency_name = ANY($5)` membership test. `[]` (the
+  # default, and the Testing/perf callers' 5-arg form) means "no gates" — every non-null key
+  # is unconfigured K=1, which `= ANY('{}')` yields as false, exactly.
+  def pick(repo, queue, batch, worker, lease_ttl_ms, limiter \\ nil, gate_names \\ []) do
     limiter = limiter || {GenDurable.Limiter.Postgres, %{repo: repo}}
-    pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, 3)
+    pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, gate_names, 3)
   end
 
   # Claim → admit (out-of-band) → keep admitted, release denied. Two failure regimes, kept
@@ -161,11 +173,11 @@ defmodule GenDurable.Queries do
   #     spent, or a transient DB error in admit/release/enrich) would strand the claimed batch
   #     as `executing` until the reaper. The old fused pick rolled back atomically; we mirror
   #     it by releasing the whole batch before reraising (a debited slot heals via reconcile).
-  defp pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, attempts) do
-    case claim(repo, queue, batch, worker, lease_ttl_ms) do
+  defp pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, gate_names, attempts) do
+    case claim(repo, queue, batch, worker, lease_ttl_ms, gate_names) do
       {:contended} when attempts > 1 ->
         :telemetry.execute([:gen_durable, :concurrency, :contended], %{count: 1}, %{queue: queue})
-        pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, attempts - 1)
+        pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, gate_names, attempts - 1)
 
       {:contended} ->
         []
@@ -175,8 +187,10 @@ defmodule GenDurable.Queries do
     end
   end
 
-  defp claim(repo, queue, batch, worker, lease_ttl_ms) do
-    %{rows: rows} = q!(repo, "claim", @claim_sql, [queue, batch, worker, lease_ttl_ms])
+  defp claim(repo, queue, batch, worker, lease_ttl_ms, gate_names) do
+    %{rows: rows} =
+      q!(repo, "claim", @claim_sql, [queue, batch, worker, lease_ttl_ms, gate_names])
+
     {:ok, rows}
   rescue
     e in Postgrex.Error ->

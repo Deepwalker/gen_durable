@@ -247,9 +247,13 @@ defmodule GenDurable.Testing do
   defp loop(config, worker, queue, with_scheduled, budget, acc) do
     if with_scheduled, do: promote_scheduled(config.repo, queue)
 
+    gate_names = MapSet.to_list(config.concurrency_limit_names)
+
     jobs =
       due_queues(config.repo, queue)
-      |> Enum.flat_map(&Queries.pick(config.repo, &1, 100, worker, 60_000, config.limiter))
+      |> Enum.flat_map(
+        &Queries.pick(config.repo, &1, 100, worker, 60_000, config.limiter, gate_names)
+      )
 
     cond do
       jobs == [] ->

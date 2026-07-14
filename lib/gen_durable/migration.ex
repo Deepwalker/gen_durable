@@ -28,7 +28,7 @@ defmodule GenDurable.Migration do
 
   use Ecto.Migration
 
-  @latest_version 2
+  @latest_version 3
 
   @doc "Migrate the schema up to `:version` (default: latest)."
   def up(opts \\ []) do
@@ -352,6 +352,28 @@ defmodule GenDurable.Migration do
       CHECK (available >= 0 AND available <= cap)
     )
     """)
+  end
+
+  # --- version 3: DDL ------------------------------------------------
+
+  # The gate name split out of `concurrency_key` (`"name:partition"` → `"name"`),
+  # materialized ONCE per write as a STORED generated column so the picker never
+  # parses the key per row. The hot claim tests gate membership with
+  # `concurrency_name = ANY($gates)` — a comparison against the (tiny) configured-gate
+  # array — instead of `split_part(...)` + a per-row join to `gen_durable_bucket_configs`.
+  # NULL key ⇒ NULL name (split_part(NULL,…) is NULL). Immutable expression, so the
+  # column is safe as GENERATED; the ADD rewrites the table once (ACCESS EXCLUSIVE) and
+  # backfills every existing row. See `GenDurable.Queries` (@claim_sql) and PERFORMANCE.md §3.
+  defp change(3, :up, p) do
+    execute("""
+    ALTER TABLE #{p}.gen_durable
+      ADD COLUMN concurrency_name text
+      GENERATED ALWAYS AS (split_part(concurrency_key, ':', 1)) STORED
+    """)
+  end
+
+  defp change(3, :down, p) do
+    execute("ALTER TABLE #{p}.gen_durable DROP COLUMN concurrency_name")
   end
 
   # --- helpers ---------------------------------------------------------------

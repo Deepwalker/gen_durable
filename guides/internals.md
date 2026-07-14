@@ -29,7 +29,7 @@ One row per instance (or job — a job is a one-step instance). Column groups:
 | lifecycle | `status` | enum `durable_status`: `runnable → executing → awaiting_signal / awaiting_children / done / failed`; the whole protocol is flips of this column |
 | scheduling | `queue`, `priority`, `eligible_at` | the pick order is exactly `(queue, priority, eligible_at)` |
 | claim | `locked_by`, `lease_expires_at` | who is executing it and until when the claim is trusted |
-| admission | `concurrency_key`, `concurrency_shard`, `rate_limit`, `weight` | `concurrency_shard` is set at claim time for gated keys (the release credits that shard back); `rate_limit`/`weight` describe the *current* step |
+| admission | `concurrency_key`, `concurrency_name`, `concurrency_shard`, `rate_limit`, `weight` | `concurrency_name` is a **stored generated column** (`split_part(concurrency_key, ':', 1)`, the gate name) — the picker tests gate membership against it with no per-row `split_part`; `concurrency_shard` is set at claim time for gated keys (the release credits that shard back); `rate_limit`/`weight` describe the *current* step |
 | coordination | `awaits text[]`, `await_deadline`, `parent_id`, `children_pending` | signal parking and child fan-out join state |
 | identity | `correlation_key`, `correlation_scope durable_status[]`, `correlation_guard` | `correlation_guard` is a **stored generated column**: equals the key while `status = any(scope)`, else NULL — computed by the database, never by application code |
 | bookkeeping | `inserted_at`, `updated_at` | `updated_at` doubles as the termination instant for GC retention |
@@ -85,16 +85,20 @@ pick's business.
 ### The pick — claim, then out-of-band admission
 
 Admission for **configured** limits lives behind the `GenDurable.Limiter` behaviour, not in
-the claim. The pick is three steps (`Queries.pick/6`). Config lookups filter by `kind` — a
-`concurrency_key` whose prefix equals a *rate*-limit name must not read as a gate:
+the claim. The pick is three steps (`Queries.pick/7`). The claim reads **no config table** —
+the set of configured gate names is threaded in as a parameter (`config.concurrency_limit_names`,
+built at boot from `concurrency_limits:` only, so a `concurrency_key` whose prefix equals a
+*rate*-limit name is naturally not in it and never reads as a gate):
 
 1. **claim** (`@claim_sql`, one lock-light statement) — up to `batch` runnable rows via
    `gen_durable_pick`, locked in-scan with `FOR NO KEY UPDATE SKIP LOCKED`, flipped to
-   `executing`. The K = 1 guard rides in the `WHERE` (an *unconfigured* keyed row with an
-   executing sibling is filtered *before* the `LIMIT`), and `gen_durable_concurrency_active`
-   is its correctness backstop. A configured gate keeps ALL its candidates — a provisional
-   non-null `concurrency_shard` drops them out of that arbiter (their cap is the bucket). No
-   bucket table is touched here.
+   `executing`. Gate membership is `concurrency_name = ANY($5)` — the stored generated split of
+   the key (no per-row `split_part`, no join to `gen_durable_bucket_configs`) against that gate
+   array. The K = 1 guard rides in the `WHERE` (an *unconfigured* keyed row with an executing
+   sibling is filtered *before* the `LIMIT`), and `gen_durable_concurrency_active` is its
+   correctness backstop. A configured gate keeps ALL its candidates — a provisional non-null
+   `concurrency_shard` drops them out of that arbiter (their cap is the bucket). No bucket table
+   is touched here.
 2. **admit** (`Limiter.admit/2`) — the claimed batch, ordered `(priority, eligible_at)`, goes
    to the backend. `Limiter.Postgres` runs the same capacity math as the old fused pick — gate
    ranges over `grabbed ∪ cold` shards; cumulative rate weight over per-shard refilled
