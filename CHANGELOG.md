@@ -6,6 +6,42 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.9
+
+### Changed
+- **Admission for configured limits moved out of the pick, behind a `GenDurable.Limiter`
+  behaviour.** The fused claim (the `c_*`/`r_*` CTEs) welded rate/concurrency admission and
+  its bucket `FOR UPDATE` locks into the single pick statement; under fan-out that claim
+  locks hard, and sharding the buckets (0.2.7) smears the contention without curing it. The
+  pick now (1) claims candidate rows into `executing` in one lock-light statement, then
+  (2) asks the limiter to `admit/2` them (a separate, short statement that holds only the
+  bucket locks), then (3) keeps the admitted and releases the denied. Concurrency credit
+  is out-of-band too: the outcome's `credit_gate` rider is gone — the executor calls
+  `Limiter.credit/2` after a committed outcome (a stale outcome credits nothing, exactly as
+  the rider did). The K=1 dedup of **unconfigured** concurrency keys stays in-band (the
+  `gen_durable_concurrency_active` arbiter) — it is intrinsic to the durable row.
+- **Trade-off:** claim and admit are no longer one statement, so a saturated gate
+  over-claims up to the batch and the limiter releases the excess (scheduler backoff bounds
+  the churn), and a crash between the two windows leaks a slot in the safe direction
+  (under-admission), healed by the reconciler — the same self-heal that already backed
+  crash recovery. The observable limits are unchanged.
+
+### Added
+- **A pluggable limiter backend, selected by the `:limiter` engine option.**
+  - `:postgres` (default) — `GenDurable.Limiter.Postgres`: the same sharded
+    `gen_durable_buckets` admission math, now run as standalone statements over the claimed
+    batch instead of fused into the pick. No new dependency.
+  - `{:redis, url_or_opts}` — `GenDurable.Limiter.Redis`: concurrency is a **lease-scored
+    ZSET** semaphore per key (members are holders, scores are lease expiries) that
+    **self-heals on lease expiry** — a crashed holder is pruned on the next admit, no Postgres
+    reconcile; the heartbeat renews live holders so a long step is never pruned. Rate is a
+    Lua token bucket. `admit`/`renew` are single atomic `EVAL`s; caps live in `persistent_term`
+    (seeded at startup), so admission needs no config round-trip. Requires the optional `:redix`
+    dep. **Single-node Redis** (one `admit` touches every batched key; Cluster would span hash
+    slots). No schema change — the K=1 arbiter and `concurrency_shard` stay a Postgres-row
+    concern regardless of backend.
+- Migration-free: 0.2.9 adds **no** DDL; both backends reuse the existing tables / no tables.
+
 ## 0.2.8
 
 ### Changed

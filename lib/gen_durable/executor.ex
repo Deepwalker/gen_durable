@@ -221,6 +221,12 @@ defmodule GenDurable.Executor do
         )
 
       committed ->
+        # The row left `executing` — credit its concurrency slot back, out-of-band
+        # (replaces the old `credit_gate` rider). Only for a CONFIGURED gate (a slot was
+        # drawn); plain / unconfigured K=1 rows carry none. Skipped on `:stale` above: the
+        # row was reclaimed and its slot belongs to the new claimant.
+        credit_slot(config, job)
+
         # The committed outcome may have settled the instance (terminal or
         # parked) — nudge this node's awaiters. A hint only: awaiters re-check
         # the row, so over-nudging (e.g. an empty schedule_childs that left the
@@ -254,6 +260,14 @@ defmodule GenDurable.Executor do
 
     :ok
   end
+
+  # Credit the concurrency slot the job held (the opaque handle the limiter drew at pick time)
+  # back to its backend. A configured gate carries a slot; plain / unconfigured K=1 rows carry
+  # none (`nil`).
+  defp credit_slot(config, %{slot: slot}) when not is_nil(slot),
+    do: GenDurable.Limiter.credit(config.limiter, [slot])
+
+  defp credit_slot(_config, _job), do: :ok
 
   defp format_reason(reason) when is_binary(reason), do: reason
   defp format_reason(%{__exception__: true} = e), do: Exception.message(e)

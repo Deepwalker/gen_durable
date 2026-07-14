@@ -82,38 +82,37 @@ opposite orders would deadlock on the unique index's uncommitted entries; in one
 race is a clean conflict instead. Inserts touch **no other table** — limiter buckets are the
 pick's business.
 
-### The pick — one statement, three admissions
+### The pick — claim, then out-of-band admission
 
-The engine's most complex statement (`Queries.pick/5`), a single CTE chain over the two
-limiter tables plus `gen_durable`. Config lookups filter by `kind` — a `concurrency_key`
-whose prefix equals a *rate*-limit name must not read as a gate:
+Admission for **configured** limits lives behind the `GenDurable.Limiter` behaviour, not in
+the claim. The pick is three steps (`Queries.pick/6`). Config lookups filter by `kind` — a
+`concurrency_key` whose prefix equals a *rate*-limit name must not read as a gate:
 
-1. `cand` — up to `batch` runnable rows via `gen_durable_pick`, locked in-scan with
-   `FOR NO KEY UPDATE SKIP LOCKED`. The K = 1 guard rides in the `WHERE` (keyed rows with an
-   executing sibling are filtered *before* the `LIMIT`); configured-gate and rate rows pass
-   through — their admission is capacity math below.
-2. gate CTEs — lock **this picker's share** of the winner keys' slot shards
-   (`FOR UPDATE OF b SKIP LOCKED`, ordered) so concurrent pickers take *disjoint* shards,
-   compute cumulative admission ranges over `grabbed ∪ cold` (a bucketless gate admits
-   against virtual full shards from the config), remember the drawn shard per row.
-3. rate CTEs — cumulative weight per key over the survivors, lock the key's shards
-   (`SKIP LOCKED`), refill each per shard from the *current* config
-   (`LEAST(burst/shards, tokens + elapsed × rate/shards)`), grant the prefix that fits the
-   summed grabbed availability. Rate has no credit-back, so rate rows carry no shard — the
-   consumed weight is debited **proportionally** across the grabbed shards.
-4. `claimed` — flip the admitted set to `executing` with `locked_by`, lease, and (for gates)
-   `concurrency_shard`.
-5. writebacks and mints — debit the grabbed counter shards; `INSERT` the cold ones **already
-   debited** (`c_mint` merges racing gate mints via `ON CONFLICT`; a racing rate mint is a
-   PK violation and a bounded pick retry — which also keeps rate trippable only on the PK and
-   gates only on the CHECK, disambiguating the `:contended` telemetry).
-6. two `UNION ALL` tails return throttle counts per limited key — the
-   `:throttled` telemetry rides the same round-trip.
+1. **claim** (`@claim_sql`, one lock-light statement) — up to `batch` runnable rows via
+   `gen_durable_pick`, locked in-scan with `FOR NO KEY UPDATE SKIP LOCKED`, flipped to
+   `executing`. The K = 1 guard rides in the `WHERE` (an *unconfigured* keyed row with an
+   executing sibling is filtered *before* the `LIMIT`), and `gen_durable_concurrency_active`
+   is its correctness backstop. A configured gate keeps ALL its candidates — a provisional
+   non-null `concurrency_shard` drops them out of that arbiter (their cap is the bucket). No
+   bucket table is touched here.
+2. **admit** (`Limiter.admit/2`) — the claimed batch, ordered `(priority, eligible_at)`, goes
+   to the backend. `Limiter.Postgres` runs the same capacity math as the old fused pick — gate
+   ranges over `grabbed ∪ cold` shards; cumulative rate weight over per-shard refilled
+   availability (`LEAST(burst/shards, tokens + elapsed × rate/shards)`); debit only the
+   finally-admitted (gate **and** rate); cold shards minted **already debited** (`c_mint`
+   merges racing gate mints via `ON CONFLICT`, a racing rate mint is a bounded PK-violation
+   retry) — as ONE statement holding only the bucket `FOR UPDATE OF b SKIP LOCKED` locks, not
+   the row claim. It stamps the drawn shard onto the admitted rows and returns
+   `%{admitted, denied}`.
+3. **keep / release** — denied rows go back to `runnable` (`release_claims`); a saturated gate
+   thus over-claims up to `batch` and releases the excess, the price of not holding the row
+   locks across the admit round-trip (scheduler backoff bounds the churn). `:throttled`
+   telemetry is derived from the denials.
 
-Everything capacity-related is `never executed` in the plan when the window holds no keyed
-rows — an unkeyed queue pays one window sort over ≤ batch rows and nothing else. After the
-pick, two batched `SELECT`s enrich the whole claim set (pending signals, live children) —
-three statements per batch total, regardless of batch size.
+An unlimited pick calls no backend at all (an empty admit short-circuits in Elixir): it is the
+same claim plus two batched `SELECT`s enriching the whole claim set (pending signals, live
+children) — three statements per batch, regardless of batch size. A limited pick adds the
+admit round-trip (and a release when a limit bites).
 
 ### Outcomes — one guarded statement each
 
@@ -123,16 +122,18 @@ status = 'executing'` as the guarded head of a CTE chain, with riders gated on i
 
 | Outcome | Row flip | Riders |
 |---|---|---|
-| `:next` | → `runnable`, new step/state, new `rate_limit`/`weight`, optional `concurrency_key` change, `concurrency_shard` cleared | `credit` (gate slot back), `consumed` (DELETE handled signals) |
-| `:retry` | → `runnable` with backoff, `attempt` kept incrementing, `awaits` kept | `credit` |
-| `:await` | → `awaiting_signal` + `awaits`/deadline | `credit`; the one **multi-statement** op: park + recheck in a short transaction (the recheck closes the signal-raced-the-park window) |
-| `:done` / `:stop` | → `done`/`failed` + `result`/`last_error` | `credit`, `consumed`, and the parent join: decrement the parent's `children_pending`, waking it at zero |
-| `schedule_childs` | → `awaiting_children` (or `runnable` when none inserted) | `credit`, `consumed`, the children `INSERT` (same unnest/conflict shape as `insert_all`) |
+| `:next` | → `runnable`, new step/state, new `rate_limit`/`weight`, optional `concurrency_key` change, `concurrency_shard` cleared | `consumed` (DELETE handled signals) |
+| `:retry` | → `runnable` with backoff, `attempt` kept incrementing, `awaits` kept | — |
+| `:await` | → `awaiting_signal` + `awaits`/deadline | the one **multi-statement** op: park + recheck in a short transaction (the recheck closes the signal-raced-the-park window) |
+| `:done` / `:stop` | → `done`/`failed` + `result`/`last_error` | `consumed`, and the parent join: decrement the parent's `children_pending`, waking it at zero |
+| `schedule_childs` | → `awaiting_children` (or `runnable` when none inserted) | `consumed`, the children `INSERT` (same unnest/conflict shape as `insert_all`) |
 
-The `credit` rider reads the row's **old** `concurrency_key`/`concurrency_shard` from the
-table, not from the update — sibling CTEs see the statement snapshot, never each other's
-writes — which is exactly what lets `:next` release the old slot while rewriting the key in
-the same statement.
+Every outcome clears `concurrency_shard` (the row is leaving `executing`), but the gate slot
+is **credited out-of-band**: the executor calls `Limiter.credit/2` after a *committed*
+(non-stale) outcome, with the `{key, shard}` the job held. A stale outcome credits nothing
+(the executor skips it, exactly as the old inline `credit` rider affected zero rows under a
+failed guard); a crash between commit and credit leaks the slot in the safe direction
+(under-admission), healed by the reconciler.
 
 ### Signals — `deliver_signal`, one statement
 
@@ -175,8 +176,8 @@ not-yet-parked row without waiting.
   choice: with a single *unsharded* counter, blocking `FOR UPDATE` beat `SKIP LOCKED`, which
   spin-retried with no alternative work. Sharding removes the one hot row, so skipping wins —
   size `shards ≥ contending nodes`, or an under-sharded hot key degrades back to that spin.)
-  The credit riders and the reconciler still take plain `FOR UPDATE` on the specific shard
-  they address, in sorted order.
+  The out-of-band credit (`Limiter.credit/2`) and the reconciler still take plain `FOR UPDATE`
+  on the specific shard they address, in sorted order.
 - **Racing inserts meet at unique indexes, in sorted order.** Ordered insertion turns
   "deadlock on each other's uncommitted index entries" into "one clean unique violation",
   which the caller resolves (pick retry) or ignores (`ON CONFLICT DO NOTHING`).

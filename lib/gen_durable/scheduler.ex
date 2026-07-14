@@ -162,6 +162,9 @@ defmodule GenDurable.Scheduler do
   def handle_info(:heartbeat, state) do
     ids = buffer_ids(state.buffer) ++ in_flight_ids(state.in_flight)
     Queries.heartbeat(state.config.repo, ids, state.worker, state.config.lease_ttl_ms)
+    # Renew the limiter slots those held rows still occupy: a lease-native backend (Redis)
+    # bumps each slot's expiry so a live holder is never pruned mid-step. PG no-ops.
+    GenDurable.Limiter.renew(state.config.limiter, held_slots(state))
     schedule(:heartbeat, state.heartbeat_interval)
     {:noreply, state}
   end
@@ -301,7 +304,9 @@ defmodule GenDurable.Scheduler do
 
     if demand > 0 and (demand >= state.min_demand or idle?(state)) do
       config = state.config
-      jobs = Queries.pick(config.repo, state.queue, demand, state.worker, config.lease_ttl_ms)
+      jobs =
+        Queries.pick(config.repo, state.queue, demand, state.worker, config.lease_ttl_ms,
+          config.limiter)
 
       :telemetry.execute(
         [:gen_durable, :pick, :stop],
@@ -325,7 +330,7 @@ defmodule GenDurable.Scheduler do
     state = %{
       state
       | buffer: rest,
-        in_flight: Map.put(state.in_flight, task.ref, job.id)
+        in_flight: Map.put(state.in_flight, task.ref, {job.id, job.slot})
     }
 
     drain(state)
@@ -380,7 +385,14 @@ defmodule GenDurable.Scheduler do
   end
 
   defp buffer_ids(buffer), do: Enum.map(buffer, & &1.id)
-  defp in_flight_ids(in_flight), do: Map.values(in_flight)
+  defp in_flight_ids(in_flight), do: Enum.map(Map.values(in_flight), &elem(&1, 0))
+
+  # The limiter slots still held by buffered (admitted, not yet running) and in-flight rows.
+  defp held_slots(state) do
+    from_buffer = Enum.map(state.buffer, & &1.slot)
+    from_in_flight = Enum.map(Map.values(state.in_flight), &elem(&1, 1))
+    Enum.reject(from_buffer ++ from_in_flight, &is_nil/1)
+  end
 
   defp schedule(msg, after_ms), do: Process.send_after(self(), msg, after_ms)
 end

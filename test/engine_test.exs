@@ -94,6 +94,23 @@ defmodule GenDurable.EngineTest do
     assert row.result == %{"count" => 2}
   end
 
+  test "engine boots with the Redis limiter and drives gated jobs to done" do
+    start_engine(limiter: {:redis, redis_url()}, concurrency_limits: [gate: [limit: 2]])
+    key = "gate:#{System.unique_integer([:positive])}"
+
+    ids =
+      for _ <- 1..4 do
+        {:ok, id} =
+          GenDurable.insert(GenDurable.Test.Counter, state: %{target: 2}, concurrency_key: key)
+
+        id
+      end
+
+    for id <- ids do
+      assert wait_status(id, "done").result == %{"count" => 2}
+    end
+  end
+
   test "await parks, signal wakes next_step which reads ctx.awaited and consumes it" do
     start_engine()
     {:ok, id} = GenDurable.insert(GenDurable.Test.Awaiter)

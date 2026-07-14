@@ -25,6 +25,7 @@ defmodule GenDurable.GC do
   def init(opts) do
     state = %{
       repo: opts.repo,
+      limiter: opts.limiter,
       interval: opts.interval,
       retention_ms: opts.retention_ms,
       batch: opts.batch
@@ -37,8 +38,9 @@ defmodule GenDurable.GC do
   @impl true
   def handle_info(:gc, state) do
     swept = Queries.gc(state.repo, state.retention_ms, state.batch)
-    buckets = Queries.gc_buckets(state.repo)
-    gates = Queries.reconcile_concurrency(state.repo)
+    # The limiter self-heals its own counters (PG: sweep stale rate buckets + reconcile
+    # concurrency gates from the executing-rows truth). Stats ride into the telemetry.
+    %{buckets: buckets, gates: gates} = GenDurable.Limiter.reconcile(state.limiter)
 
     if swept > 0 or buckets > 0 or gates > 0 do
       :telemetry.execute(

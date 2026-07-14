@@ -83,76 +83,25 @@ defmodule GenDurable.Queries do
 
   # --- picker ----------------------------------------------------------------
 
-  # One statement, three admissions — K=1 concurrency dedup (unconfigured keys),
-  # concurrency GATES (configured keys: a sharded semaphore of size `cap`), and
-  # sharded token-bucket rate limiting — plus the canonical Postgres claim
-  # (`SELECT … FOR NO KEY UPDATE SKIP LOCKED LIMIT`, then one `UPDATE`).
+  # The claim: lock top-$2 runnable rows for the queue and flip them to `executing`,
+  # WITHOUT admission. Admission for CONFIGURED limits is out-of-band now
+  # (`GenDurable.Limiter`); only the K=1 dedup of UNCONFIGURED concurrency keys stays here,
+  # as the `cand` NOT EXISTS guard plus the `gen_durable_concurrency_active` unique arbiter.
   #
-  # Bucket rows (rate and gate) live in one sharded table `gen_durable_buckets`,
-  # keyed by (kind, key, shard). The pick locks a key's shard rows with
-  # **FOR UPDATE OF b SKIP LOCKED**: concurrent (cross-node) pickers grab
-  # DISJOINT shard subsets and admit over what each grabbed, so they run in
-  # parallel instead of serializing on one bucket held across the whole claim.
-  # A lone picker grabs every shard → full capacity, identical to unsharded.
-  # SKIP LOCKED never waits, so pickers can never deadlock on buckets; #pickers
-  # > #shards just means an excess picker grabs nothing for that key this pick
-  # and retries. Config lookups filter by `kind` — a concurrency_key whose
-  # prefix equals a RATE config name must not be misread as a gate (it would
-  # skip the K=1 arbiter and break mutual exclusion).
+  #   cand    — top-$2 runnable rows by (priority, eligible_at), locked once
+  #             (FOR NO KEY UPDATE SKIP LOCKED). A row whose concurrency_key is already
+  #             executing is excluded UNLESS the key is a configured gate; NULL keys
+  #             short-circuit. `row_number()` marks the most-urgent row per key.
+  #   winners — unconfigured keys keep only their rn=1 row (K=1 window dedup); a CONFIGURED
+  #             gate keeps ALL its candidates (the limiter trims them by capacity).
+  #   claimed — flip winners to `executing`. This over-claims a saturated gate up to $2;
+  #             the limiter denies the excess and `pick_claim` releases it back to runnable.
+  #             The alternative — holding the row locks across the admit round-trip — is the
+  #             contention we are removing. A cross-node race on an unconfigured key trips
+  #             the K=1 arbiter and aborts the whole claim; `pick_claim` retries warm.
   #
-  #   cand     — top-$2 runnable rows by (priority, eligible_at) via
-  #              `gen_durable_pick`, locked once (FOR NO KEY UPDATE SKIP LOCKED).
-  #              Rows whose concurrency_key is already `executing` are excluded
-  #              (NOT EXISTS) unless the key is a gate; NULL keys short-circuit
-  #              the guard. `row_number()` marks the most-urgent row per key
-  #              (NULL keys fall back to id via the 'k:'/'i:' prefixes).
-  #   winners  — unconfigured keys keep only their rn=1 row (K=1 window dedup);
-  #              GATED keys (name in bucket_configs, kind='conc') keep ALL their
-  #              candidate rows — admission is capacity-based below. K=1
-  #              correctness is the UNIQUE arbiter on (concurrency_key) WHERE
-  #              executing; a cross-node race cannot commit two (see pick/6).
-  #   c_cold   — a gated key with NO bucket rows is COLD: a fresh mint is full by
-  #              definition, so its virtual full shards come from the config with
-  #              no read. c_ranges unions them in, c_mint INSERTs them debited.
-  #   c_locked — lock this picker's share of the gated winner keys' shards
-  #              (SKIP LOCKED → disjoint across pickers), ordered (key, shard).
-  #   c_ranges — cumulative admission ranges over the grabbed ∪ cold shards,
-  #              most-available first. min(available) per (key, shard) is a cheap
-  #              backstop (SKIP LOCKED can't hit the EPQ double-emit that
-  #              motivated it, but harmless).
-  #   c_admit  — a gated row is admitted iff its per-key rank rn falls in a
-  #              shard's range; the shard is stamped on the row
-  #              (concurrency_shard) so the completion credit-back is addressed.
-  #   c_mint   — materialize the cold gate shards pre-debited (cap − taken).
-  #              ON CONFLICT DO UPDATE merges a racing picker's debit; an
-  #              overdraw trips the CHECK, aborts, and pick/6 retries warm.
-  #   pool     — the concurrency-admitted set (unconfigured rn=1 pass through),
-  #              which the rate CTEs then filter further; both writebacks derive
-  #              from the FINAL claimed set, so a row the gate admits but the
-  #              rate denies debits neither.
-  #   rw       — cumulative weight `cw` of the urgency prefix per rate key.
-  #   r_cold   — a rate key with NO bucket rows: virtual full shards from config
-  #              (each burst/shards), unioned into r_shards. Cold admits with no
-  #              lag; r_mint INSERTs the shards debited.
-  #   r_locked — lock this picker's share of the rate key's shards (SKIP LOCKED),
-  #              refill rate/burst read from the CURRENT config (so a burst
-  #              change is instant, and the stored `capacity` is rewritten each
-  #              pick). Rate has no credit-back, so rate rows carry no shard.
-  #   r_shards — per-shard refilled availability (grabbed ∪ cold); r_key_avail
-  #              sums it. granted = the cumulative-weight prefix that fits the
-  #              sum. A lone picker grabs all shards → the full `weight ≤ burst`
-  #              budget; a contended one sees only its slice.
-  #   r_new    — distribute the consumed weight across the grabbed shards
-  #              PROPORTIONALLY (each shard keeps avail·(1 − consumed/total));
-  #              writeback banks it on the locked shards, r_mint on the cold ones
-  #              (no ON CONFLICT — a cold-key race collides on the PK, aborts,
-  #              and retries warm; this is also what keeps rate trippable only on
-  #              the PK and conc only on the CHECK, disambiguating :contended).
-  #
-  # Final flip: a winner runs iff it has no rate_limit (NULL short-circuits) or
-  # it made the fitting prefix. With no configured keys the bucket CTEs are
-  # empty and this reduces to the plain K=1 claim.
-  @pick_sql """
+  # Returns the job fields plus the admission inputs (gated?, rate_limit, weight).
+  @claim_sql """
   WITH cand AS (
     SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at,
            row_number() OVER (PARTITION BY coalesce('k:' || concurrency_key, 'i:' || id::text)
@@ -173,251 +122,113 @@ defmodule GenDurable.Queries do
     ) s
   ),
   winners AS (
-    SELECT c.id, c.concurrency_key, c.rate_limit, c.weight, c.priority, c.eligible_at, c.rn,
+    SELECT c.id, c.concurrency_key, c.rate_limit, c.weight, c.priority, c.eligible_at,
            (cc.name IS NOT NULL) AS gated
     FROM cand c
     LEFT JOIN gen_durable_bucket_configs cc
            ON cc.kind = 'conc' AND cc.name = split_part(c.concurrency_key, ':', 1)
     WHERE c.rn = 1 OR cc.name IS NOT NULL
   ),
-  c_cold AS (
-    SELECT k.concurrency_key AS key, s.shard,
-           floor(cc.capacity / cc.shards)
-             + CASE WHEN s.shard < (cc.capacity::bigint % cc.shards) THEN 1 ELSE 0 END AS cap
-    FROM (SELECT DISTINCT concurrency_key FROM winners WHERE gated) k
-    JOIN gen_durable_bucket_configs cc ON cc.kind = 'conc' AND cc.name = split_part(k.concurrency_key, ':', 1)
-    CROSS JOIN LATERAL generate_series(0, cc.shards - 1) AS s(shard)
-    WHERE NOT EXISTS (SELECT 1 FROM gen_durable_buckets b
-                      WHERE b.kind = 'conc' AND b.key = k.concurrency_key)
-  ),
-  c_locked AS (
-    SELECT b.key, b.shard, b.available
-    FROM gen_durable_buckets b
-    JOIN (SELECT DISTINCT concurrency_key FROM winners WHERE gated) k
-      ON k.concurrency_key = b.key
-    WHERE b.kind = 'conc'
-    ORDER BY b.key, b.shard
-    FOR UPDATE OF b SKIP LOCKED
-  ),
-  c_ranges AS (
-    SELECT key, shard, available,
-           sum(available) OVER (PARTITION BY key ORDER BY available DESC, shard
-                                ROWS UNBOUNDED PRECEDING) AS hi
-    FROM (
-      SELECT key, shard, min(available) AS available
-      FROM c_locked
-      GROUP BY key, shard
-      UNION ALL
-      SELECT key, shard, cap AS available FROM c_cold
-    ) d
-  ),
-  c_admit AS (
-    SELECT w.id, r.shard
-    FROM winners w
-    JOIN c_ranges r ON r.key = w.concurrency_key
-                   AND w.rn > r.hi - r.available AND w.rn <= r.hi
-    WHERE w.gated
-  ),
-  pool AS (
-    SELECT w.id, w.concurrency_key, w.rate_limit AS rkey, w.weight,
-           w.priority, w.eligible_at, w.gated, a.shard AS c_shard
-    FROM winners w
-    LEFT JOIN c_admit a ON a.id = w.id
-    WHERE (NOT w.gated) OR a.id IS NOT NULL
-  ),
-  rw AS (
-    SELECT id, rkey, c_shard,
-           sum(weight) OVER (PARTITION BY rkey ORDER BY priority, eligible_at, id
-                             ROWS UNBOUNDED PRECEDING) AS cw
-    FROM pool
-  ),
-  r_keys AS (SELECT DISTINCT rkey AS key FROM rw WHERE rkey IS NOT NULL),
-  r_cold AS (
-    SELECT k.key, s.shard, cfg.capacity / cfg.shards AS shard_cap
-    FROM r_keys k
-    JOIN gen_durable_bucket_configs cfg ON cfg.kind = 'rate' AND cfg.name = split_part(k.key, ':', 1)
-    CROSS JOIN LATERAL generate_series(0, cfg.shards - 1) AS s(shard)
-    WHERE NOT EXISTS (SELECT 1 FROM gen_durable_buckets b WHERE b.kind = 'rate' AND b.key = k.key)
-  ),
-  r_locked AS (
-    SELECT b.key, b.shard, b.available, b.last_refill,
-           cfg.capacity / cfg.shards AS shard_cap, cfg.rate / cfg.shards AS shard_rate
-    FROM gen_durable_buckets b
-    JOIN r_keys k ON k.key = b.key
-    JOIN gen_durable_bucket_configs cfg ON cfg.kind = 'rate' AND cfg.name = split_part(b.key, ':', 1)
-    WHERE b.kind = 'rate'
-    ORDER BY b.key, b.shard
-    FOR UPDATE OF b SKIP LOCKED
-  ),
-  r_shards AS (
-    SELECT key, shard,
-           LEAST(shard_cap,
-                 available + extract(epoch from clock_timestamp() - last_refill) * shard_rate) AS avail,
-           shard_cap, false AS cold
-    FROM r_locked
-    UNION ALL
-    SELECT key, shard, shard_cap AS avail, shard_cap, true AS cold
-    FROM r_cold
-  ),
-  r_key_avail AS (
-    SELECT key, sum(avail) AS total FROM r_shards GROUP BY key
-  ),
-  granted AS (
-    SELECT w.id, w.rkey, w.cw
-    FROM rw w JOIN r_key_avail a ON a.key = w.rkey
-    WHERE w.cw <= a.total
-  ),
-  consumed AS (
-    SELECT rkey AS key, max(cw) AS consumed FROM granted GROUP BY rkey
-  ),
-  r_new AS (
-    SELECT s.key, s.shard, s.shard_cap, s.cold,
-           s.avail - CASE WHEN a.total > 0
-                          THEN s.avail * coalesce(c.consumed, 0) / a.total
-                          ELSE 0 END AS new_avail
-    FROM r_shards s
-    JOIN r_key_avail a ON a.key = s.key
-    LEFT JOIN consumed c ON c.key = s.key
-  ),
-  writeback AS (
-    UPDATE gen_durable_buckets b
-    SET available = n.new_avail, last_refill = clock_timestamp(), capacity = n.shard_cap
-    FROM r_new n
-    WHERE b.kind = 'rate' AND b.key = n.key AND b.shard = n.shard AND NOT n.cold
-  ),
-  r_mint AS (
-    INSERT INTO gen_durable_buckets (kind, key, shard, capacity, available, last_refill)
-    SELECT 'rate', n.key, n.shard, n.shard_cap, n.new_avail, clock_timestamp()
-    FROM r_new n
-    WHERE n.cold
-    ORDER BY n.key, n.shard
-  ),
   claimed AS (
     UPDATE gen_durable g
-    SET status = 'executing', locked_by = $3, concurrency_shard = p.c_shard,
+    SET status = 'executing', locked_by = $3,
+        -- A gate carries a non-null shard so it drops OUT of the K=1 arbiter index
+        -- (unconfigured keys keep NULL and stay in it). This is a provisional 0 held
+        -- only across the admit round-trip; the limiter stamps the real shard. Provisional
+        -- 0 is a valid shard, so a reconcile racing the window drifts safe (under-admit).
+        concurrency_shard = CASE WHEN w.gated THEN 0 ELSE NULL END,
         lease_expires_at = now() + $4::int * interval '1 millisecond', updated_at = now()
-    FROM rw p LEFT JOIN granted gr ON gr.id = p.id
-    WHERE g.id = p.id AND (p.rkey IS NULL OR gr.id IS NOT NULL)
-    RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key,
-              g.awaits, g.concurrency_shard
-  ),
-  c_writeback AS (
-    UPDATE gen_durable_buckets b
-    SET available = b.available - d.cnt
-    FROM (SELECT c.concurrency_key AS key, c.concurrency_shard AS shard, count(*) AS cnt
-          FROM claimed c
-          WHERE c.concurrency_shard IS NOT NULL
-          GROUP BY 1, 2) d
-    WHERE b.kind = 'conc' AND b.key = d.key AND b.shard = d.shard
-  ),
-  c_mint AS (
-    INSERT INTO gen_durable_buckets (kind, key, shard, capacity, available)
-    SELECT 'conc', c.key, c.shard, c.cap, c.cap - coalesce(d.cnt, 0)
-    FROM c_cold c
-    LEFT JOIN (SELECT cl.concurrency_key AS key, cl.concurrency_shard AS shard, count(*) AS cnt
-               FROM claimed cl
-               WHERE cl.concurrency_shard IS NOT NULL
-               GROUP BY 1, 2) d
-      ON d.key = c.key AND d.shard = c.shard
-    ORDER BY c.key, c.shard
-    ON CONFLICT (kind, key, shard) DO UPDATE
-      SET available = gen_durable_buckets.available
-                      - (EXCLUDED.capacity - EXCLUDED.available)
-  ),
-  throttled AS (
-    SELECT w.rkey AS key, count(*) AS wanted, count(gr.id) AS granted
-    FROM rw w LEFT JOIN granted gr ON gr.id = w.id
-    WHERE w.rkey IS NOT NULL
-    GROUP BY w.rkey
-    HAVING count(*) > count(gr.id)
-  ),
-  c_throttled AS (
-    SELECT w.concurrency_key AS key, count(*) AS wanted, count(a.id) AS admitted
-    FROM winners w LEFT JOIN c_admit a ON a.id = w.id
-    WHERE w.gated
-    GROUP BY 1
-    HAVING count(*) > count(a.id)
+    FROM winners w
+    WHERE g.id = w.id
+    RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key, g.awaits
   )
-  SELECT 0 AS tag, id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits,
-         NULL::text AS rkey, NULL::bigint AS wanted, NULL::bigint AS granted
-  FROM claimed
-  UNION ALL
-  SELECT 1, NULL::bigint, NULL::text, NULL::int, NULL::text, NULL::jsonb, NULL::int, NULL::text,
-         NULL::text[], key, wanted, granted
-  FROM throttled
-  UNION ALL
-  SELECT 2, NULL::bigint, NULL::text, NULL::int, NULL::text, NULL::jsonb, NULL::int, NULL::text,
-         NULL::text[], key, wanted, admitted
-  FROM c_throttled
+  SELECT c.id, c.fsm, c.fsm_version, c.step, c.state, c.attempt, c.concurrency_key, c.awaits,
+         w.gated, w.rate_limit, w.weight
+  FROM claimed c JOIN winners w ON w.id = c.id
+  ORDER BY w.priority, w.eligible_at, c.id
   """
 
-  def pick(repo, queue, batch, worker, lease_ttl_ms),
-    do: pick(repo, queue, batch, worker, lease_ttl_ms, 3)
-
-  # A cross-node claim race on a concurrency_key (two picks, different rows, one
-  # key, both invisible to each other's snapshot) ends in a unique violation on
-  # the gen_durable_concurrency_active arbiter — the DB-enforced serialization.
-  # The violation aborts the whole claim statement, so the losing pick simply
-  # retries: the winner is committed by then and the NOT EXISTS guard routes
-  # around its key. Rare (the guard filters everything visible), observable via
-  # [:gen_durable, :concurrency, :contended]; after the attempts run out this
-  # round claims nothing and the next poll tries again.
-  defp pick(repo, queue, batch, worker, lease_ttl_ms, attempts) do
-    %{rows: rows} = q!(repo, "pick", @pick_sql, [queue, batch, worker, lease_ttl_ms])
-    jobs = Enum.filter(rows, fn [tag | _] -> tag == 0 end)
-
-    # a limit that wanted more than it admitted is biting — observable.
-    for [tag, _, _, _, _, _, _, _, _, key, wanted, granted] <- rows, tag in [1, 2] do
-      {event, measurements} =
-        case tag do
-          1 -> {[:gen_durable, :rate_limit, :throttled], %{wanted: wanted, granted: granted}}
-          2 -> {[:gen_durable, :concurrency, :throttled], %{wanted: wanted, admitted: granted}}
-        end
-
-      :telemetry.execute(event, measurements, %{key: key, queue: queue})
-    end
-
-    enrich(repo, Enum.map(jobs, &to_job(&1, worker)))
-  rescue
-    e in Postgrex.Error ->
-      # Three constraint-resolved races, one discipline (constraint =
-      # correctness, retry = resolution): the K=1 unique arbiter; the buckets'
-      # CHECK (a residual gate over-admission race — see c_ranges' dedup —
-      # aborts the whole claim instead of committing it); and the buckets'
-      # PRIMARY KEY (two picks minting the same cold rate key — see r_mint). The
-      # retry re-reads the winner's committed row, so it resolves warm.
-      #
-      # The two bucket tables collapsed into one, so the CHECK and PK names are
-      # now shared. They still disambiguate rate vs conc telemetry only because
-      # of an invariant: concurrency mints with ON CONFLICT (c_mint), so it can
-      # trip only the CHECK; rate mints WITHOUT ON CONFLICT (r_mint), so it can
-      # trip only the PK. Do not add ON CONFLICT to r_mint or remove it from
-      # c_mint without splitting these events by kind.
-      constraint = is_map(e.postgres) && e.postgres[:constraint]
-
-      event =
-        case constraint do
-          "gen_durable_concurrency_active" -> [:gen_durable, :concurrency, :contended]
-          "gen_durable_buckets_check" -> [:gen_durable, :concurrency, :contended]
-          "gen_durable_buckets_pkey" -> [:gen_durable, :rate_limit, :contended]
-          _ -> nil
-        end
-
-      if event do
-        :telemetry.execute(event, %{count: 1}, %{queue: queue})
-
-        if attempts > 1,
-          do: pick(repo, queue, batch, worker, lease_ttl_ms, attempts - 1),
-          else: []
-      else
-        reraise e, __STACKTRACE__
-      end
+  def pick(repo, queue, batch, worker, lease_ttl_ms, limiter \\ nil) do
+    limiter = limiter || {GenDurable.Limiter.Postgres, %{repo: repo}}
+    pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, 3)
   end
 
-  # `worker` rides in the job: it is the claim's identity, and the outcome
-  # queries require it (ownership guard).
-  defp to_job(
-         [_tag, id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits | _],
+  # Claim → admit (out-of-band) → keep admitted, release denied. Two failure regimes, kept
+  # apart because the claim autocommits before admit runs:
+  #   * the CLAIM's K=1 arbiter (gen_durable_concurrency_active) aborts the claim atomically
+  #     (nothing committed) under a cross-node race on an unconfigured key — retry warm.
+  #   * anything AFTER the claim commits (admit's buckets CHECK/PK once its own retries are
+  #     spent, or a transient DB error in admit/release/enrich) would strand the claimed batch
+  #     as `executing` until the reaper. The old fused pick rolled back atomically; we mirror
+  #     it by releasing the whole batch before reraising (a debited slot heals via reconcile).
+  defp pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, attempts) do
+    case claim(repo, queue, batch, worker, lease_ttl_ms) do
+      {:contended} when attempts > 1 ->
+        :telemetry.execute([:gen_durable, :concurrency, :contended], %{count: 1}, %{queue: queue})
+        pick_claim(repo, limiter, queue, batch, worker, lease_ttl_ms, attempts - 1)
+
+      {:contended} ->
+        []
+
+      {:ok, rows} ->
+        admit_claimed(repo, limiter, rows, queue, worker)
+    end
+  end
+
+  defp claim(repo, queue, batch, worker, lease_ttl_ms) do
+    %{rows: rows} = q!(repo, "claim", @claim_sql, [queue, batch, worker, lease_ttl_ms])
+    {:ok, rows}
+  rescue
+    e in Postgrex.Error ->
+      if is_map(e.postgres) && e.postgres[:constraint] == "gen_durable_concurrency_active",
+        do: {:contended},
+        else: reraise(e, __STACKTRACE__)
+  end
+
+  defp admit_claimed(repo, limiter, rows, queue, worker) do
+    claimed = Enum.map(rows, &claimed_row(&1, worker))
+    {needs_admit, plain} = Enum.split_with(claimed, &(&1.gated or &1.rate != nil))
+
+    entries =
+      Enum.map(needs_admit, fn c ->
+        %{id: c.id, conc: if(c.gated, do: c.concurrency_key), rate: c.rate}
+      end)
+
+    %{admitted: admitted, denied: denied} = GenDurable.Limiter.admit(limiter, entries)
+
+    slot_by_id = Map.new(admitted)
+    admitted_ids = MapSet.new(admitted, fn {id, _slot} -> id end)
+
+    if denied != [] do
+      release_claims(repo, denied, worker)
+      throttle_telemetry(needs_admit, admitted_ids, queue)
+    end
+
+    admitted_rows =
+      for c <- needs_admit, MapSet.member?(admitted_ids, c.id),
+          do: %{c | slot: slot_by_id[c.id]}
+
+    jobs = Enum.map(plain ++ admitted_rows, &Map.drop(&1, [:gated, :rate]))
+    enrich(repo, jobs)
+  rescue
+    e ->
+      _ = safe_release(repo, Enum.map(rows, &hd/1), worker)
+      reraise e, __STACKTRACE__
+  end
+
+  # Best-effort release (a DB still down leaves the reaper as the floor, as before the split).
+  defp safe_release(repo, ids, worker) do
+    release_claims(repo, ids, worker)
+  rescue
+    _ -> :ok
+  end
+
+  # A claimed row from @claim_sql. `:gated`/`:rate` drive admission and are dropped before the
+  # job reaches the executor; `:slot` is the opaque handle the limiter returns for an admitted
+  # gated row (backend-defined — PG `{key, shard}`, Redis `{key, id}`), `nil` otherwise.
+  defp claimed_row(
+         [id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits, gated, rate_limit,
+          weight],
          worker
        ) do
     %{
@@ -428,9 +239,66 @@ defmodule GenDurable.Queries do
       state: state,
       attempt: attempt,
       concurrency_key: concurrency_key,
+      slot: nil,
       awaits: awaits,
-      worker: worker
+      worker: worker,
+      gated: gated,
+      rate: if(rate_limit, do: {rate_limit, weight})
     }
+  end
+
+  # Release the over-claimed rows the limiter denied: back to `runnable`, untouched
+  # otherwise (attempt/eligible_at kept, so priority order and retry count survive). They
+  # never got a concurrency_shard (the limiter stamps only the admitted), so nothing to
+  # credit. Guarded on the worker's ownership, like every outcome.
+  defp release_claims(repo, ids, worker) do
+    q!(
+      repo,
+      "release_claims",
+      """
+      UPDATE gen_durable
+      SET status = 'runnable', locked_by = null, lease_expires_at = null,
+          concurrency_shard = null, updated_at = now()
+      WHERE id = ANY($1::bigint[]) AND locked_by = $2 AND status = 'executing'
+      """,
+      [ids, worker]
+    )
+
+    :ok
+  end
+
+  # A biting limit is observable: per key, how many wanted vs how many got in this pick.
+  # A gate and a rate limit are reported separately; a row gated AND rated that the rate
+  # side denies is counted under its concurrency key too (the split can't tell the two
+  # apart from the admission result alone — a minor drift from the old fused telemetry).
+  defp throttle_telemetry(needs_admit, admitted_ids, queue) do
+    denied = Enum.reject(needs_admit, &MapSet.member?(admitted_ids, &1.id))
+
+    denied
+    |> Enum.filter(& &1.gated)
+    |> Enum.frequencies_by(& &1.concurrency_key)
+    |> Enum.each(fn {key, denied_n} ->
+      wanted = Enum.count(needs_admit, &(&1.gated and &1.concurrency_key == key))
+
+      :telemetry.execute(
+        [:gen_durable, :concurrency, :throttled],
+        %{wanted: wanted, admitted: wanted - denied_n},
+        %{key: key, queue: queue}
+      )
+    end)
+
+    denied
+    |> Enum.filter(&(&1.rate != nil))
+    |> Enum.frequencies_by(fn %{rate: {key, _w}} -> key end)
+    |> Enum.each(fn {key, denied_n} ->
+      wanted = Enum.count(needs_admit, fn c -> match?({^key, _}, c.rate) end)
+
+      :telemetry.execute(
+        [:gen_durable, :rate_limit, :throttled],
+        %{wanted: wanted, granted: wanted - denied_n},
+        %{key: key, queue: queue}
+      )
+    end)
   end
 
   # Attach each claimed job's signal inbox and children — two statements per
@@ -742,21 +610,12 @@ defmodule GenDurable.Queries do
          (SELECT n.queue FROM notify n WHERE n.status = 'runnable' LIMIT 1)
   """
 
-  # The concurrency-gate release, a rider CTE of every outcome: the row is
-  # leaving `executing`, so its slot is credited back to the shard it was drawn
-  # from. The OLD key/shard are read from the TABLE — sibling CTEs see the
-  # statement snapshot, never the outcome UPDATE's writes, so this is the
-  # pre-transition value even when the outcome rewrites the key — and the join
-  # on the guarded CTE (`src`) gates it: a stale outcome credits nothing. A
-  # missing bucket (swept) drops the credit in the conservative direction
-  # (under-admission), healed by the GC reconciler.
-  defp credit_gate(src) do
-    "credit AS (UPDATE gen_durable_buckets b " <>
-      "SET available = available + 1 " <>
-      "FROM gen_durable old JOIN #{src} gc ON gc.id = old.id " <>
-      "WHERE old.concurrency_shard IS NOT NULL " <>
-      "AND b.kind = 'conc' AND b.key = old.concurrency_key AND b.shard = old.concurrency_shard)"
-  end
+  # The concurrency-gate release is now out-of-band: the row still nulls its
+  # `concurrency_shard` on every outcome (leaving `executing`), but the slot is
+  # credited back by `GenDurable.Limiter.credit/2`, called by the executor after a
+  # committed (non-stale) outcome — see `GenDurable.Executor.apply_outcome`. A stale
+  # outcome credits nothing (the executor skips it); a crash between commit and credit
+  # leaks in the conservative direction (under-admission), healed by the reconciler.
 
   # :next sets the row's rate_limit key ($5, NULL ⇒ not limited) and weight ($6) for the
   # next step. No bucket rider: a missing bucket is minted, pre-debited, by the
@@ -784,7 +643,6 @@ defmodule GenDurable.Queries do
           WHERE id = $1 AND locked_by = $7 AND status = 'executing'
           RETURNING id
         ),
-        #{credit_gate("committed")},
         consumed AS (
           DELETE FROM signals
           WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
@@ -814,8 +672,7 @@ defmodule GenDurable.Queries do
               locked_by = null, lease_expires_at = null, updated_at = now()
           WHERE id = $1 AND locked_by = $4 AND status = 'executing'
           RETURNING id
-        ),
-        #{credit_gate("committed")}
+        )
         SELECT count(*) FROM committed
         """,
         [id, state_json, delay_ms, worker]
@@ -874,8 +731,7 @@ defmodule GenDurable.Queries do
                   locked_by = null, lease_expires_at = null, updated_at = now()
               WHERE id = $1 AND locked_by = $5 AND status = 'executing'
               RETURNING id
-            ),
-            #{credit_gate("park")}
+            )
             SELECT count(*) FROM park
             """,
             [id, state_json, names, next_step, worker, timeout_ms]
@@ -923,7 +779,6 @@ defmodule GenDurable.Queries do
           WHERE id = $1 AND locked_by = $3 AND status = 'executing'
           RETURNING id, parent_id
         ),
-        #{credit_gate("terminal")},
         consumed AS (
           DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
         ),
@@ -948,7 +803,6 @@ defmodule GenDurable.Queries do
           WHERE id = $1 AND locked_by = $3 AND status = 'executing'
           RETURNING id, parent_id
         ),
-        #{credit_gate("terminal")},
         consumed AS (
           DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
         ),
@@ -978,7 +832,6 @@ defmodule GenDurable.Queries do
           WHERE id = $1 AND locked_by = $5 AND status = 'executing'
           RETURNING id
         ),
-        #{credit_gate("committed")},
         consumed AS (
           DELETE FROM signals
           WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
@@ -1012,8 +865,6 @@ defmodule GenDurable.Queries do
     sql =
       "WITH claim AS (SELECT id FROM gen_durable " <>
         "WHERE id = $1 AND locked_by = $17 AND status = 'executing' FOR NO KEY UPDATE), " <>
-        credit_gate("claim") <>
-        ", " <>
         "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
         "AND id = ANY($4::bigint[])), " <>
         "ins AS (INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>

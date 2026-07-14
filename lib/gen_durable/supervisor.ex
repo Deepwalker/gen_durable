@@ -129,10 +129,23 @@ defmodule GenDurable.Supervisor do
       end
 
     rate_configs = parse_rate_limits(Keyword.fetch!(opts, :rate_limits))
+    conc_configs = parse_concurrency_limits(Keyword.fetch!(opts, :concurrency_limits))
+
+    # The out-of-band admission backend: :postgres (default — the sharded buckets table) or
+    # {:redis, url_or_opts} (a lease-scored ZSET semaphore + token buckets). Redis needs its
+    # own connection, returned here to slot into the tree before the schedulers pick.
+    {limiter, limiter_children} =
+      build_limiter(
+        Keyword.get(opts, :limiter, :postgres),
+        repo,
+        name,
+        Keyword.fetch!(opts, :lease_ttl)
+      )
 
     config = %{
       name: name,
       repo: repo,
+      limiter: limiter,
       # The FSM registry table is owned by this supervisor process — it lives
       # and dies with the instance, and executors reach it through the config.
       registry: GenDurable.Registry.new(Keyword.fetch!(opts, :fsms)),
@@ -149,13 +162,12 @@ defmodule GenDurable.Supervisor do
     # against a stopped engine are legal, the rows wait in the database.
     :persistent_term.put({GenDurable, name}, config)
 
-    # Seed the policy tables so the picker can join them. No-ops when empty.
-    :ok = GenDurable.Queries.upsert_rate_configs(repo, rate_configs)
-
+    # Seed the policy so the limiter can admit against it. No-ops when empty.
     :ok =
-      GenDurable.Queries.upsert_concurrency_configs(
-        repo,
-        parse_concurrency_limits(Keyword.fetch!(opts, :concurrency_limits))
+      GenDurable.Limiter.sync_config(
+        limiter,
+        Enum.map(rate_configs, &{:rate, &1.name, &1.rate, &1.capacity, &1.shards}) ++
+          Enum.map(conc_configs, &{:conc, &1.name, &1.capacity, &1.shards})
       )
 
     task_sup = Module.concat(name, TaskSupervisor)
@@ -214,8 +226,10 @@ defmodule GenDurable.Supervisor do
         },
         {Task.Supervisor, name: task_sup}
       ] ++
+        limiter_children ++
         poke_children(name, poke) ++
-        reaper_child(repo, name, reaper_cfg) ++ gc_child(repo, name, gc_cfg) ++ schedulers
+        reaper_child(repo, name, reaper_cfg) ++
+        gc_child(repo, limiter, name, gc_cfg) ++ schedulers
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -245,6 +259,45 @@ defmodule GenDurable.Supervisor do
 
   defp poke_children(_name, _mode), do: []
 
+  # Build the limiter `{module, handle}` and any children it needs. Postgres needs none;
+  # Redis needs a dedicated (sync-connecting) Redix connection, ordered before the schedulers.
+  defp build_limiter(:postgres, repo, _name, _lease_ttl),
+    do: {{GenDurable.Limiter.Postgres, %{repo: repo}}, []}
+
+  defp build_limiter({:redis, redis}, _repo, name, lease_ttl) do
+    validate_limiter_redis!(redis)
+    conn = Module.concat(name, LimiterRedis)
+    handle = %{conn: conn, lease_ttl_ms: lease_ttl, cfg_key: {GenDurable, name, :limiter_cfg}}
+    {{GenDurable.Limiter.Redis, handle}, [limiter_redix_child(redis, conn)]}
+  end
+
+  defp build_limiter(other, _repo, _name, _lease_ttl) do
+    raise ArgumentError,
+          ":limiter must be :postgres or {:redis, url_or_opts}, got: #{inspect(other)}"
+  end
+
+  defp limiter_redix_child(redis, conn) do
+    arg =
+      case redis do
+        url when is_binary(url) -> {url, [name: conn, sync_connect: true]}
+        opts when is_list(opts) -> Keyword.merge(opts, name: conn, sync_connect: true)
+      end
+
+    Supervisor.child_spec({Redix, arg}, id: {Redix, conn})
+  end
+
+  defp validate_limiter_redis!(redis) when is_binary(redis) or is_list(redis) do
+    unless Code.ensure_loaded?(Redix) do
+      raise ArgumentError,
+            "limiter: {:redis, _} requires the optional :redix dependency — " <>
+              "add {:redix, \"~> 1.2\"} to your deps"
+    end
+  end
+
+  defp validate_limiter_redis!(other) do
+    raise ArgumentError, "limiter {:redis, _} needs a url or opts, got: #{inspect(other)}"
+  end
+
   defp validate_poke!(mode) when mode in [:local, :cluster], do: mode
 
   defp validate_poke!({:redis, redis} = mode) when is_binary(redis) or is_list(redis) do
@@ -273,7 +326,7 @@ defmodule GenDurable.Supervisor do
     end
   end
 
-  defp gc_child(repo, name, cfg) do
+  defp gc_child(repo, limiter, name, cfg) do
     case cfg do
       false ->
         Logger.info("gen_durable #{inspect(name)}: gc disabled on this node")
@@ -284,6 +337,7 @@ defmodule GenDurable.Supervisor do
           {GenDurable.GC,
            %{
              repo: repo,
+             limiter: limiter,
              interval: cfg[:interval],
              retention_ms: cfg[:retention],
              batch: cfg[:batch]

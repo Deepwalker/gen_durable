@@ -203,6 +203,12 @@ defmodule GenDurable.QueriesTest do
       rows
     end
 
+    # Concurrency credit is out-of-band now: `complete_*` nulls the row's shard, and the
+    # executor credits the slot via the limiter. These Queries-level tests drive the
+    # completion directly, so they credit the drawn slot explicitly, as the executor would.
+    defp credit_slot(key, shard),
+      do: :ok = GenDurable.Limiter.Postgres.credit(%{repo: Repo}, [{key, shard}])
+
     test "a configured key admits up to `limit` concurrently; a release readmits" do
       :ok = seed_gate("api", 2)
       for _ <- 1..4, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
@@ -231,6 +237,8 @@ defmodule GenDurable.QueriesTest do
       # a release credits the slot back, addressed — the next pick admits one
       [j | _] = jobs
       {:ok, _} = Queries.complete_done(Repo, j.id, @worker, ~s({}))
+      {key, shard} = j.slot
+      :ok = credit_slot(key, shard)
       assert gate_buckets("api") == [[0, 2, 1]]
       assert [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
     end
@@ -249,7 +257,11 @@ defmodule GenDurable.QueriesTest do
           "SELECT id FROM gen_durable WHERE concurrency_key = 'api' AND concurrency_shard = 0"
         )
 
-      for [id] <- shard0, do: {:ok, _} = Queries.complete_done(Repo, id, @worker, ~s({}))
+      for [id] <- shard0 do
+        {:ok, _} = Queries.complete_done(Repo, id, @worker, ~s({}))
+        :ok = credit_slot("api", 0)
+      end
+
       assert gate_buckets("api") == [[0, 2, 2], [1, 2, 0]]
     end
 
@@ -263,6 +275,28 @@ defmodule GenDurable.QueriesTest do
 
       assert Enum.count(keys, &(&1 == "api")) == 2
       assert Enum.count(keys, &(&1 == "solo")) == 1
+    end
+
+    test "gated AND rate-limited: the gate slot is debited only when rate also passes" do
+      :ok = seed_gate("gate", 5)
+      # rate config "api": burst 3, no refill — the rate is the binding limit here
+      Queries.upsert_rate_configs(Repo, [%{name: "api", rate: 0.0, capacity: 3, shards: 1}])
+
+      for _ <- 1..3,
+          do:
+            {:ok, _} =
+              Queries.insert(
+                Repo,
+                params(%{concurrency_key: "gate:x", rate_limit: "api", weight: 2})
+              )
+
+      # all 3 fit the gate (cap 5), but rate cumulative 2,4,6 vs budget 3 admits only the first
+      jobs = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert length(jobs) == 1
+
+      # the gate slot was taken for the 1 finally-admitted, NOT for the 2 rate-denied rows
+      # (bucket key is the full concurrency_key; config name is its prefix "gate")
+      assert gate_buckets("gate:x") == [[0, 5, 4]]
     end
 
     test "an exhausted gate emits [:gen_durable, :concurrency, :throttled]" do
@@ -303,8 +337,9 @@ defmodule GenDurable.QueriesTest do
         "INSERT INTO gen_durable_buckets (kind, key, shard, capacity, available) VALUES ('conc', 'ghost:1', 0, 5, 5)"
       )
 
-      # finish the row: the gate becomes idle-full — the whole key is swept too
+      # finish the row and credit its slot: the gate becomes idle-full — swept too
       {:ok, _} = Queries.complete_done(Repo, id, @worker, ~s({}))
+      :ok = credit_slot("api", 0)
       assert Queries.reconcile_concurrency(Repo) == 2
       assert gate_buckets("api") == []
       assert gate_buckets("ghost:1") == []

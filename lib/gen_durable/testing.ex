@@ -110,6 +110,7 @@ defmodule GenDurable.Testing do
     config = %{
       name: __MODULE__,
       repo: repo,
+      limiter: {GenDurable.Limiter.Postgres, %{repo: repo}},
       registry: Registry.new(Keyword.get(opts, :fsms, [])),
       rate_limit_names: configured_rate_limits(repo)
     }
@@ -247,7 +248,7 @@ defmodule GenDurable.Testing do
 
     jobs =
       due_queues(config.repo, queue)
-      |> Enum.flat_map(&Queries.pick(config.repo, &1, 100, worker, 60_000))
+      |> Enum.flat_map(&Queries.pick(config.repo, &1, 100, worker, 60_000, config.limiter))
 
     cond do
       jobs == [] ->

@@ -88,6 +88,7 @@ The engine is started as `{GenDurable, opts}`:
 | `:queues` | `[default: 10]` | `queue_name => concurrency` |
 | `:rate_limits` | `[]` | named [token-bucket limits](rate_limiting.md) (`[api: [allowed: 100, period: {1, :minute}, shards: 1]]`) |
 | `:concurrency_limits` | `[]` | named [concurrency gates](concurrency.md) for `concurrency_key` (`[api: [limit: 100, shards: 1]]`) |
+| `:limiter` | `:postgres` | admission backend for the configured limits above: `:postgres` (the sharded buckets table, no new dep) or `{:redis, url_or_opts}` (a lease-scored ZSET semaphore + token buckets; needs the optional `:redix` dep; single-node Redis). Unconfigured K=1 `concurrency_key` dedup is always in-band, independent of this |
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows |
 | `:poll_interval` | `1_000` | base ms between idle polls (inserts, signal wakes, and fan-out transitions are discovered immediately via the poke transport — see `:poke`; the poll covers retry backoffs and the reaper's wakes) |
