@@ -21,10 +21,20 @@ install is missing (before the first deployment they were edited into v1 in plac
   the rider did). The K=1 dedup of **unconfigured** concurrency keys stays in-band (the
   `gen_durable_concurrency_active` arbiter) — it is intrinsic to the durable row.
 - **Trade-off:** claim and admit are no longer one statement, so a saturated gate
-  over-claims up to the batch and the limiter releases the excess (scheduler backoff bounds
-  the churn), and a crash between the two windows leaks a slot in the safe direction
-  (under-admission), healed by the reconciler — the same self-heal that already backed
-  crash recovery. The observable limits are unchanged.
+  over-claims up to the batch and the limiter releases the excess (the scheduler's poke
+  debounce, below, bounds the churn), and a crash between the two windows leaks a slot in the
+  safe direction (under-admission), healed by the reconciler — the same self-heal that already
+  backed crash recovery. The observable limits are unchanged. A failure *after* the claim
+  commits (admit's retries spent, or a transient DB error in admit/release/enrich) now
+  releases the whole claimed batch before reraising, so it can't strand rows as `executing`
+  until the reaper — mirroring the old fused pick's atomic rollback.
+- **Poke debounce (picker anti-thrash).** Because an *empty* pick on a saturated limit now
+  WRITES (claim + release) instead of only reading, the local poke leg — which has no
+  sender-side dedup, one poke per insert/signal/join — could hammer the picker. An idle
+  scheduler now coalesces every poke in a short window into a single fill (one armed timer),
+  bounding poke-driven picks to ≤1 per window regardless of the poke rate. Busy schedulers
+  still drop pokes (they self-serve via completion-refill); the ≤10 ms added idle→work
+  latency is negligible.
 
 ### Added
 - **A pluggable limiter backend, selected by the `:limiter` engine option.**

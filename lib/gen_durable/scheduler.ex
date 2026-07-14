@@ -55,6 +55,14 @@ defmodule GenDurable.Scheduler do
   # Retry cadence for re-joining the poke scope while it restarts.
   @rejoin_retry 100
 
+  # Poke debounce window. The local poke leg has no sender-side dedup — every insert, signal
+  # delivery, and join fires one poke, so a hot stream would drive a pick per poke. An idle
+  # scheduler coalesces all pokes in this window into ONE fill (a single armed timer),
+  # bounding poke-driven picks to ≤1 per window regardless of the poke rate. Small, so the
+  # idle -> work latency it adds is negligible; large enough that a saturated limit (where an
+  # empty pick now WRITES a claim + release, not just reads) cannot be hammered pick-per-insert.
+  @poke_debounce_ms 10
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @doc false
@@ -142,7 +150,9 @@ defmodule GenDurable.Scheduler do
       drain_timeout: opts.drain_timeout,
       task_sup: opts.task_sup,
       buffer: [],
-      in_flight: %{}
+      in_flight: %{},
+      # A pending debounced poke-fill (nil = none armed); coalesces a poke stream — see :poke.
+      poke_timer: nil
     }
 
     schedule(:poll, 0)
@@ -174,17 +184,33 @@ defmodule GenDurable.Scheduler do
   # completion, and its poll fills any free slots — so a BUSY scheduler DROPS
   # pokes. Reacting there is the redundant cross-node pick that a poke fan-out
   # (`:cluster`/`{:redis, _}`) multiplies into a DB thundering herd (every node
-  # picking on every insert, one winning). We still drain the mailbox of any
-  # coalesced pokes either way. On an idle queue the poke fills and snaps the
-  # idle backoff to base; an empty poke leaves the poll cadence untouched —
-  # unlike an empty poll, it is not evidence of continued idleness.
+  # picking on every insert, one winning).
+  #
+  # DEBOUNCE: the local poke leg has no sender-side dedup, so a hot insert/signal stream
+  # would drive a pick per poke — and post-0.2.9 an empty pick on a saturated limit WRITES
+  # (claim + release), not just reads. So an idle scheduler doesn't fill inline; it arms a
+  # single short timer (if none is armed) and fills once when it fires, coalescing every poke
+  # in the window into one pick. We still drain the mailbox of coalesced pokes here.
   def handle_info(:poke, state) do
     flush_pokes()
 
+    if idle?(state) and state.poke_timer == nil do
+      {:noreply, %{state | poke_timer: Process.send_after(self(), :poke_fill, @poke_debounce_ms)}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  # The debounce window elapsed — do the one coalesced fill. Re-check idle: a task completion
+  # in the window already refilled (self-serve), making the poke moot. An empty fill snaps
+  # nothing (unlike an empty poll, a poke is not evidence of continued idleness); a filling
+  # one snaps the idle backoff to base.
+  def handle_info(:poke_fill, state) do
+    state = %{state | poke_timer: nil}
+
     if idle?(state) do
       {state, fetched} = fill(state)
-      state = if fetched > 0, do: %{state | cur_poll: state.poll_interval}, else: state
-      {:noreply, state}
+      {:noreply, if(fetched > 0, do: %{state | cur_poll: state.poll_interval}, else: state)}
     else
       {:noreply, state}
     end

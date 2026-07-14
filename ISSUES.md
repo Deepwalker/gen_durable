@@ -599,6 +599,41 @@ validation gap). Surfaced by the first harness variant (key-grouped
 insertion: 5 of 8 keys never entered the window). Mitigation documented in
 both guides: own queue for heavily capped flows, or a less urgent priority.
 
+### 27. Local poke storm × out-of-band write amplification — FIXED (debounce); adaptive backoff NOTED
+
+**Status: fixed (debounce).** The local poke leg (`Poke.fanout(_, :local)`, run by every
+transport for the caller's node) has no sender-side dedup — insert/insert_all, signal
+delivery, and join/fan-out each fire one poke per event (`dispatch_rows` dedups only
+per-queue within a single batch). The idle-gate (0.2.8) drops pokes only when the scheduler
+is BUSY; a scheduler saturated on a configured limit is IDLE (`idle? = in_flight == [] and
+buffer == []`) yet admits nothing, so every poke passed straight into a `fill`.
+
+Benign before 0.2.9 — an empty pick was one read-only statement (the fused pick never
+flipped denied rows to executing). The out-of-band split (#item: limiter behaviour) made an
+empty pick on a saturated limit WRITE: `claim` (≤batch rows → executing) + `release_claims`
+(≤batch → runnable). So a hot insert/signal stream to a saturated queue could drive
+~poke-rate × 2·batch row-writes of pure churn — the picker-thrash regression.
+
+**Fix:** an idle scheduler debounces the poke stream (`Scheduler`, `@poke_debounce_ms 10`):
+the first poke arms a single timer, pokes within the window are dropped (timer already armed),
+and the timer fires ONE `fill`. Poke-driven picks are bounded to ≤1 per window regardless of
+poke rate; busy schedulers still drop pokes; freed capacity under saturation is found by
+completion-refill (not pokes), so the debounce costs no real latency there. Verified: full
+suite green — the 10 ms debounce is transparent (work is still discovered, ≤10 ms later).
+
+**NOTED (not taken now):** under *sustained* saturation the debounce still allows ≤1 empty
+claim+release per window (~100/s at 10 ms). An adaptive poke backoff — an empty poke-fill
+stretches the next window like `adapt` stretches the idle poll, resetting on a filling one —
+would collapse that to near-zero while keeping low latency for genuine idle→work transitions.
+Deferred: the fixed debounce already turns unbounded churn into bounded; the adaptive version
+trades simplicity for a win that only matters under a pathological hammer-a-full-gate load.
+Revisit when a real workload shows material picker-write load from a persistently saturated
+queue. (Related: pathology #4 above — denied rows occupying the pick window's `LIMIT` slots.)
+
+**Coverage gap:** no deterministic test of the coalescing — schedulers are unnamed / not
+directly addressable and timing assertions are flaky; the state-machine invariant (a second
+poke while `poke_timer != nil` arms no second timer) is read-verified only.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

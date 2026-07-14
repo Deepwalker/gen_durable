@@ -31,8 +31,10 @@ defmodule GenDurable.Poke do
   A poke only wakes an **idle** scheduler — the idle → work transition it
   exists for. A scheduler with work in flight drops it and rediscovers new work
   on its next task completion (or poll), so a fan-out never becomes N nodes all
-  picking on every insert. Together with the Redis dedup lock, a hot insert
-  stream stays a trickle of picks, not a herd.
+  picking on every insert. An idle scheduler additionally **debounces** the poke
+  stream — the local leg has no sender-side dedup, so it coalesces every poke in
+  a short window into a single pick (see `GenDurable.Scheduler`). Together with
+  the Redis dedup lock, a hot insert stream stays a trickle of picks, not a herd.
   """
 
   # :redix is an optional dependency; these calls only execute when the
