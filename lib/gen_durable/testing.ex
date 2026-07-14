@@ -291,7 +291,7 @@ defmodule GenDurable.Testing do
   defp due_queues(_repo, queue), do: [queue]
 
   defp configured_rate_limits(repo) do
-    %{rows: rows} = repo.query!("SELECT name FROM gen_durable_rate_configs")
+    %{rows: rows} = repo.query!("SELECT name FROM gen_durable_bucket_configs WHERE kind = 'rate'")
     MapSet.new(List.flatten(rows))
   end
 

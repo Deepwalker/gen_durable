@@ -57,18 +57,27 @@ defmodule GenDurable.QueriesTest do
   end
 
   defp seed(rate, burst),
-    do: Queries.upsert_rate_configs(Repo, [%{name: "api", rate: rate * 1.0, burst: burst * 1.0}])
+    do:
+      Queries.upsert_rate_configs(Repo, [
+        %{name: "api", rate: rate * 1.0, capacity: burst * 1.0, shards: 1}
+      ])
 
   defp tokens(key) do
     %{rows: [[t]]} =
-      Repo.query!("SELECT tokens FROM gen_durable_rate_buckets WHERE key = $1", [key])
+      Repo.query!(
+        "SELECT sum(available) FROM gen_durable_buckets WHERE kind = 'rate' AND key = $1",
+        [key]
+      )
 
     t
   end
 
   defp rate_buckets(key) do
     %{rows: rows} =
-      Repo.query!("SELECT tokens FROM gen_durable_rate_buckets WHERE key = $1", [key])
+      Repo.query!(
+        "SELECT available FROM gen_durable_buckets WHERE kind = 'rate' AND key = $1 ORDER BY shard",
+        [key]
+      )
 
     List.flatten(rows)
   end
@@ -175,17 +184,19 @@ defmodule GenDurable.QueriesTest do
 
   describe "concurrency gates (configured concurrency_key)" do
     setup do
-      Repo.query!("TRUNCATE gen_durable_concurrency_buckets, gen_durable_concurrency_configs")
+      Repo.query!("TRUNCATE gen_durable_buckets, gen_durable_bucket_configs")
       :ok
     end
 
     defp seed_gate(name, limit, shards \\ 1),
-      do: Queries.upsert_concurrency_configs(Repo, [%{name: name, cap: limit, shards: shards}])
+      do:
+        Queries.upsert_concurrency_configs(Repo, [%{name: name, capacity: limit, shards: shards}])
 
     defp gate_buckets(key) do
       %{rows: rows} =
         Repo.query!(
-          "SELECT shard, cap, available FROM gen_durable_concurrency_buckets WHERE key = $1 ORDER BY shard",
+          "SELECT shard, capacity::int, available::int FROM gen_durable_buckets " <>
+            "WHERE kind = 'conc' AND key = $1 ORDER BY shard",
           [key]
         )
 
@@ -280,13 +291,16 @@ defmodule GenDurable.QueriesTest do
       assert gate_buckets("api") == [[0, 2, 1]]
 
       # simulate a crash leak (conservative direction: available too low)
-      Repo.query!("UPDATE gen_durable_concurrency_buckets SET available = 0 WHERE key = 'api'")
+      Repo.query!(
+        "UPDATE gen_durable_buckets SET available = 0 WHERE kind = 'conc' AND key = 'api'"
+      )
+
       assert Queries.reconcile_concurrency(Repo) == 1
       assert gate_buckets("api") == [[0, 2, 1]]
 
       # an orphaned bucket (no config) with nothing executing is swept
       Repo.query!(
-        "INSERT INTO gen_durable_concurrency_buckets (key, shard, cap, available) VALUES ('ghost:1', 0, 5, 5)"
+        "INSERT INTO gen_durable_buckets (kind, key, shard, capacity, available) VALUES ('conc', 'ghost:1', 0, 5, 5)"
       )
 
       # finish the row: the gate becomes idle-full — the whole key is swept too
@@ -343,6 +357,57 @@ defmodule GenDurable.QueriesTest do
 
       %{rows: [[key]]} = Repo.query!("SELECT concurrency_key FROM gen_durable WHERE id = $1", [b])
       assert key == "k2"
+    end
+
+    test "a concurrency_key whose prefix is a RATE-limit name still mutually excludes" do
+      # 'stripe' is a rate limit, not a gate. Unifying the config tables must not
+      # make 'stripe:1' read as a gate (the kind='conc' filter) — else it would
+      # skip the K=1 arbiter and admit both. This guards that regression.
+      :ok =
+        Queries.upsert_rate_configs(Repo, [
+          %{name: "stripe", rate: 100.0, capacity: 100.0, shards: 1}
+        ])
+
+      {:ok, _a} = Queries.insert(Repo, params(%{concurrency_key: "stripe:1"}))
+      {:ok, _b} = Queries.insert(Repo, params(%{concurrency_key: "stripe:1"}))
+
+      # K=1 mutual exclusion: exactly one of the two runs
+      assert length(Queries.pick(Repo, "default", 10, @worker, @ttl)) == 1
+    end
+
+    test "a picker skips a shard another holds (SKIP LOCKED) and admits from the rest" do
+      :ok = seed_gate("api", 4, 2)
+
+      # cold-mint both shards; the lone pick admits 1 to shard 0
+      {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+      assert [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      assert gate_buckets("api") == [[0, 2, 1], [1, 2, 2]]
+
+      for _ <- 1..3, do: {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+
+      # a concurrent connection holds shard 0's bucket row
+      test_pid = self()
+
+      {:ok, holder} =
+        Task.start(fn ->
+          Repo.transaction(fn ->
+            Repo.query!(
+              "SELECT 1 FROM gen_durable_buckets WHERE kind = 'conc' AND key = 'api' AND shard = 0 FOR UPDATE"
+            )
+
+            send(test_pid, :locked)
+            receive(do: (:release -> :ok))
+          end)
+        end)
+
+      assert_receive :locked, 2000
+      claimed = Queries.pick(Repo, "default", 10, @worker, @ttl)
+      send(holder, :release)
+
+      # shard 0 is skipped (held), not waited on: the pick admits only shard 1's
+      # two free slots and returns promptly — never blocked by the held shard
+      assert length(claimed) == 2
+      assert gate_buckets("api") == [[0, 2, 1], [1, 2, 0]]
     end
   end
 
@@ -966,7 +1031,7 @@ defmodule GenDurable.QueriesTest do
 
   describe "rate limiting (spec §12)" do
     setup do
-      Repo.query!("TRUNCATE gen_durable_rate_buckets, gen_durable_rate_configs")
+      Repo.query!("TRUNCATE gen_durable_buckets, gen_durable_bucket_configs")
       :ok
     end
 
@@ -1054,7 +1119,7 @@ defmodule GenDurable.QueriesTest do
       :ok = Queries.complete_retry(Repo, id, @worker, ~s({}), 0)
 
       # simulate gc_buckets having swept the bucket while the row slept
-      Repo.query!("DELETE FROM gen_durable_rate_buckets WHERE key = 'api'")
+      Repo.query!("DELETE FROM gen_durable_buckets WHERE kind = 'rate' AND key = 'api'")
 
       # the same pick that finds the key cold mints it and grants — no stall,
       # and the fresh mint is again full-minus-taken
@@ -1078,21 +1143,26 @@ defmodule GenDurable.QueriesTest do
       # rate 10/s, burst 5 ⇒ fully refilled after 0.5s idle
       :ok = seed(10, 5)
       # zero-rate: never refills, so deleting would grant a fresh burst — never swept
-      :ok = Queries.upsert_rate_configs(Repo, [%{name: "frozen", rate: 0.0, burst: 5.0}])
+      :ok =
+        Queries.upsert_rate_configs(Repo, [%{name: "frozen", rate: 0.0, capacity: 5.0, shards: 1}])
 
       Repo.query!("""
-      INSERT INTO gen_durable_rate_buckets (key, tokens, last_refill) VALUES
-        ('api:idle',  0, now() - interval '10 seconds'),
-        ('api:fresh', 0, now()),
-        ('ghost:1',   0, now() - interval '10 seconds'),
-        ('frozen:1',  0, now() - interval '1 hour')
+      INSERT INTO gen_durable_buckets (kind, key, shard, capacity, available, last_refill) VALUES
+        ('rate', 'api:idle',  0, 5, 0, now() - interval '10 seconds'),
+        ('rate', 'api:fresh', 0, 5, 0, now()),
+        ('rate', 'ghost:1',   0, 5, 0, now() - interval '10 seconds'),
+        ('rate', 'frozen:1',  0, 5, 0, now() - interval '1 hour')
       """)
 
       # api:idle (refilled by now) and ghost:1 (config removed) go; the fresh
       # and the zero-rate buckets stay.
       assert Queries.gc_buckets(Repo) == 2
 
-      %{rows: rows} = Repo.query!("SELECT key FROM gen_durable_rate_buckets ORDER BY key")
+      %{rows: rows} =
+        Repo.query!(
+          "SELECT DISTINCT key FROM gen_durable_buckets WHERE kind = 'rate' ORDER BY key"
+        )
+
       assert List.flatten(rows) == ["api:fresh", "frozen:1"]
     end
 

@@ -49,18 +49,23 @@ this machinery.
 
 ## Sharding a big gate
 
-Completions of one key serialize on its slot counter (a row lock held to commit), which
-caps a single gate's completion throughput at roughly `1 / commit_latency` — about 1–3k/s
-per shard on local disks. For large limits, split the counter:
+A gate's `cap` is split across `shards` slot-counter rows (default 1):
 
 ```elixir
 concurrency_limits: [stripe: [limit: 1000, shards: 10]]
 ```
 
-Claims draw from the aggregate (spread across shards); releases credit back the shard
-they came from. Size it as `shards ≥ limit × commit_latency / step_duration` — e.g.
-limit 1000, 100 ms steps, 1 ms commits ⇒ 10 shards. A gate is only hot if its key is hot,
-and the cap itself throttles the key, so defaults rarely need touching below `limit ≈ 500`.
+Sharding buys two things. **Pick-side parallelism**: each pick locks the shards it needs
+with `FOR UPDATE OF b SKIP LOCKED`, so pickers on different nodes take *disjoint* shards and
+admit in parallel instead of serializing (or blocking) on one row — size `shards ≥ the nodes
+that contend the key`. **Release-side throughput**: completions credit back the shard they
+came from (a row lock held to commit), so one key's completions spread across shard rows
+instead of serializing at `1 / commit_latency` (≈1–3k/s on local disks) — size
+`shards ≥ limit × commit_latency / step_duration` (limit 1000, 100 ms steps, 1 ms commits ⇒
+10 shards). Take the larger of the two. A lone picker grabs all shards and admits up to the
+full cap, identical to an unsharded gate; a gate is only hot if its key is hot, and the cap
+itself throttles the key, so defaults rarely need touching below `limit ≈ 500`. `shards` is
+clamped to `limit` (more shards than slots is nonsense).
 
 ## Releasing or switching the key mid-flight
 

@@ -50,10 +50,8 @@ their instance via the cascade.
 
 | Table | Shape | Role |
 |---|---|---|
-| `gen_durable_rate_configs` | `name PK, rate, burst` | token-bucket policy, upserted at engine boot from `rate_limits:` |
-| `gen_durable_rate_buckets` | `key PK, tokens, last_refill` | one counter row per key ever granted; minted **pre-debited by the pick itself**, swept by GC when idle. The PK doubles as the cold-mint arbiter |
-| `gen_durable_concurrency_configs` | `name PK, cap, shards` | gate policy, upserted at boot from `concurrency_limits:` |
-| `gen_durable_concurrency_buckets` | `key, shard PK, cap, available`, `CHECK (0 ≤ available ≤ cap)` | free-slot counters, one row per shard; the CHECK is the hard cap — over-admission and double-credit are uncommittable |
+| `gen_durable_bucket_configs` | `(kind, name) PK, rate, capacity, shards` | rate **and** gate policy in one table (`kind` = `'rate'`/`'conc'`; `rate` is NULL for gates, `capacity` = burst or cap), upserted at boot from `rate_limits:`/`concurrency_limits:` |
+| `gen_durable_buckets` | `(kind, key, shard) PK, capacity, available, last_refill`, `CHECK (0 ≤ available ≤ capacity)` | sharded counters for both limiters (`available` = tokens or free slots; `last_refill` NULL for gates); minted **pre-debited by the pick**, swept by GC/reconciler when idle. `kind` in the key lets a rate limit and a gate share a name/partition without colliding. The CHECK is the hard cap — over-admission and double-credit are uncommittable |
 
 ## The indexes
 
@@ -86,23 +84,29 @@ pick's business.
 
 ### The pick — one statement, three admissions
 
-The engine's most complex statement (`Queries.pick/5`), a single CTE chain over four tables:
+The engine's most complex statement (`Queries.pick/5`), a single CTE chain over the two
+limiter tables plus `gen_durable`. Config lookups filter by `kind` — a `concurrency_key`
+whose prefix equals a *rate*-limit name must not read as a gate:
 
 1. `cand` — up to `batch` runnable rows via `gen_durable_pick`, locked in-scan with
    `FOR NO KEY UPDATE SKIP LOCKED`. The K = 1 guard rides in the `WHERE` (keyed rows with an
    executing sibling are filtered *before* the `LIMIT`); configured-gate and rate rows pass
    through — their admission is capacity math below.
-2. gate CTEs — lock the winner keys' slot shards (`FOR UPDATE`, ordered), compute cumulative
-   admission ranges over `locked ∪ cold` (a bucketless gate admits against virtual full
-   shards from the config), remember the drawn shard per row.
-3. rate CTEs — cumulative weight per bucket over the survivors, lock the bucket rows
-   (ordered), refill lazily (`LEAST(burst, tokens + elapsed × rate)`), grant the fitting
-   prefix.
-4. `claimed` — flip the admitted set to `executing` with `locked_by`, lease, and
+2. gate CTEs — lock **this picker's share** of the winner keys' slot shards
+   (`FOR UPDATE OF b SKIP LOCKED`, ordered) so concurrent pickers take *disjoint* shards,
+   compute cumulative admission ranges over `grabbed ∪ cold` (a bucketless gate admits
+   against virtual full shards from the config), remember the drawn shard per row.
+3. rate CTEs — cumulative weight per key over the survivors, lock the key's shards
+   (`SKIP LOCKED`), refill each per shard from the *current* config
+   (`LEAST(burst/shards, tokens + elapsed × rate/shards)`), grant the prefix that fits the
+   summed grabbed availability. Rate has no credit-back, so rate rows carry no shard — the
+   consumed weight is debited **proportionally** across the grabbed shards.
+4. `claimed` — flip the admitted set to `executing` with `locked_by`, lease, and (for gates)
    `concurrency_shard`.
-5. writebacks and mints — debit existing counter rows; `INSERT` the cold ones **already
+5. writebacks and mints — debit the grabbed counter shards; `INSERT` the cold ones **already
    debited** (`c_mint` merges racing gate mints via `ON CONFLICT`; a racing rate mint is a
-   PK violation and a bounded pick retry).
+   PK violation and a bounded pick retry — which also keeps rate trippable only on the PK and
+   gates only on the CHECK, disambiguating the `:contended` telemetry).
 6. two `UNION ALL` tails return throttle counts per limited key — the
    `:throttled` telemetry rides the same round-trip.
 
@@ -146,8 +150,8 @@ not-yet-parked row without waiting.
 | heartbeat | — | extends `lease_expires_at` of the claimed set, ownership-guarded |
 | reaper | expired leases via `gen_durable_lease`, ordered `SKIP LOCKED` claim | → `runnable`, `attempt + 1`; a parallel sweep fires await timeouts via `gen_durable_await_deadline` |
 | GC (terminal) | ids via `gen_durable_gc`, sparing terminal children of mid-join parents | two-step: `SELECT` the batch, `DELETE ... WHERE id = ANY` — the delete is PK-driven, never a scan |
-| GC (rate buckets) | idle-refilled and orphaned buckets, ordered `SKIP LOCKED` | `DELETE` — safe because the pick re-mints a missing bucket full-minus-taken, zero lag |
-| GC (gate reconciler) | one transaction: ordered `SKIP LOCKED` lock of all gate shards | heal `cap`/`available` from the executing-rows truth, sweep orphaned/idle keys whole, backfill shards missing after a `shards:` increase |
+| GC (rate buckets) | idle-refilled and orphaned rate keys, ordered `SKIP LOCKED` | `DELETE` per key **all-shards-or-nothing** — safe because the pick re-mints a missing key full-minus-taken (cold ⇒ no rows at all), zero lag |
+| GC (gate reconciler) | one transaction: ordered `SKIP LOCKED` lock of the `kind='conc'` shards | heal `capacity`/`available` from the executing-rows truth, sweep orphaned/idle keys whole, backfill shards missing after a `shards:` increase |
 | scheduler startup | claims of a dead predecessor (same instance/queue/VM) | → `runnable` immediately instead of waiting out the lease |
 
 ## The locking discipline
@@ -162,10 +166,17 @@ not-yet-parked row without waiting.
   modifies columns of a **full** unique index, and the only full unique index is the
   immutable PK (the correlation/concurrency uniques are partial, which Postgres excludes) —
   adding a full unique index over a mutable column would invalidate this.
-- **Counter rows use blocking `FOR UPDATE`, always acquired in sorted key order.** Every
-  pick, credit rider, and the reconciler sort before locking, so all lock acquisition
-  sequences are compatible. Blocking is deliberate: for one hot bucket, `SKIP LOCKED`
-  measured *slower* (spin-retry with no alternative work).
+- **Counter shards are locked with `FOR UPDATE OF b SKIP LOCKED`, in sorted `(key, shard)`
+  order.** Concurrent (cross-node) pickers grab *disjoint* shard subsets of a hot key and
+  admit over what each grabbed, so they run in parallel instead of serializing on one bucket
+  held across the whole claim; a lone picker grabs every shard and behaves exactly as an
+  unsharded counter. Because a skip-locked acquisition never waits, counter locks — like
+  instance-row claims — cannot appear in any deadlock cycle. (This reverses an earlier
+  choice: with a single *unsharded* counter, blocking `FOR UPDATE` beat `SKIP LOCKED`, which
+  spin-retried with no alternative work. Sharding removes the one hot row, so skipping wins —
+  size `shards ≥ contending nodes`, or an under-sharded hot key degrades back to that spin.)
+  The credit riders and the reconciler still take plain `FOR UPDATE` on the specific shard
+  they address, in sorted order.
 - **Racing inserts meet at unique indexes, in sorted order.** Ordered insertion turns
   "deadlock on each other's uncommitted index entries" into "one clean unique violation",
   which the caller resolves (pick retry) or ignores (`ON CONFLICT DO NOTHING`).
@@ -181,8 +192,8 @@ telemetry):
 | Constraint | Race it settles |
 |---|---|
 | `gen_durable_concurrency_active` (unique) | two picks claiming one K = 1 key |
-| `gen_durable_concurrency_buckets` CHECK | residual gate over-admission; double credit |
-| `gen_durable_rate_buckets` PK | two picks minting the same cold rate bucket |
+| `gen_durable_buckets` CHECK | residual gate over-admission; double credit (gates mint with `ON CONFLICT`, so only they trip the CHECK) |
+| `gen_durable_buckets` PK | two picks minting the same cold rate key (rate mints without `ON CONFLICT`, so only it trips the PK) |
 | `gen_durable_correlation` (unique) | duplicate business identity across concurrent inserts |
 
 The meta-rule behind this (learned the hard way — see ISSUES #23): under `READ COMMITTED`,

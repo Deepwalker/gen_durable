@@ -2,8 +2,32 @@
 
 All notable changes to `gen_durable` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and makes
-**no backward-compatibility guarantees** — there is one schema version and migrations are
-edited in place until the MVP settles.
+**no backward-compatibility guarantees**. Now that there is a live install, schema changes
+ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
+install is missing (before the first deployment they were edited into v1 in place).
+
+## 0.2.7
+
+### Changed
+- **Rate limits and concurrency gates are now one sharded mechanism.** The four limiter tables
+  collapse into `gen_durable_bucket_configs` and `gen_durable_buckets`, both keyed by
+  `(kind, …)` so a rate limit and a gate may share a name without colliding. Rate limits gain a
+  `shards:` option (gates already had one); each pick locks a key's shards with
+  `FOR UPDATE OF b SKIP LOCKED`, so concurrent (cross-node) pickers grab **disjoint** shards
+  and admit in parallel instead of serializing — or blocking a whole pick — on one bucket row
+  held across the claim. A lone picker still grabs every shard (full `burst`/`cap`), `SKIP
+  LOCKED` makes bucket deadlock structurally impossible, and rate's consumed weight is debited
+  proportionally across the grabbed shards (rate rows carry no shard — it has no credit-back).
+  Default `shards` is 1 — behaviour-preserving; opt into parallelism per limit, sizing
+  `shards ≥ contending nodes`.
+
+### Migration
+- **First versioned schema increment (`@latest_version` → 2).** `change(1)` is frozen;
+  `change(2)` drops the four old limiter tables and creates the two unified ones. They are
+  ephemeral (configs re-seed from options at boot, buckets mint on demand), so it is a pure
+  drop-and-recreate with nothing to preserve — an existing install runs only `change(2)`, a
+  fresh one runs both in one `up()`. Re-run your existing one-line `GenDurable.Migration.up()`
+  migration.
 
 ## 0.2.6
 

@@ -224,9 +224,9 @@ all `rate_limit IS NULL`:
 Update on gen_durable g (rows=50)
   CTE cand     -> Index Scan using gen_durable_pick (rows=50)   ← unchanged candidate select
   CTE winners  -> WindowAgg -> Sort (rows=50, 27kB quicksort)   ← the only added work
-  CTE r_cold   -> Anti Join (rows=0); rate_buckets index "never executed"
-  CTE locked   -> LockRows (rows=0); rate_buckets index "never executed"
-  CTE avail/granted/writeback/r_mint -> rows=0 / never executed
+  CTE r_cold   -> Anti Join (rows=0); gen_durable_buckets index "never executed"
+  CTE r_locked -> LockRows (rows=0); gen_durable_buckets index "never executed"
+  CTE r_shards/r_key_avail/granted/r_new/writeback/r_mint -> rows=0 / never executed
   final        -> Nested Loop -> Index Scan gen_durable_pkey (the PK flip, as before)
 Execution Time: 1.9 ms   (the full production pick, §2c gate CTEs included)
 ```
@@ -243,11 +243,30 @@ bucket the GC swept, admit with **zero lag**. Two picks racing the same cold key
 bucket's primary key; the loser's claim aborts whole and retries against the winner's committed
 row (`[:gen_durable, :rate_limit, :contended]`, same bounded-retry discipline as the §2c gates).
 
-**Under contention.** A bucket is a single counter row locked with `FOR UPDATE`; concurrent
-pickers serialize on it. Measured drain of 20k jobs, 8 concurrent pickers, batch 50, infinite
-budget (so we measure lock and mint cost, not throttling) — same methodology as §2c:
+**Under contention (sharded).** A key's budget is split across `shards` counter rows
+(default 1). Each pick locks the shards it needs with `FOR UPDATE OF b SKIP LOCKED`, so
+concurrent (cross-node) pickers grab **disjoint** shards and admit in parallel instead of
+serializing — or blocking a whole pick — on one row held across the claim. A skip-locked lock
+never waits, so bucket deadlock is structurally impossible; a lone picker grabs every shard
+and sees the full `burst` (`weight ≤ burst` still holds), and the consumed weight is debited
+**proportionally** across the grabbed shards (rate carries no per-row shard — it has no
+credit-back). Size `shards ≥ the nodes that contend the hottest key`; leave it at 1 for a
+single-node or cold key. The cold-mint conservation property is unchanged: a run of rate 0,
+burst 5, 100 fresh keys × 10 jobs, 8 workers racing the mints granted **exactly** 5 per key
+with every bucket at exactly 0.0 tokens — the PK-collision path loses and leaks nothing.
 
-| path | throughput | vs baseline |
+> ⚠ **The table below was measured on the pre-sharding 0.2.6 design** — a single counter row
+> locked with blocking `FOR UPDATE`. It showed that even one hot bucket did not register at
+> batch 50 (the lock was taken once per pick, held for the statement only, amortized over the
+> batch — all within a ±3% noise band). The sharded `SKIP LOCKED` design changes the
+> contention mechanism (disjoint shards, skip-instead-of-wait), and reliable multi-picker
+> contention numbers need production-like idle-backoff and real multi-node hardware — not a
+> single-VM raw-loop drain, which would penalize skip-and-retry for a spin the scheduler
+> backs off. These numbers are **pending re-measurement**; the correctness properties above
+> still hold. (This also reverses the earlier note that `SKIP LOCKED` was *slower*: that was
+> true for one hot **unsharded** row with no alternative work — sharding removes that row.)
+
+| path (pre-sharding 0.2.6) | throughput | vs baseline |
 |---|---|---|
 | no rate limit | 9 150 jobs/s | 1.00× |
 | one hot bucket, cold start | 9 320 jobs/s | 1.02× |
@@ -255,38 +274,27 @@ budget (so we measure lock and mint cost, not throttling) — same methodology a
 | 100 buckets (partitioned), cold | 9 060 jobs/s | 0.99× |
 | 2 000 cold keys, 10 jobs each | 8 960 jobs/s | 0.98× |
 
-Everything is within the run-to-run noise band (repeats of one scenario spread ±3%): the lock is
-taken once per pick — amortized over the whole batch — and held for the statement only, so even
-a single hot bucket doesn't register at batch 50, and the mint-heavy sweep (2 000 cold keys)
-costs the same as warm buckets. The whole run retried 27 cold-mint collisions and drained every
-job. A separate conservation run (rate 0, burst 5, 100 fresh keys × 10 jobs, 8 workers racing
-the mints, 3×) granted **exactly** 5 per key with every bucket landing at exactly 0.0 tokens —
-the collision path loses and leaks nothing. Grants are **batched** (one lock acquisition per
-pick-cycle, not per job). `SKIP LOCKED` on the bucket measured *slower* for a
-single hot bucket (spin-retry with no alternative work), so the picker uses blocking
-`FOR UPDATE`. Buckets are locked in key order (`ORDER BY` sorts before `LockRows`), so
-concurrent picks acquire them in the same order and cannot deadlock — the sort is over the
-distinct bucket keys of one batch (a handful of rows), not a measurable cost. Numbers are on a
-local Postgres 17 (devcontainer); read the ratios, not absolutes.
-
 ### 2c. Concurrency gates: batched grants, per-shard release chains
 
 A configured `concurrency_key` (a gate: at most `limit` in flight) adds its own CTE family
-to the pick, shaped like the rate limiter's: lock the gate's slot-counter rows (ordered),
-admit the winners' prefix against the aggregate `available`, debit in one writeback. Like
-the rate CTEs, all of it is `never executed` when no gated rows are in the window — a
-non-gated queue pays nothing (same EXPLAIN discipline as §2b).
+to the pick, shaped like the rate limiter's: lock this picker's share of the gate's
+slot-counter shards (`FOR UPDATE OF b SKIP LOCKED`, ordered), admit the winners' prefix
+against the grabbed `available`, debit in one writeback. Like the rate CTEs, all of it is
+`never executed` when no gated rows are in the window — a non-gated queue pays nothing (same
+EXPLAIN discipline as §2b).
 
-The asymmetry to know about is **grants vs releases**. Grants are batched — one lock pass
-over the gate's shards per pick, amortized over the whole batch. Releases are per-step: the
-outcome's `credit` rider locks the shard row until commit, so completions of one key form a
-commit-latency chain — a per-shard ceiling of roughly `1 / commit_latency` (≈1–3k
-completions/s on local disks, ~300–1000/s on cloud storage; chained transactions cannot
-group-commit). That is what `shards:` is for: `S` shards ⇒ `S` independent chains. Size
-`shards ≥ limit × commit_latency / step_duration`. The self-limiting argument of §2b applies
-on both sides: a gate is only hot if its key is hot, and the cap itself throttles the key —
-a config that saturates its own gate (huge limit, sub-10ms steps) is capping something that
-did not need capping.
+Sharding helps **both** sides. On the **grant** side, each pick locks only the shards it
+touches with `SKIP LOCKED`, so concurrent pickers take disjoint shards and admit in parallel —
+a hot gate no longer serializes (or blocks a whole pick on) one row. On the **release** side,
+the outcome's `credit` rider locks the specific shard it addresses until commit, so
+completions of one key form a commit-latency chain per shard — a per-shard ceiling of roughly
+`1 / commit_latency` (≈1–3k completions/s on local disks, ~300–1000/s on cloud storage;
+chained transactions cannot group-commit). `S` shards ⇒ up to `S` parallel grants and `S`
+independent release chains. Size `shards` ≥ the larger of the contending nodes (grant
+parallelism) and `limit × commit_latency / step_duration` (release throughput). The
+self-limiting argument of §2b applies on both sides: a gate is only hot if its key is hot, and
+the cap itself throttles the key — a config that saturates its own gate (huge limit, sub-10ms
+steps) is capping something that did not need capping.
 
 Crash paths deliberately under-credit (a leaked slot means *stricter*-than-limit, never
 looser); the GC reconciler repairs the counters from the executing-rows truth each sweep,
@@ -296,18 +304,19 @@ caught a real over-admission race through it (a locked bucket scan emitting a ro
 under concurrent writes — fixed by deduplication in the pick, with the CHECK + retry as
 the remaining backstop).
 
-**Measured** (drain of 20k zero-length jobs, 8 concurrent pickers, batch 50, local
-Postgres 17 — the §2b methodology):
+> ⚠ **Measured on the pre-sharding 0.2.6 design** (drain of 20k zero-length jobs, 8 pickers,
+> batch 50): one shard serialized both grants and credits on a single row (0.46× of lockless,
+> the worst case by construction — zero-length steps = pure gate traffic), 8 shards recovered
+> to ~0.9×. Under the current `SKIP LOCKED` grants the 1-shard grant side no longer *blocks*
+> (it skips), so these numbers are **pending re-measurement** on production-like backoff /
+> multi-node hardware (see the §2b note).
 
-| scenario | throughput | vs baseline |
+| scenario (pre-sharding 0.2.6) | throughput | vs baseline |
 |---|---|---|
 | no key (baseline) | 9 579 jobs/s | 1.00× |
 | gate, never throttling, 1 shard | 4 389 jobs/s | 0.46× |
 | gate, never throttling, 8 shards | 8 428 jobs/s | 0.88× |
 
-One hot shard serializes both the batched grants and every per-completion credit on a
-single row — the worst case by construction (zero-length steps = pure gate traffic) —
-and still moves ~4.4k jobs/s through one gate; 8 shards recover to ~0.9× of lockless.
 Cold gates cost nothing extra: the first claim mints the counters pre-debited in the
 same statement (a racing double-mint merges via ON CONFLICT, overdraft aborted by the
 CHECK and retried), so "no buckets yet" is indistinguishable from "buckets full".

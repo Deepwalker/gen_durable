@@ -86,7 +86,7 @@ The engine is started as `{GenDurable, opts}`:
 | `:repo` | — (required) | the host's `Ecto.Repo` |
 | `:fsms` | `[]` | modules to register — only for a custom `:name` or versioning |
 | `:queues` | `[default: 10]` | `queue_name => concurrency` |
-| `:rate_limits` | `[]` | named [token-bucket limits](rate_limiting.md) |
+| `:rate_limits` | `[]` | named [token-bucket limits](rate_limiting.md) (`[api: [allowed: 100, period: {1, :minute}, shards: 1]]`) |
 | `:concurrency_limits` | `[]` | named [concurrency gates](concurrency.md) for `concurrency_key` (`[api: [limit: 100, shards: 1]]`) |
 | `:lease_ttl` | `60_000` | ms a claimed row stays leased before the reaper may reclaim it |
 | `:heartbeat_interval` | `20_000` | ms between lease extensions for claimed rows |

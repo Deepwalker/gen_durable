@@ -99,10 +99,12 @@ defmodule GenDurable.TestingTest do
   end
 
   test "a concurrency gate admits, credits, and re-admits through drain" do
-    Repo.query!("TRUNCATE gen_durable_concurrency_buckets, gen_durable_concurrency_configs")
+    Repo.query!("TRUNCATE gen_durable_buckets, gen_durable_bucket_configs")
 
     :ok =
-      GenDurable.Queries.upsert_concurrency_configs(Repo, [%{name: "gate", cap: 1, shards: 1}])
+      GenDurable.Queries.upsert_concurrency_configs(Repo, [
+        %{name: "gate", capacity: 1, shards: 1}
+      ])
 
     {:ok, a} = GenDurable.insert(GenDurable.Test.Plain, concurrency_key: {:gate, 7}, repo: Repo)
     {:ok, b} = GenDurable.insert(GenDurable.Test.Plain, concurrency_key: {:gate, 7}, repo: Repo)
@@ -111,7 +113,9 @@ defmodule GenDurable.TestingTest do
     # mint-and-admit in the same statement, or drain would see an empty pick
     # and wrongly stop at "quiescence" with runnable work left
     %{rows: [[buckets]]} =
-      Repo.query!("SELECT count(*) FROM gen_durable_concurrency_buckets WHERE key = 'gate:7'")
+      Repo.query!(
+        "SELECT count(*) FROM gen_durable_buckets WHERE kind = 'conc' AND key = 'gate:7'"
+      )
 
     assert buckets == 0
 
@@ -123,9 +127,12 @@ defmodule GenDurable.TestingTest do
   end
 
   test "a rate limit admits through a cold bucket in one drain" do
-    Repo.query!("TRUNCATE gen_durable_rate_buckets, gen_durable_rate_configs")
+    Repo.query!("TRUNCATE gen_durable_buckets, gen_durable_bucket_configs")
 
-    :ok = GenDurable.Queries.upsert_rate_configs(Repo, [%{name: "api", rate: 0.0, burst: 2.0}])
+    :ok =
+      GenDurable.Queries.upsert_rate_configs(Repo, [
+        %{name: "api", rate: 0.0, capacity: 2.0, shards: 1}
+      ])
 
     {:ok, a} = GenDurable.insert(GenDurable.Test.Plain, rate_limit: {:api, 7}, repo: Repo)
     {:ok, b} = GenDurable.insert(GenDurable.Test.Plain, rate_limit: {:api, 7}, repo: Repo)
@@ -134,7 +141,9 @@ defmodule GenDurable.TestingTest do
     # mint-and-grant in the same statement, or drain would see an empty pick
     # and wrongly stop at "quiescence" with runnable work left
     %{rows: [[buckets]]} =
-      Repo.query!("SELECT count(*) FROM gen_durable_rate_buckets WHERE key = 'api:7'")
+      Repo.query!(
+        "SELECT count(*) FROM gen_durable_buckets WHERE kind = 'rate' AND key = 'api:7'"
+      )
 
     assert buckets == 0
 

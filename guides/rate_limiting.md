@@ -17,12 +17,15 @@ Engine-start option:
  repo: MyApp.Repo,
  rate_limits: [
    stripe: [allowed: 100, period: {1, :minute}],
-   emails: [allowed: 5, period: 60, burst: 10]
+   emails: [allowed: 5, period: 60, burst: 10, shards: 4]
  ]}
 ```
 
 It is a **token bucket**: `allowed`/`period` set the sustained rate, `burst` (default `allowed`)
 the instantaneous slack. `period` is seconds or `{n, :second | :minute | :hour | :day}`.
+`shards` (default 1) splits rate/burst across that many counter rows so pickers on different
+nodes take disjoint shards instead of serializing — size it to the number of nodes that
+contend the hottest key (see cross-node correctness below).
 
 ## Opt a step in
 
@@ -81,9 +84,15 @@ starving).
   `[:gen_durable, :rate_limit, :contended]`).
 - **Unknown key.** A `rate_limit` whose name has no configured policy makes the row **stall** (no
   bucket) and emits `[:gen_durable, :rate_limit, :unknown]`. Keep your keys configured.
-- **Cross-node correctness.** The bucket is a single Postgres counter row; concurrent pickers
-  across nodes serialize on it. A rate-limited bucket is low-throughput by definition, so this is
-  never the bottleneck — see the [performance notes](../PERFORMANCE.md).
+- **Cross-node correctness and sharding.** A key's budget is split across `shards` counter rows
+  (default 1). Each pick locks the shards it needs with `FOR UPDATE OF b SKIP LOCKED`, so
+  concurrent pickers on different nodes grab *disjoint* shards and admit in parallel — a hot key
+  no longer serializes every node on one row, and a node never *blocks* its whole pick behind
+  another's bucket lock. A lone picker grabs all shards and sees the full `burst`, so
+  `weight ≤ burst` still holds; the consumed weight is debited proportionally across the grabbed
+  shards. Aggregate rate/burst are preserved (each shard gets `rate/shards`, `burst/shards`). Set
+  `shards` ≥ the nodes that contend the hottest key; leave it at 1 for a single-node or cold key.
+  See the [performance notes](../PERFORMANCE.md).
 - **A deep throttled backlog crowds its queue.** Throttled rows stay runnable and keep occupying
   the pick window, so a heavily saturated key can starve *unrelated* same-priority work behind
   it. Give high-volume rate-limited flows their own queue — see the honest-list entry in the

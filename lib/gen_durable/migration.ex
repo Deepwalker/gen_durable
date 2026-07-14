@@ -28,7 +28,7 @@ defmodule GenDurable.Migration do
 
   use Ecto.Migration
 
-  @latest_version 1
+  @latest_version 2
 
   @doc "Migrate the schema up to `:version` (default: latest)."
   def up(opts \\ []) do
@@ -260,6 +260,98 @@ defmodule GenDurable.Migration do
     execute("DROP TABLE IF EXISTS #{p}.signals")
     execute("DROP TABLE IF EXISTS #{p}.gen_durable")
     execute("DROP TYPE IF EXISTS #{p}.durable_status")
+  end
+
+  # --- version 2: unified, sharded rate + concurrency buckets --------
+
+  # The four limiter tables collapse into two. Rate joins concurrency in one
+  # sharded shape so the pick can lock a key's shards with SKIP LOCKED —
+  # concurrent (cross-node) pickers grab disjoint shard subsets instead of
+  # blocking on one bucket row across the whole claim.
+  #
+  # Config and bucket rows are ephemeral: configs are re-seeded from the
+  # `rate_limits:`/`concurrency_limits:` options at every engine start, and
+  # buckets are minted on demand by the pick and swept by the GC. So the
+  # upgrade is a plain drop-and-recreate with nothing to preserve — an
+  # existing install runs only this increment; a fresh one runs 1 then 2.
+  defp change(2, :up, p) do
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_concurrency_buckets")
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_concurrency_configs")
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_rate_buckets")
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_rate_configs")
+
+    # `kind` is part of the primary key so a rate limit and a concurrency gate
+    # may share a name (and a bucket key) without colliding — they lived in
+    # separate tables before, so this keeps the two namespaces independent.
+    execute("""
+    CREATE TABLE #{p}.gen_durable_bucket_configs (
+      kind     text not null,
+      name     text not null,
+      rate     double precision,           -- tokens/sec; NULL for concurrency
+      capacity double precision not null,   -- burst (rate) or cap (concurrency)
+      shards   smallint not null,
+      PRIMARY KEY (kind, name),
+      CHECK (kind IN ('rate', 'conc'))
+    )
+    """)
+
+    # One row per (kind, key, shard). `available` is tokens (rate) or free
+    # slots (conc); `capacity` is the shard's ceiling (burst/shards or a
+    # slot split of cap). The CHECK is the hard cap: over-admission or a
+    # double credit is uncommittable. `last_refill` drives the rate refill
+    # and is NULL for concurrency (which refills by completion credit).
+    execute("""
+    CREATE TABLE #{p}.gen_durable_buckets (
+      kind        text not null,
+      key         text not null,
+      shard       smallint not null,
+      capacity    double precision not null,
+      available   double precision not null,
+      last_refill timestamptz,
+      PRIMARY KEY (kind, key, shard),
+      CHECK (available >= 0 AND available <= capacity)
+    )
+    """)
+  end
+
+  defp change(2, :down, p) do
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_buckets")
+    execute("DROP TABLE IF EXISTS #{p}.gen_durable_bucket_configs")
+
+    execute("""
+    CREATE TABLE #{p}.gen_durable_rate_configs (
+      name  text primary key,
+      rate  double precision not null,
+      burst double precision not null
+    )
+    """)
+
+    execute("""
+    CREATE TABLE #{p}.gen_durable_rate_buckets (
+      key         text primary key,
+      tokens      double precision not null,
+      last_refill timestamptz not null default clock_timestamp()
+    )
+    """)
+
+    execute("""
+    CREATE TABLE #{p}.gen_durable_concurrency_configs (
+      name   text primary key,
+      cap    int not null,
+      shards int not null
+    )
+    """)
+
+    execute("""
+    CREATE TABLE #{p}.gen_durable_concurrency_buckets (
+      key       text not null,
+      shard     smallint not null,
+      cap       int not null,
+      available int not null,
+      PRIMARY KEY (key, shard),
+      CHECK (available >= 0 AND available <= cap)
+    )
+    """)
   end
 
   # --- helpers ---------------------------------------------------------------

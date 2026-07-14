@@ -50,16 +50,20 @@ defmodule GenDurable.Supervisor do
       in-flight steps to finish before giving up to the reaper (default `5_000`).
       Buffered (un-started) rows are released immediately regardless.
     * `:rate_limits` — named token-bucket rate limits (default `[]`), e.g.
-      `[stripe: [allowed: 100, period: {1, :minute}], emails: [allowed: 5, period: 60, burst: 10]]`.
+      `[stripe: [allowed: 100, period: {1, :minute}], emails: [allowed: 5, period: 60, burst: 10, shards: 4]]`.
       `allowed`/`period` set the sustained rate; `burst` (default `allowed`) the capacity.
-      A step opts into a limit by returning `rate_limit: :stripe` (or `{:stripe, key}`).
+      `shards` (default 1) splits rate/burst across bucket rows so concurrent
+      (cross-node) pickers grab disjoint shards instead of serializing — size it to
+      the number of nodes that contend the hottest key. A step opts into a limit by
+      returning `rate_limit: :stripe` (or `{:stripe, key}`).
     * `:concurrency_limits` — named concurrency caps for `concurrency_key` (default
       `[]`), e.g. `[stripe: [limit: 1000, shards: 10]]`: at most `limit` concurrent
       executions per key whose name matches (`concurrency_key: {:stripe, tenant}` ⇒
       key `"stripe:tenant"`, name `"stripe"`). An unconfigured key keeps the default
-      limit of 1 (mutual exclusion). `shards` (default 1) splits the cap across
-      bucket rows — completions of one key serialize per shard, so size
-      `shards ≥ limit × commit_latency / step_duration`. **Careful**: a config name
+      limit of 1 (mutual exclusion). `shards` (default 1, clamped to `limit`) splits
+      the cap across bucket rows so cross-node pickers take disjoint shards and
+      completions credit back per shard — size `shards ≥ contending nodes`.
+      **Careful**: a config name
       captures every key with that prefix — configuring a name that collides with
       identity-style keys (e.g. `order:` used for mutual exclusion) silently raises
       their limit and breaks the exclusion.
@@ -319,8 +323,10 @@ defmodule GenDurable.Supervisor do
     end
   end
 
-  # `[stripe: [allowed: 100, period: {1, :minute}], …]` → `[%{name, rate, burst}]`.
-  # rate = allowed / period_seconds (the sustained throughput); burst defaults to allowed.
+  # `[stripe: [allowed: 100, period: {1, :minute}, shards: 4], …]` →
+  # `[%{name, rate, capacity, shards}]`. rate = allowed / period_seconds (the
+  # sustained throughput); capacity (burst) defaults to allowed; shards defaults
+  # to 1 — opt-in cross-node pick parallelism, splitting rate/burst evenly.
   defp parse_rate_limits(rate_limits) do
     for {name, cfg} <- rate_limits do
       allowed = Keyword.fetch!(cfg, :allowed)
@@ -329,13 +335,15 @@ defmodule GenDurable.Supervisor do
       %{
         name: to_string(name),
         rate: allowed / period,
-        burst: Keyword.get(cfg, :burst, allowed) * 1.0
+        capacity: Keyword.get(cfg, :burst, allowed) * 1.0,
+        shards: cfg |> Keyword.get(:shards, 1) |> max(1)
       }
     end
   end
 
-  # `[stripe: [limit: 1000, shards: 10]]` → `[%{name, cap, shards}]`. `shards`
-  # defaults to 1 and is clamped to the cap (more shards than slots is nonsense).
+  # `[stripe: [limit: 1000, shards: 10]]` → `[%{name, capacity, shards}]`.
+  # `shards` defaults to 1, is clamped to the cap (more shards than slots is
+  # nonsense), and sets the cross-node pick parallelism for the gate.
   defp parse_concurrency_limits(limits) do
     for {name, cfg} <- limits do
       cap = Keyword.fetch!(cfg, :limit)
@@ -343,7 +351,11 @@ defmodule GenDurable.Supervisor do
       if not is_integer(cap) or cap < 1,
         do: raise(ArgumentError, "concurrency limit #{inspect(name)} must be a positive integer")
 
-      %{name: to_string(name), cap: cap, shards: cfg |> Keyword.get(:shards, 1) |> min(cap)}
+      %{
+        name: to_string(name),
+        capacity: cap,
+        shards: cfg |> Keyword.get(:shards, 1) |> max(1) |> min(cap)
+      }
     end
   end
 
