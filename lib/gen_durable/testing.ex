@@ -112,7 +112,8 @@ defmodule GenDurable.Testing do
       repo: repo,
       limiter: {GenDurable.Limiter.Postgres, %{repo: repo}},
       registry: Registry.new(Keyword.get(opts, :fsms, [])),
-      rate_limit_names: configured_rate_limits(repo)
+      rate_limit_names: configured_rate_limits(repo),
+      concurrency_limit_names: configured_concurrency_limits(repo)
     }
 
     loop(
@@ -293,6 +294,11 @@ defmodule GenDurable.Testing do
 
   defp configured_rate_limits(repo) do
     %{rows: rows} = repo.query!("SELECT name FROM gen_durable_bucket_configs WHERE kind = 'rate'")
+    MapSet.new(List.flatten(rows))
+  end
+
+  defp configured_concurrency_limits(repo) do
+    %{rows: rows} = repo.query!("SELECT name FROM gen_durable_bucket_configs WHERE kind = 'conc'")
     MapSet.new(List.flatten(rows))
   end
 

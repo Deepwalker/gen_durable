@@ -13,11 +13,19 @@ defmodule GenDurable.Outcome do
 
   Step names and signal names are normalized to strings. `:await` accepts a single
   name or a list of names; both normalize to a list. `:next` accepts an optional 4th
-  keyword `opts` (`rate_limit:`, `weight:`), `:await` an optional 5th (`timeout:`);
-  both normalize to an opts map in the tuple's last position.
+  keyword `opts` (`rate_limit:`, `weight:`, `concurrency_key:`, `inline_execution:`),
+  `:await` an optional 5th (`timeout:`); both normalize to an opts map in the tuple's
+  last position. `inline_execution:` (`true`/`false`, default `nil` ⇒ defer to the FSM's
+  `inline_execution:` option) forces or forbids running the next step inline in the same
+  worker for this one transition — see `GenDurable.Executor`.
   """
 
-  @type next_opts :: %{rate_limit: String.t() | nil, weight: number()}
+  @type next_opts :: %{
+          rate_limit: String.t() | nil,
+          weight: number(),
+          concurrency_key: String.t() | nil | :keep,
+          inline_execution: boolean() | nil
+        }
   @type await_opts :: %{timeout: pos_integer() | nil}
 
   @type t ::
@@ -32,14 +40,18 @@ defmodule GenDurable.Outcome do
   def validate({:next, step, state}) when is_binary(step) or is_atom(step),
     do:
       {:ok,
-       {:next, to_string(step), state, %{rate_limit: nil, weight: 1, concurrency_key: :keep}}}
+       {:next, to_string(step), state,
+        %{rate_limit: nil, weight: 1, concurrency_key: :keep, inline_execution: nil}}}
 
   def validate({:next, step, state, opts})
       when (is_binary(step) or is_atom(step)) and is_list(opts) do
     with {:ok, rl} <- normalize_rate_limit(Keyword.get(opts, :rate_limit)),
          {:ok, w} <- normalize_weight(Keyword.get(opts, :weight)),
-         {:ok, ck} <- normalize_concurrency_key(Keyword.fetch(opts, :concurrency_key)) do
-      {:ok, {:next, to_string(step), state, %{rate_limit: rl, weight: w, concurrency_key: ck}}}
+         {:ok, ck} <- normalize_concurrency_key(Keyword.fetch(opts, :concurrency_key)),
+         {:ok, inline} <- normalize_inline(Keyword.get(opts, :inline_execution)) do
+      {:ok,
+       {:next, to_string(step), state,
+        %{rate_limit: rl, weight: w, concurrency_key: ck, inline_execution: inline}}}
     else
       :error -> {:error, {:bad_outcome, {:next, step, state, opts}}}
     end
@@ -99,6 +111,13 @@ defmodule GenDurable.Outcome do
   defp normalize_concurrency_key(:error), do: {:ok, :keep}
   defp normalize_concurrency_key({:ok, nil}), do: {:ok, nil}
   defp normalize_concurrency_key({:ok, value}), do: normalize_rate_limit(value)
+
+  # inline_execution on :next — absent (nil) means DEFER to the FSM's `inline_execution:`
+  # default; an explicit true/false overrides it for this one transition (run the next
+  # step inline in the same worker, or force a requeue through the picker).
+  defp normalize_inline(nil), do: {:ok, nil}
+  defp normalize_inline(b) when is_boolean(b), do: {:ok, b}
+  defp normalize_inline(_), do: :error
 
   @spec validate!(term()) :: t()
   def validate!(outcome) do

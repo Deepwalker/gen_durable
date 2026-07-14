@@ -253,6 +253,20 @@ defmodule GenDurable.Scheduler do
     end
   end
 
+  # An inline-continuing task swapped the concurrency slot its row holds (a new
+  # concurrency_key). Track the current slot so the heartbeat renews the RIGHT one — a
+  # lease-native limiter (Redis) prunes a slot it stops hearing about, double-booking the key.
+  # A swap for an id that already left `in_flight` (task finished) is a harmless no-op.
+  def handle_info({:slot_swap, id, slot}, state) do
+    in_flight =
+      Map.new(state.in_flight, fn
+        {ref, {^id, _old}} -> {ref, {id, slot}}
+        pair -> pair
+      end)
+
+    {:noreply, %{state | in_flight: in_flight}}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   # Monitor-then-join, tolerating the scope dying at any point in between —
@@ -330,9 +344,16 @@ defmodule GenDurable.Scheduler do
 
     if demand > 0 and (demand >= state.min_demand or idle?(state)) do
       config = state.config
+
       jobs =
-        Queries.pick(config.repo, state.queue, demand, state.worker, config.lease_ttl_ms,
-          config.limiter)
+        Queries.pick(
+          config.repo,
+          state.queue,
+          demand,
+          state.worker,
+          config.lease_ttl_ms,
+          config.limiter
+        )
 
       :telemetry.execute(
         [:gen_durable, :pick, :stop],
@@ -351,7 +372,12 @@ defmodule GenDurable.Scheduler do
   # order is not SQL-guaranteed, so this is best-effort, not a contract).
   defp drain(%{buffer: [job | rest]} = state)
        when map_size(state.in_flight) < state.concurrency do
-    task = Task.Supervisor.async_nolink(state.task_sup, fn -> Executor.run(state.config, job) end)
+    sched = self()
+
+    task =
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
+        Executor.run(state.config, job, sched)
+      end)
 
     state = %{
       state

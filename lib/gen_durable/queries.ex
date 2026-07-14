@@ -205,8 +205,7 @@ defmodule GenDurable.Queries do
     end
 
     admitted_rows =
-      for c <- needs_admit, MapSet.member?(admitted_ids, c.id),
-          do: %{c | slot: slot_by_id[c.id]}
+      for c <- needs_admit, MapSet.member?(admitted_ids, c.id), do: %{c | slot: slot_by_id[c.id]}
 
     jobs = Enum.map(plain ++ admitted_rows, &Map.drop(&1, [:gated, :rate]))
     enrich(repo, jobs)
@@ -227,8 +226,19 @@ defmodule GenDurable.Queries do
   # job reaches the executor; `:slot` is the opaque handle the limiter returns for an admitted
   # gated row (backend-defined — PG `{key, shard}`, Redis `{key, id}`), `nil` otherwise.
   defp claimed_row(
-         [id, fsm, fsm_version, step, state, attempt, concurrency_key, awaits, gated, rate_limit,
-          weight],
+         [
+           id,
+           fsm,
+           fsm_version,
+           step,
+           state,
+           attempt,
+           concurrency_key,
+           awaits,
+           gated,
+           rate_limit,
+           weight
+         ],
          worker
        ) do
     %{
@@ -654,6 +664,96 @@ defmodule GenDurable.Queries do
 
     committed?(n)
   end
+
+  # INLINE CONTINUATION (run-ahead): commit the `:next` transition WITHOUT leaving
+  # `executing` — the same worker keeps the claim and runs the next step in place,
+  # skipping the requeue → re-pick round-trip. Durability is unchanged: the next
+  # step's state is committed here, before that step runs; a crash re-runs it via the
+  # reaper exactly as a requeued `:next` would. Same ownership guard as every outcome
+  # (`locked_by = $worker AND status = 'executing'`): an orphaned chained task whose
+  # lease expired commits nothing (`:stale`) — critically, this guarded commit runs
+  # BEFORE the executor calls the (unguarded) out-of-band `Limiter.admit`, so an orphan
+  # never debits/stamps a row a new claimant now owns.
+  #
+  # Concurrency handoff between steps (the executor computed the directives):
+  #   * `set_key`   — false keeps the current `concurrency_key` (`:keep`); true sets it
+  #                   to `key_value` (a new key, or NULL to release).
+  #   * `set_shard` — false keeps the current shard; true sets it to `shard_value`:
+  #                     NULL — release / unconfigured new key (re-enters the K=1 arbiter;
+  #                            a unique violation here means the key is taken → `:contended`,
+  #                            and the executor requeues through the picker), or
+  #                     0    — provisional for a CONFIGURED new key (non-null ⇒ out of the
+  #                            K=1 index); the real shard is stamped by the subsequent
+  #                            `Limiter.admit`, mirroring the claim path.
+  # The lease is extended so a long inline chain never relies solely on the heartbeat.
+  def continue_next(
+        repo,
+        id,
+        worker,
+        step,
+        state_json,
+        consumed_ids,
+        rate_limit,
+        weight,
+        set_key,
+        key_value,
+        set_shard,
+        shard_value,
+        lease_ttl_ms
+      ) do
+    %{rows: [[n]]} =
+      q!(
+        repo,
+        "continue_next",
+        """
+        WITH committed AS (
+          UPDATE gen_durable
+          SET step = $2, state = $3::text::jsonb, status = 'executing', eligible_at = now(),
+              attempt = 0, awaits = null, rate_limit = $5, weight = $6,
+              concurrency_key = CASE WHEN $8::bool THEN $9 ELSE concurrency_key END,
+              concurrency_shard = CASE WHEN $10::bool THEN $11 ELSE concurrency_shard END,
+              lease_expires_at = now() + $12::int * interval '1 millisecond', updated_at = now()
+          WHERE id = $1 AND locked_by = $7 AND status = 'executing'
+          RETURNING id
+        ),
+        consumed AS (
+          DELETE FROM signals
+          WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
+        )
+        SELECT count(*) FROM committed
+        """,
+        [
+          id,
+          step,
+          state_json,
+          consumed_ids,
+          rate_limit,
+          weight,
+          worker,
+          set_key,
+          key_value,
+          set_shard,
+          shard_value,
+          lease_ttl_ms
+        ]
+      )
+
+    committed?(n)
+  rescue
+    e in Postgrex.Error ->
+      # An unconfigured new concurrency_key that another executing row already holds trips
+      # the K=1 arbiter (gen_durable_concurrency_active). The whole statement rolls back —
+      # nothing committed — so the executor falls back to a normal requeue (`complete_next`)
+      # and the picker arbitrates the key, exactly as a first pick would.
+      if is_map(e.postgres) && e.postgres[:constraint] == "gen_durable_concurrency_active",
+        do: :contended,
+        else: reraise(e, __STACKTRACE__)
+  end
+
+  # Reload the signal inbox and children snapshot for already-claimed jobs — the same
+  # batched enrichment the pick runs, exposed for the inline-continuation path (a run-ahead
+  # step gets a fresh snapshot, identical to what a re-pick would hand it).
+  def enrich_jobs(repo, jobs), do: enrich(repo, jobs)
 
   # :retry redoes the same step, so it consumes nothing and KEEPS `awaits` — the
   # redo must see the same awaited signals it was handed. The gate slot is

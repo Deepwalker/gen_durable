@@ -135,6 +135,37 @@ is **credited out-of-band**: the executor calls `Limiter.credit/2` after a *comm
 failed guard); a crash between commit and credit leaks the slot in the safe direction
 (under-admission), healed by the reconciler.
 
+### Inline continuation — `continue_next`, the run-ahead commit
+
+An `inline_execution:` FSM's `:next` does **not** leave `executing`. `continue_next` is the
+same guarded head (`WHERE id = $1 AND locked_by = $worker AND status = 'executing'`) but
+commits the next step/state while the row **stays `executing` under the same worker** and
+extends the lease — so the executor runs the next step in the same task, skipping the requeue
+→ re-pick round-trip. Durability is identical to a requeued `:next`: the next state is
+committed before that step runs; a crash re-runs it via the reaper.
+
+The concurrency handoff between steps is what the extra parameters drive:
+
+| Next `concurrency_key` | `continue_next` sets | Admission (out-of-band, AFTER the commit) |
+|---|---|---|
+| `:keep` (default) | nothing — same key/shard/slot held across the step | none (still holding the slot) |
+| `nil` (release) | `concurrency_key` = NULL, `concurrency_shard` = NULL | none; the old slot is credited |
+| configured new key | key = new, shard = **provisional 0** (out of the K=1 index) | `Limiter.admit` debits the bucket, **stamps the real shard**, draws the slot; old slot credited |
+| unconfigured new key | key = new, shard = NULL (re-enters the K=1 arbiter) | none; a `gen_durable_concurrency_active` violation ⇒ **`:contended`**, the row requeues and the picker serializes the key; old slot credited |
+
+**Ordering is a correctness invariant, not a preference.** The guarded `continue_next` runs
+**before** `Limiter.admit`, because the PG limiter's admit `stamp`s `concurrency_shard` by id
+**unguarded** by `locked_by`. If an orphaned chained task (its lease expired, its row
+reclaimed) reached admit, that stamp would land on a row a new claimant owns — corrupting its
+shard and, for an unconfigured key, dropping it out of the K=1 index (breaking exclusion). By
+committing first, an orphan fails the guard (`:stale`) and never admits. If admit then denies
+(rate token unaffordable / configured slot full), the row is requeued through the normal
+outcome path and the picker admits it — inline never over-runs a limit.
+
+A slot that changed mid-chain is reported to the scheduler (`{:slot_swap, id, slot}`) so the
+heartbeat's `Limiter.renew` bumps the **current** slot; a lease-native backend (Redis) would
+otherwise prune a slot it stops hearing about and double-book the key.
+
 ### Signals — `deliver_signal`, one statement
 
 `target` (resolve an id or a `correlation_guard` among live instances) → `ins` (inbox

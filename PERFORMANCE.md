@@ -48,6 +48,29 @@ Round-trips, not query execution time, dominate: every statement below executes 
 (~0.3–1 ms across hosts). The cost is the count of hops, which is why collapsing the
 outcome from 4 hops to 1 matters more than any single statement's plan.
 
+### 1.1 Inline execution (run-ahead) — trading the re-pick for a held claim
+
+With `use GenDurable.FSM, inline_execution: true`, a `:next` step does not go back through
+the picker. The step transition and the next step run **in the same worker task**, on the
+claim already held:
+
+| Phase (chained step) | Statements | Notes |
+|---|---|---|
+| **`continue_next`** | 1 | guarded commit that keeps the row `executing` (durability unchanged) |
+| **enrich** | 2 | the same batched inbox + children loads a re-pick would run — a fresh snapshot |
+| **`Limiter.admit`** | 0 or 1 | only when the next step is rate-limited or adopts a *configured* concurrency key |
+
+So a chained step is **~3 round-trips (+1 when admitting)** — but it **skips the pick's claim
+scan, the requeue write, and the task respawn** entirely. The claim scan (§2) is the
+expensive statement on the hot path (index scan + `SKIP LOCKED` + K=1 window), so avoiding it
+per step is the win, even though the enrich loads are still paid (they keep the run-ahead
+step's `ctx.all`/`ctx.childs` identical to what a re-pick would hand it). `concurrency_key:
+:keep` — the default — needs no admit round-trip at all: the instance holds its one slot
+across the whole chain. This is **opt-in and default-off**, so the §1 statement counts and
+the `test/perf_test.exs` pick/outcome assertions are unchanged; the chained-step counts are
+guarded separately there. The tradeoff — a chain doesn't re-check priority until it yields —
+is in `ISSUES.md`.
+
 ---
 
 ## 2. The picker (the one query that must scale)

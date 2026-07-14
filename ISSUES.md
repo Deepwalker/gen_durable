@@ -634,6 +634,50 @@ queue. (Related: pathology #4 above — denied rows occupying the pick window's 
 directly addressable and timing assertions are flaky; the state-machine invariant (a second
 poke while `poke_timer != nil` arms no second timer) is read-verified only.
 
+## Design additions (feature review)
+
+### 28. Inline execution (run-ahead) — the design and its deliberately-taken tradeoffs
+
+**Status: NOTED (feature; the tradeoffs below are accepted and documented, not bugs).**
+`inline_execution:` lets a `:next` run the next step in the same worker task (guarded
+`continue_next` keeps the row `executing`) instead of requeuing through the picker. Three
+non-obvious hazards were closed by design; two residual tradeoffs are accepted.
+
+**Closed — orphan corrupts a live claimant via the unguarded admit stamp.** The PG limiter's
+`admit` `stamp`s `concurrency_shard` by id **without** a `locked_by` guard (limiter/postgres.ex,
+`stamp` CTE). If a mid-chain admit ran from an orphaned task (lease expired, row reclaimed by a
+new worker), that stamp would overwrite the new claimant's shard — and for an unconfigured key,
+a non-null shard drops the row out of the `gen_durable_concurrency_active` index, **breaking
+K=1 exclusion**. Closed by ordering: the guarded `continue_next` commits FIRST and re-proves
+ownership; an orphan fails the guard (`:stale`) and never reaches admit. Verified: engine +
+queries tests (`:stale` path), and the ordering is asserted in the executor's structure.
+
+**Closed — Redis slot pruned mid-chain on a key change.** The scheduler renews held slots from
+its `in_flight` map on the heartbeat; a chained step that swaps the concurrency slot (a new
+key) would leave the new slot unrenewed → a lease-native backend prunes it → the key
+double-books. Closed by the executor sending `{:slot_swap, id, slot}`; the scheduler tracks the
+current slot. (`:keep`, the common case, never swaps.)
+
+**Closed — unconfigured-key contention mid-chain.** A new unconfigured key already held by
+another executing row trips the K=1 unique index inside `continue_next`; caught as `:contended`,
+the whole statement rolls back and the row requeues so the picker's arbiter serializes it —
+identical to a first pick losing the K=1 race. Deterministically tested (`queries_test.exs`).
+
+**NOTED — priority staleness across a chain.** An inline FSM holds one executor slot and runs
+its steps back-to-back without the picker re-evaluating `(priority, eligible_at)` between them,
+so a higher-priority row that arrives mid-chain waits until the chain yields (a terminal/await/
+retry outcome, a denied token, or a step with `inline_execution: false`). Accepted: inline is
+opt-in per FSM, and a boundary step (`inline_execution: false`) is the explicit yield lever.
+Triggering condition to revisit: an inline FSM with long `:next` chains sharing a queue with
+latency-sensitive higher-priority work — cap chain length (a `run_ahead: N` bound) if it bites.
+
+**NOTED — rate-token leak on a mid-chain `:stale`.** The rate token is admitted after the
+guarded `continue_next` but the token debit is not itself rolled back if a later step's commit
+goes `:stale`; the token leaks in the safe direction (throughput slightly under budget) and
+refills by time. This is the same leak-on-crash the out-of-band admit already has (0.2.9); a
+mid-chain `:stale` requires the lease to expire *during* a step, which is already a degenerate
+(scheduler-dead) case. Not worth a rollback round-trip.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

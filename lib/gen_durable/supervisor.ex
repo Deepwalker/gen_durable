@@ -151,6 +151,11 @@ defmodule GenDurable.Supervisor do
       registry: GenDurable.Registry.new(Keyword.fetch!(opts, :fsms)),
       lease_ttl_ms: Keyword.fetch!(opts, :lease_ttl),
       rate_limit_names: MapSet.new(rate_configs, & &1.name),
+      # Which concurrency-key names are CONFIGURED (have a `conc` bucket). Lets the
+      # executor route an inline step's new concurrency_key: a configured name is
+      # admitted out-of-band via the limiter, an unconfigured one rides the in-band
+      # K=1 arbiter. See `GenDurable.Executor`.
+      concurrency_limit_names: MapSet.new(conc_configs, & &1.name),
       poke: poke,
       # origin tag for cross-node pokes: lets a subscriber drop messages this
       # VM published (its schedulers were already poked directly)

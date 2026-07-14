@@ -7,12 +7,14 @@ for the *why* and the exact mechanics follow the pointers in [Going deeper](#goi
 ## Mental model in one paragraph
 
 An FSM instance is a **row**, not a process. `insert` writes a `runnable` row; a per-queue
-**Scheduler** claims it (`runnable → executing`, leased), an ephemeral **Task** runs one
+**Scheduler** claims it (`runnable → executing`, leased), an ephemeral **Task** runs a
 `step/2`, and the **outcome** commits the next state (`→ runnable`/`awaiting_*`/`done`/`failed`)
 **before** execution proceeds — that commit is the durability guarantee. A crash before it
-re-runs the step (at-least-once). Everything else — leases + reaper, the K=1 unique arbiter,
-out-of-band rate/concurrency admission, signals, await, fan-out — exists to make that loop
-correct and fast under concurrency and node death.
+re-runs the step (at-least-once). (An `inline_execution:` FSM's Task may run several `:next`
+steps back-to-back on the same claim — each still commits before the next runs.) Everything
+else — leases + reaper, the K=1 unique arbiter, out-of-band rate/concurrency admission,
+signals, await, fan-out — exists to make that loop correct and fast under concurrency and node
+death.
 
 ## Module map (`lib/gen_durable/`)
 
@@ -21,7 +23,7 @@ correct and fast under concurrency and node death.
 | `GenDurable` (`gen_durable.ex`) | Public API: `insert`/`insert_all`/`await`/`signal`/`child_spec`; builds insert params; fires pokes. |
 | `Supervisor` (`supervisor.ex`) | Engine supervisor. Parses opts, builds the `config` (into `:persistent_term` `{GenDurable, name}`), seeds limiter policy, starts the per-node component tree. **Start here to see what runs.** |
 | `Scheduler` (`scheduler.ex`) | Per-queue feeder+executor loop. Claims into a small buffer, spawns ≤`concurrency` Tasks, heartbeats claimed rows, discovers work by poke/poll, drains on shutdown. |
-| `Executor` (`executor.ex`) | Runs one picked job: resolve FSM → load state → `step/2` (guarded) → apply outcome → credit the limiter slot → poke downstream wakes. |
+| `Executor` (`executor.ex`) | Runs one picked job: resolve FSM → load state → `step/2` (guarded) → apply outcome → credit the limiter slot → poke downstream wakes. With `inline_execution:`, loops a `:next` into the next step in the SAME task (guarded `continue_next` + out-of-band admit) instead of requeuing. |
 | `Queries` (`queries.ex`) | **Every SQL statement, one function each.** The pick (`@claim_sql`), the `complete_*` outcomes, heartbeat/reap/reclaim, GC + bucket reconcile, insert/signal. The single largest and most invariant-dense file. |
 | `Limiter` (`limiter.ex`) | Behaviour + dispatch for **out-of-band admission** of configured limits: `admit`/`credit`/`renew`/`sync_config`/`reconcile`. A limiter is a `{module, handle}`. |
 | `Limiter.Postgres` (`limiter/postgres.ex`) | Default backend: the sharded `gen_durable_buckets` admission math (`@admit_sql`), as standalone statements over the claimed batch. |
@@ -88,6 +90,15 @@ coexist and the public API resolves the right one.
   out-of-band — see below) → an `Executor` Task runs `step/2` → a `complete_*` outcome commits
   the next state under the ownership guard (`locked_by` + `executing`) and credits the limiter
   slot → downstream pokes fire.
+- **Inline execution (run-ahead).** For an `inline_execution:` FSM, a `:next` doesn't requeue:
+  the Executor commits the next state with `continue_next` (KEEPS the row `executing`, same
+  claim — same guard, durability unchanged) and runs the next step in the same task. The
+  guarded commit runs FIRST so it re-proves ownership before the (unguarded) out-of-band
+  admit; then `Limiter.admit` secures the next step's rate token / configured concurrency slot
+  (an unconfigured new key rides the K=1 arbiter inside `continue_next` itself). Denied ⇒ the
+  row requeues and the picker admits it — inline is a fast path, not a semantic change. A
+  changed slot is reported to the scheduler (`{:slot_swap, …}`) so the heartbeat renews the
+  right one.
 - **Limiter (configured rate/concurrency).** The pick claims candidates lock-light, then
   `Limiter.admit/2` decides who runs (debiting tokens / taking slots) as a separate statement;
   denied rows are released back to `runnable`. On outcome, `Limiter.credit/2` returns the slot;

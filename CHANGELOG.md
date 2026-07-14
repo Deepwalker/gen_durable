@@ -6,6 +6,40 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.10
+
+### Added
+- **Inline execution (run-ahead): `use GenDurable.FSM, inline_execution: true`.** A `:next`
+  outcome can now run the next step **in the same worker task**, holding the same claim,
+  instead of committing the row back to `runnable` and paying a full re-pick (claim scan +
+  admit + enrich + task respawn) between every step. It's opt-in per FSM, and a single
+  `:next` may override the default with `inline_execution: true|false` in its opts (mark a
+  boundary step to requeue even in an inline FSM, or force one transition inline).
+
+  This leans on the out-of-band limiter (0.2.9): before running the next step the executor
+  secures its tokens as separate statements — a rate token via `Limiter.admit`, a slot for a
+  **configured** new `concurrency_key` via `Limiter.admit`, and an **unconfigured** new key
+  in-band through the K=1 arbiter (the guarded `continue_next` commit itself). If any is
+  denied, the row is requeued and the picker admits it exactly as before — inline is a fast
+  path, never a semantic change. `concurrency_key: :keep` (the default) holds the same slot
+  across steps with no admission round-trip.
+
+  **Hot-path cost.** A chained step is one guarded `continue_next` (keeps the row
+  `executing`, commits the next state — durability unchanged) plus the two batched enrich
+  loads (a fresh inbox/children snapshot, identical to a re-pick), and one `Limiter.admit`
+  only when the step is rate-limited or adopts a configured key. It skips the pick's claim
+  scan, the requeue write, and the task respawn. Default-off, so existing pick/outcome
+  statement counts are unchanged; see `test/perf_test.exs` and `PERFORMANCE.md`.
+
+  **Ordering (correctness).** The guarded `continue_next` runs **before** `Limiter.admit`:
+  the guard re-proves ownership, so an orphaned chained task (lease expired, row reclaimed)
+  commits nothing (`:stale`) and never reaches the unguarded admit — which stamps
+  `concurrency_shard` by id and would otherwise corrupt a new claimant's row and break K=1.
+  A changed slot is reported to the scheduler (`{:slot_swap, …}`) so its heartbeat renews
+  the current slot (a lease-native limiter would prune one it stops hearing about).
+  See `ISSUES.md` for the tradeoffs (priority staleness across a chain; the rate-token leak
+  on a mid-chain `:stale`).
+
 ## 0.2.9
 
 ### Changed

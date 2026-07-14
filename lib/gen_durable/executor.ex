@@ -10,6 +10,14 @@ defmodule GenDurable.Executor do
   *crash* (a bare `exit`, a kill — no return at all) is **not** handled here —
   it is the reaper's job, the at-least-once safety floor.
 
+  Inline execution (run-ahead): an `inline_execution:` FSM's `:next` runs the
+  next step in THIS task on the same claim instead of requeuing — a guarded
+  `continue_next` commit (keeps the row `executing`; durability unchanged) then
+  an out-of-band `Limiter.admit` for the next step's tokens; denied ⇒ the row
+  requeues and the picker admits it. The chained step gets a fresh inbox/children
+  snapshot (re-enriched per step), so its `ctx` matches what a re-pick would hand
+  it. Disabled when `run/3`'s `sched` is `nil` (the `Testing.drain/1` path).
+
   Signal consumption: a step sees the awaited subset as `ctx.awaited`
   (only the signals whose name is in the set it parked on) and the whole inbox as
   `ctx.all`. On a progressing outcome the engine deletes exactly the `ctx.awaited`
@@ -28,38 +36,31 @@ defmodule GenDurable.Executor do
 
   @doc """
   Execute `job` (a map returned by `Queries.pick/5`). `config` is `%{repo: ...}`.
-  Returns the outcome tuple in its serialized (DB-ready) form.
+  Returns the last committed outcome tuple in its serialized (DB-ready) form.
+
+  `sched` is the scheduler pid (for the inline-continuation slot handoff); `nil` — the
+  `Testing.drain/1` path — disables inline chaining, so each `run/2` commits exactly one
+  step, as before.
   """
-  def run(config, job) do
-    repo = config.repo
+  def run(config, job), do: run(config, job, nil)
+
+  def run(config, job, sched) do
     # Deliberately OUTSIDE the guarded region: an unresolvable fsm here is most
     # likely a rolling deploy (this node does not know the module yet — another
     # node does), so the right move is the crash path (lease floor, re-pick
     # elsewhere), not a terminal :stop that would lose the instance.
     module = Registry.fetch!(config.registry, job.fsm, job.fsm_version)
     state_module = module.__gd_state__()
+    run_step(config, job, module, state_module, sched)
+  end
 
-    state = State.from_db(state_module, job.state)
-    all = job.signals
-    awaits = job.awaits || []
-
-    ctx = %Context{
-      id: job.id,
-      fsm: job.fsm,
-      fsm_version: job.fsm_version,
-      step: job.step,
-      attempt: job.attempt,
-      state: state,
-      # awaited: the subset the step's await named (delivered + consumed on progress
-      # by these exact ids); all: the full inbox, for the raw case.
-      awaited: Enum.filter(all, &(&1.name in awaits)),
-      all: all,
-      childs: job.childs
-    }
+  # Run one step to a committed outcome; on an inline `:next` continuation, loop into the
+  # next step in THIS worker (no requeue, no re-pick) with the same claim held.
+  defp run_step(config, job, module, state_module, sched) do
+    ctx = build_ctx(job, state_module)
 
     started = System.monotonic_time()
     {outcome, consumed} = invoke(module, state_module, ctx)
-    apply_outcome(config, repo, job, outcome, consumed)
     warn_unknown_rate_limit(config, job, outcome)
 
     :telemetry.execute(
@@ -68,7 +69,250 @@ defmodule GenDurable.Executor do
       %{id: job.id, fsm: job.fsm, step: job.step, kind: Outcome.kind(outcome)}
     )
 
-    outcome
+    case maybe_continue(config, job, outcome, consumed, module, sched) do
+      {:continue, next_job} -> run_step(config, next_job, module, state_module, sched)
+      :done -> outcome
+    end
+  end
+
+  defp build_ctx(job, state_module) do
+    all = job.signals
+    awaits = job.awaits || []
+
+    %Context{
+      id: job.id,
+      fsm: job.fsm,
+      fsm_version: job.fsm_version,
+      step: job.step,
+      attempt: job.attempt,
+      state: State.from_db(state_module, job.state),
+      # awaited: the subset the step's await named (delivered + consumed on progress
+      # by these exact ids); all: the full inbox, for the raw case.
+      awaited: Enum.filter(all, &(&1.name in awaits)),
+      all: all,
+      childs: job.childs
+    }
+  end
+
+  # --- inline continuation (run-ahead) ---------------------------------------
+  #
+  # A `:next` whose FSM (or this transition's opts) enables `inline_execution` tries to run
+  # the next step in place. The commit that keeps the row `executing` (`continue_next`) is
+  # GUARDED and runs FIRST — it doubles as the ownership proof, so the subsequent (unguarded,
+  # out-of-band) `Limiter.admit` can never fire from an orphaned task onto a row a new
+  # claimant owns. If the next step's rate/concurrency tokens can't be secured, the row is
+  # requeued and the picker takes it — the same admission arithmetic, just not inline.
+  # Everything else (terminal, await, retry, schedule_childs, or a `:next` with inlining off)
+  # commits through the normal `apply_outcome` path. `sched == nil` (Testing) never inlines.
+
+  defp maybe_continue(
+         config,
+         job,
+         {:next, step, state_json, opts} = outcome,
+         consumed,
+         module,
+         sched
+       )
+       when is_pid(sched) do
+    if inline?(opts, module) do
+      attempt_inline(config, job, step, state_json, opts, consumed, sched, outcome)
+    else
+      apply_outcome(config, config.repo, job, outcome, consumed)
+      :done
+    end
+  end
+
+  defp maybe_continue(config, job, outcome, consumed, _module, _sched) do
+    apply_outcome(config, config.repo, job, outcome, consumed)
+    :done
+  end
+
+  defp inline?(%{inline_execution: nil}, module), do: module.__gd_inline_execution__()
+  defp inline?(%{inline_execution: flag}, _module), do: flag
+
+  defp attempt_inline(config, job, step, state_json, opts, consumed, sched, outcome) do
+    plan = conc_plan(opts.concurrency_key, job, config)
+
+    # Phase 1: guarded commit that KEEPS the row executing (durability + ownership proof).
+    case Queries.continue_next(
+           config.repo,
+           job.id,
+           job.worker,
+           step,
+           state_json,
+           consumed,
+           opts.rate_limit,
+           opts.weight,
+           plan.set_key,
+           plan.key_value,
+           plan.set_shard,
+           plan.shard_value,
+           config.lease_ttl_ms
+         ) do
+      :stale ->
+        # Lease expired mid-step and the row was reclaimed — drop, the new claimant redoes
+        # it (at-least-once), exactly like a stale outcome. Nothing admitted yet, nothing leaks.
+        emit_stale(job, outcome)
+        :done
+
+      :contended ->
+        # An unconfigured new concurrency_key is already held — requeue and let the picker's
+        # K=1 arbiter serialize it. Nothing committed by continue_next (it rolled back).
+        emit_yield(job, outcome, :contended)
+        apply_outcome(config, config.repo, job, outcome, consumed)
+        :done
+
+      :ok ->
+        finish_inline(config, job, step, state_json, opts, consumed, plan, sched, outcome)
+    end
+  end
+
+  # Phase 2: secure the next step's tokens out-of-band. The guarded commit already landed, so
+  # `Limiter.admit` is safe (we still own the row). Denied ⇒ requeue (executing → runnable via
+  # the normal outcome path, which also credits the old slot). Admitted ⇒ hand off and loop.
+  defp finish_inline(config, job, step, state_json, opts, consumed, plan, sched, outcome) do
+    case admit_inline(config, job, plan, opts) do
+      :denied ->
+        emit_yield(job, outcome, :throttled)
+        apply_outcome(config, config.repo, job, outcome, consumed)
+        :done
+
+      {:admitted, new_slot} ->
+        # Return the old concurrency slot iff the key actually changed (a `:keep` chain holds
+        # the same slot across steps — crediting it would double-count).
+        if plan.credit_old and not is_nil(job.slot),
+          do: GenDurable.Limiter.credit(config.limiter, [job.slot])
+
+        # Keep the scheduler's in-flight slot current so its heartbeat renews the RIGHT slot
+        # (a lease-native backend prunes an unrenewed one). Only when it changed.
+        if new_slot != job.slot, do: send(sched, {:slot_swap, job.id, new_slot})
+
+        emit_continue(job, outcome)
+        {:continue, build_next_job(config.repo, job, step, state_json, plan, new_slot)}
+    end
+  end
+
+  # Call the limiter only when the next step actually needs a token: a fresh rate token, or a
+  # slot for a CONFIGURED new concurrency key. `:keep`, a key release, and an unconfigured new
+  # key (K=1, handled in-band by continue_next) need no admission.
+  defp admit_inline(config, job, plan, opts) do
+    rate = if opts.rate_limit, do: {opts.rate_limit, opts.weight}
+
+    if is_nil(rate) and is_nil(plan.admit_conc) do
+      {:admitted, resolve_slot(plan, job, nil)}
+    else
+      entry = %{id: job.id, conc: plan.admit_conc, rate: rate}
+      %{admitted: admitted, denied: denied} = GenDurable.Limiter.admit(config.limiter, [entry])
+
+      if denied == [] do
+        {:admitted, resolve_slot(plan, job, admitted |> Map.new() |> Map.get(job.id))}
+      else
+        :denied
+      end
+    end
+  end
+
+  # The slot the NEXT step will hold: keep the current one, none, or the one admit just drew.
+  defp resolve_slot(%{new_slot: :keep}, job, _admitted), do: job.slot
+  defp resolve_slot(%{new_slot: :none}, _job, _admitted), do: nil
+  defp resolve_slot(%{new_slot: :from_admit}, _job, admitted), do: admitted
+
+  # Directives for `continue_next` + admission, from the next step's `concurrency_key`:
+  #   :keep — hold the current key/shard/slot, admit nothing.
+  #   nil   — release the key (clear key + shard), credit the old slot, admit nothing.
+  #   configured new key — set key + PROVISIONAL shard (out of K=1); admit stamps the real
+  #                        shard and draws the slot; credit the old one.
+  #   unconfigured new key — set key + NULL shard (re-enters the K=1 arbiter, enforced by
+  #                          continue_next); no slot, credit the old one.
+  defp conc_plan(:keep, _job, _config),
+    do: %{
+      set_key: false,
+      key_value: nil,
+      set_shard: false,
+      shard_value: nil,
+      admit_conc: nil,
+      credit_old: false,
+      new_slot: :keep
+    }
+
+  defp conc_plan(nil, _job, _config),
+    do: %{
+      set_key: true,
+      key_value: nil,
+      set_shard: true,
+      shard_value: nil,
+      admit_conc: nil,
+      credit_old: true,
+      new_slot: :none
+    }
+
+  defp conc_plan(key, _job, config) when is_binary(key) do
+    name = key |> String.split(":", parts: 2) |> hd()
+
+    if MapSet.member?(config.concurrency_limit_names, name) do
+      %{
+        set_key: true,
+        key_value: key,
+        set_shard: true,
+        shard_value: 0,
+        admit_conc: key,
+        credit_old: true,
+        new_slot: :from_admit
+      }
+    else
+      %{
+        set_key: true,
+        key_value: key,
+        set_shard: true,
+        shard_value: nil,
+        admit_conc: nil,
+        credit_old: true,
+        new_slot: :none
+      }
+    end
+  end
+
+  # The next step's job: same claim (id/worker), new step/state/slot/key, attempt reset, and a
+  # FRESH inbox/children snapshot — identical to what a re-pick would have handed the step.
+  defp build_next_job(repo, job, step, state_json, plan, new_slot) do
+    next_key = if plan.set_key, do: plan.key_value, else: job.concurrency_key
+
+    base = %{
+      job
+      | step: step,
+        state: state_json,
+        attempt: 0,
+        awaits: [],
+        slot: new_slot,
+        concurrency_key: next_key
+    }
+
+    [enriched] = Queries.enrich_jobs(repo, [base])
+    enriched
+  end
+
+  defp emit_continue(job, outcome) do
+    :telemetry.execute(
+      [:gen_durable, :run_ahead, :continue],
+      %{count: 1},
+      %{id: job.id, fsm: job.fsm, from: job.step, to: elem(outcome, 1)}
+    )
+  end
+
+  defp emit_yield(job, outcome, reason) do
+    :telemetry.execute(
+      [:gen_durable, :run_ahead, :yield],
+      %{count: 1},
+      %{id: job.id, fsm: job.fsm, step: job.step, to: elem(outcome, 1), reason: reason}
+    )
+  end
+
+  defp emit_stale(job, outcome) do
+    :telemetry.execute(
+      [:gen_durable, :outcome, :stale],
+      %{count: 1},
+      %{id: job.id, fsm: job.fsm, step: job.step, kind: Outcome.kind(outcome)}
+    )
   end
 
   # A `:next` naming a rate-limit whose name has no configured policy: the row

@@ -971,4 +971,84 @@ defmodule GenDurable.EngineTest do
       GenDurable.insert(GenDurable.Test.Counter, state: %{target: 1}, name: Nope)
     end
   end
+
+  describe "inline execution (run-ahead)" do
+    test "chains :next steps in ONE worker task — no requeue, no re-pick" do
+      start_supervised!(agent_spec(GenDurable.Test.InlineAgent, fn -> [] end))
+      attach_telemetry([[:gen_durable, :run_ahead, :continue]])
+      start_engine()
+
+      {:ok, id} = GenDurable.insert(GenDurable.Test.InlineChain)
+      assert wait_status(id, "done").result == %{"ok" => true}
+
+      recorded = Agent.get(GenDurable.Test.InlineAgent, & &1)
+      assert Enum.map(recorded, &elem(&1, 0)) == ["a", "b", "c"]
+
+      pids = recorded |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+      assert length(pids) == 1, "expected all steps in one task, got: #{inspect(pids)}"
+
+      assert_receive {:telemetry, [:gen_durable, :run_ahead, :continue], _, %{from: "a", to: "b"}}
+      assert_receive {:telemetry, [:gen_durable, :run_ahead, :continue], _, %{from: "b", to: "c"}}
+    end
+
+    test "a step opting out with inline_execution: false requeues through the picker" do
+      attach_telemetry([[:gen_durable, :run_ahead, :continue]])
+      start_engine()
+
+      {:ok, id} = GenDurable.insert(GenDurable.Test.InlineBoundary)
+      assert wait_status(id, "done").result == %{"ok" => true}
+
+      # "b"→"c" chained inline; "a"→"b" did NOT (the opt-out forced a requeue).
+      assert_receive {:telemetry, [:gen_durable, :run_ahead, :continue], _, %{from: "b", to: "c"}}
+      refute_received {:telemetry, [:gen_durable, :run_ahead, :continue], _, %{from: "a"}}
+    end
+
+    test "draws a rate token per chained step when the limit affords it" do
+      start_engine(rate_limits: [tight: [allowed: 100, period: 1, burst: 100]])
+      {:ok, id} = GenDurable.insert(GenDurable.Test.InlineRate, state: %{"w" => 1})
+      assert wait_status(id, "done").result == %{"ok" => true}
+    end
+
+    test "yields to the picker when the next step's rate token is unaffordable" do
+      attach_telemetry([[:gen_durable, :run_ahead, :yield]])
+      start_engine(rate_limits: [tight: [allowed: 1, period: 60, burst: 1]])
+
+      # step "b" wants weight 5 of a burst-1 bucket → never admits (inline OR via the picker).
+      {:ok, id} = GenDurable.insert(GenDurable.Test.InlineRate, state: %{"w" => 5})
+
+      assert_receive {:telemetry, [:gen_durable, :run_ahead, :yield], _, %{reason: :throttled}},
+                     2_000
+
+      # It stays parked at "b" (throttled), never reaching :done.
+      Process.sleep(300)
+      row = status(id)
+      assert row.status in ["runnable", "executing"]
+      assert %{rows: [["b"]]} = Repo.query!("SELECT step FROM gen_durable WHERE id = $1", [id])
+    end
+
+    test "adopting a CONFIGURED concurrency_key inline draws a slot and credits it back" do
+      # gc off, so the credit is what restores the bucket — not the reconciler masking a leak.
+      start_engine(gc: false, concurrency_limits: [pool: [limit: 2]])
+      {:ok, id} = GenDurable.insert(GenDurable.Test.InlineConc, state: %{"key" => "pool:x"})
+      assert wait_status(id, "done").result == %{"ok" => true}
+
+      eventually(fn ->
+        %{rows: rows} =
+          Repo.query!(
+            "SELECT capacity, available FROM gen_durable_buckets WHERE kind='conc' AND key='pool:x'"
+          )
+
+        case rows do
+          [[cap, avail]] when cap == avail -> {:ok, true}
+          _ -> :retry
+        end
+      end)
+    end
+
+    test "adopting an UNCONFIGURED concurrency_key inline chains under the K=1 arbiter" do
+      start_engine()
+      {:ok, id} = GenDurable.insert(GenDurable.Test.InlineConc, state: %{"key" => "lock:solo"})
+      assert wait_status(id, "done").result == %{"ok" => true}
+    end
+  end
 end

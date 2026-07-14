@@ -113,6 +113,65 @@ defmodule GenDurable.PerfTest do
     assert hd(sql) =~ "consumed AS"
   end
 
+  test "continue_next (inline run-ahead commit) is a single statement" do
+    id = setup_executing()
+
+    sql =
+      statements(fn ->
+        Queries.continue_next(
+          Repo,
+          id,
+          "w",
+          "next",
+          ~s({"n":1}),
+          [],
+          nil,
+          1,
+          false,
+          nil,
+          false,
+          nil,
+          60_000
+        )
+      end)
+
+    assert length(sql) == 1
+    assert hd(sql) =~ "committed AS"
+  end
+
+  test "an inline chained step is continue_next + one batched enrich (2 loads), no claim scan" do
+    id = setup_executing()
+
+    # The re-enrich a run-ahead step runs to refresh its inbox/children snapshot — the same
+    # 2 batched loads the pick uses, and NOT the claim scan. So a chained step is 1 + 2 = 3
+    # statements (plus one Limiter.admit only when the step is rate-limited or adopts a
+    # configured concurrency key), vs a full re-pick (claim + admit + 2 loads) plus the
+    # requeue write and task respawn it avoids.
+    commit =
+      statements(fn ->
+        Queries.continue_next(
+          Repo,
+          id,
+          "w",
+          "next",
+          ~s({"n":1}),
+          [],
+          nil,
+          1,
+          false,
+          nil,
+          false,
+          nil,
+          60_000
+        )
+      end)
+
+    enrich = statements(fn -> Queries.enrich_jobs(Repo, [%{id: id}]) end)
+
+    assert length(commit) == 1
+    assert length(enrich) == 2
+  end
+
   test "complete_retry is a single statement" do
     id = setup_executing()
     assert length(statements(fn -> Queries.complete_retry(Repo, id, "w", ~s({}), 0) end)) == 1

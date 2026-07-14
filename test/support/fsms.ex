@@ -323,10 +323,64 @@ defmodule GenDurable.Test.RateUnknown do
   def step("fin", _ctx), do: {:done, %{}}
 end
 
+defmodule GenDurable.Test.InlineChain do
+  @moduledoc """
+  Inline FSM: three steps back-to-back. Each records `{step, self()}` into `InlineAgent`
+  so a test can prove every step ran in ONE worker task (inline) — no requeue/re-pick.
+  """
+  use GenDurable.FSM, name: "inline_chain", version: 1, initial: "a", inline_execution: true
+
+  @impl true
+  def step(name, %{state: s}) do
+    Agent.update(GenDurable.Test.InlineAgent, &(&1 ++ [{name, self()}]))
+
+    case name do
+      "a" -> {:next, "b", s}
+      "b" -> {:next, "c", s}
+      "c" -> {:done, %{"ok" => true}}
+    end
+  end
+end
+
+defmodule GenDurable.Test.InlineBoundary do
+  @moduledoc """
+  Inline FSM with a per-step opt-out: step `a` forces a requeue (`inline_execution: false`),
+  so only `b`→`c` chains inline (asserted via the `run_ahead` telemetry).
+  """
+  use GenDurable.FSM, name: "inline_boundary", version: 1, initial: "a", inline_execution: true
+
+  @impl true
+  def step("a", %{state: s}), do: {:next, "b", s, inline_execution: false}
+  def step("b", %{state: s}), do: {:next, "c", s}
+  def step("c", _ctx), do: {:done, %{"ok" => true}}
+end
+
+defmodule GenDurable.Test.InlineRate do
+  @moduledoc "Inline FSM whose 2nd step wants `weight` tokens of the `:tight` rate limit."
+  use GenDurable.FSM, name: "inline_rate", version: 1, initial: "a", inline_execution: true
+
+  @impl true
+  def step("a", %{state: s}), do: {:next, "b", s, rate_limit: :tight, weight: Map.get(s, "w", 1)}
+  def step("b", _ctx), do: {:done, %{"ok" => true}}
+end
+
+defmodule GenDurable.Test.InlineConc do
+  @moduledoc "Inline FSM that adopts a NEW `concurrency_key` on its 2nd step (state drives the key)."
+  use GenDurable.FSM, name: "inline_conc", version: 1, initial: "a", inline_execution: true
+
+  @impl true
+  def step("a", %{state: s}), do: {:next, "b", s, concurrency_key: Map.fetch!(s, "key")}
+  def step("b", _ctx), do: {:done, %{"ok" => true}}
+end
+
 defmodule GenDurable.Test.FSMs do
   def all do
     [
       GenDurable.Test.Counter,
+      GenDurable.Test.InlineChain,
+      GenDurable.Test.InlineBoundary,
+      GenDurable.Test.InlineRate,
+      GenDurable.Test.InlineConc,
       GenDurable.Test.RateUnknown,
       GenDurable.Test.MapCounter,
       GenDurable.Test.Awaiter,

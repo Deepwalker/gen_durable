@@ -73,7 +73,11 @@ assert %{done: 1} = drain()
 ## Inline semantics vs the engine
 
 Steps run one at a time in pick order, so `concurrency_key` serialization is trivially
-satisfied. A raise in a step routes to `handle/2` exactly as
+satisfied. This also means `drain/1` does **not** chain an
+[`inline_execution:`](machines.md#inline-execution-run-ahead) FSM's steps in one pass — each
+`:next` is re-picked on the next loop, not run in place. The instance still reaches the same
+committed states and final result (that's what you assert); the run-ahead fast path itself is
+engine behavior, covered by an engine test. A raise in a step routes to `handle/2` exactly as
 in production; a bare `exit` crashes the test process — there is no reaper inline, which
 also means crash-recovery paths (lease expiry, reclaim) are engine behavior you cover with
 an engine test, not inline.

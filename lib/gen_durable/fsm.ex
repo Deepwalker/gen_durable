@@ -68,6 +68,12 @@ defmodule GenDurable.FSM do
       up by convention, so you rarely pass this. Omit both for plain-map state.
     * `:initial` — initial step for `GenDurable.insert/2` (default `"start"`).
     * `:max_attempts` — job retry cap (default `20`). Job form only.
+    * `:inline_execution` — when `true`, a `:next` outcome runs the next step **inline
+      in the same worker** instead of requeuing it through the picker, as long as the
+      next step's rate/concurrency tokens can be secured out-of-band (denied ⇒ it
+      requeues and the picker takes it). Default `false`. A single `:next` may override
+      the FSM default with `inline_execution: true|false` in its opts — e.g. mark a
+      boundary step to requeue even in an inline FSM. See `GenDurable.Executor`.
 
   For the FSM form, `handle/2` defaults to `{:stop, reason}` and is overridable.
   For the job form, both `handle/2` (retry-with-backoff) and `backoff/1` are
@@ -96,6 +102,7 @@ defmodule GenDurable.FSM do
       def __gd_version__, do: Keyword.get(@gd_opts, :version, 1)
       def __gd_queue__, do: Keyword.get(@gd_opts, :queue, "default")
       def __gd_initial__, do: Keyword.get(@gd_opts, :initial, "start")
+      def __gd_inline_execution__, do: Keyword.get(@gd_opts, :inline_execution, false)
     end
   end
 

@@ -461,6 +461,136 @@ defmodule GenDurable.QueriesTest do
     assert state == %{"n" => 1}
   end
 
+  test "continue_next advances the step while KEEPING the row executing and owned" do
+    {:ok, id} = Queries.insert(Repo, params())
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+    # :keep posture — set neither key nor shard.
+    assert :ok =
+             Queries.continue_next(
+               Repo,
+               id,
+               @worker,
+               "next",
+               ~s({"n":1}),
+               [],
+               nil,
+               1,
+               false,
+               nil,
+               false,
+               nil,
+               @ttl
+             )
+
+    %{rows: [[status, step, attempt, state, locked, live]]} =
+      Repo.query!(
+        """
+        SELECT status::text, step, attempt, state, locked_by, lease_expires_at > now()
+        FROM gen_durable WHERE id = $1
+        """,
+        [id]
+      )
+
+    assert status == "executing"
+    assert step == "next"
+    assert attempt == 0
+    assert state == %{"n" => 1}
+    assert locked == @worker
+    assert live == true
+  end
+
+  test "continue_next is guarded — a non-owner gets :stale and commits nothing" do
+    {:ok, id} = Queries.insert(Repo, params())
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+    assert :stale =
+             Queries.continue_next(
+               Repo,
+               id,
+               "intruder",
+               "next",
+               ~s({"n":9}),
+               [],
+               nil,
+               1,
+               false,
+               nil,
+               false,
+               nil,
+               @ttl
+             )
+
+    %{rows: [[step]]} = Repo.query!("SELECT step FROM gen_durable WHERE id = $1", [id])
+    assert step == "tick"
+  end
+
+  test "continue_next releasing the key nulls concurrency_key and shard, and consumes signals" do
+    {:ok, id} = Queries.insert(Repo, params(%{concurrency_key: "lock:x"}))
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+    {:ok, _} = Queries.deliver_signal(Repo, id, "go", ~s({"v":1}), nil)
+    %{rows: [[sig]]} = Repo.query!("SELECT id FROM signals WHERE target_id = $1", [id])
+
+    assert :ok =
+             Queries.continue_next(
+               Repo,
+               id,
+               @worker,
+               "next",
+               ~s({}),
+               [sig],
+               nil,
+               1,
+               true,
+               nil,
+               true,
+               nil,
+               @ttl
+             )
+
+    %{rows: [[key, shard]]} =
+      Repo.query!("SELECT concurrency_key, concurrency_shard FROM gen_durable WHERE id = $1", [id])
+
+    assert key == nil
+    assert shard == nil
+    assert Queries.load_signals(Repo, id) == []
+  end
+
+  test "continue_next onto a held unconfigured key trips K=1 → :contended, nothing committed" do
+    # A holds the unconfigured key, executing.
+    {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "lock:solo"}))
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+    # B is separately claimed, then tries to adopt the same key inline.
+    {:ok, b} = Queries.insert(Repo, params())
+    [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
+
+    assert :contended =
+             Queries.continue_next(
+               Repo,
+               b,
+               @worker,
+               "next",
+               ~s({"n":1}),
+               [],
+               nil,
+               1,
+               true,
+               "lock:solo",
+               true,
+               nil,
+               @ttl
+             )
+
+    # B rolled back entirely — still at its original step, no key adopted.
+    %{rows: [[step, key]]} =
+      Repo.query!("SELECT step, concurrency_key FROM gen_durable WHERE id = $1", [b])
+
+    assert step == "tick"
+    assert key == nil
+    assert a != b
+  end
+
   test "complete_retry bumps attempt and delays eligibility" do
     {:ok, id} = Queries.insert(Repo, params())
     [_] = Queries.pick(Repo, "default", 10, @worker, @ttl)
