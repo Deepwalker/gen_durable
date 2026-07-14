@@ -166,17 +166,25 @@ defmodule GenDurable.Scheduler do
     {:noreply, state}
   end
 
-  # A local insert nudged us: runnable work exists NOW. Coalesce any burst of
-  # pokes already in the mailbox into one refill, then go through the normal
-  # demand gates (ceiling, min_demand) — a poke is discovery, not admission.
-  # A fetch snaps the idle backoff to base; a miss (row raced away to another
-  # node, or throttled) leaves the poll cadence untouched — unlike an empty
-  # poll, an empty poke is not evidence of continued idleness.
+  # A poke announces runnable work NOW, but it only matters for the idle -> work
+  # transition. A queue with work in flight already refills on every task
+  # completion, and its poll fills any free slots — so a BUSY scheduler DROPS
+  # pokes. Reacting there is the redundant cross-node pick that a poke fan-out
+  # (`:cluster`/`{:redis, _}`) multiplies into a DB thundering herd (every node
+  # picking on every insert, one winning). We still drain the mailbox of any
+  # coalesced pokes either way. On an idle queue the poke fills and snaps the
+  # idle backoff to base; an empty poke leaves the poll cadence untouched —
+  # unlike an empty poll, it is not evidence of continued idleness.
   def handle_info(:poke, state) do
     flush_pokes()
-    {state, fetched} = fill(state)
-    state = if fetched > 0, do: %{state | cur_poll: state.poll_interval}, else: state
-    {:noreply, state}
+
+    if idle?(state) do
+      {state, fetched} = fill(state)
+      state = if fetched > 0, do: %{state | cur_poll: state.poll_interval}, else: state
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   # Task finished and returned a value: success path (outcome committed). Refill
@@ -290,9 +298,8 @@ defmodule GenDurable.Scheduler do
   defp refill(state) do
     claimed = map_size(state.in_flight) + length(state.buffer)
     demand = state.concurrency + state.prefetch - claimed
-    idle? = map_size(state.in_flight) == 0 and state.buffer == []
 
-    if demand > 0 and (demand >= state.min_demand or idle?) do
+    if demand > 0 and (demand >= state.min_demand or idle?(state)) do
       config = state.config
       jobs = Queries.pick(config.repo, state.queue, demand, state.worker, config.lease_ttl_ms)
 
@@ -334,7 +341,7 @@ defmodule GenDurable.Scheduler do
         fetched > 0 ->
           state.poll_interval
 
-        map_size(state.in_flight) == 0 and state.buffer == [] ->
+        idle?(state) ->
           min(state.cur_poll * 2, state.max_poll_interval)
 
         true ->
@@ -358,6 +365,11 @@ defmodule GenDurable.Scheduler do
       %{queue: state.queue}
     )
   end
+
+  # A queue is idle when nothing is running and nothing is buffered — the only
+  # state a poke needs to act on. Busy queues self-serve (completion-refill fills
+  # slots as tasks finish; the poll is the floor for anything a poke can't see).
+  defp idle?(state), do: map_size(state.in_flight) == 0 and state.buffer == []
 
   defp flush_pokes do
     receive do

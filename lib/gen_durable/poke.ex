@@ -15,7 +15,10 @@ defmodule GenDurable.Poke do
       without Erlang distribution. Requires the optional `:redix` dependency.
       The caller's node is poked directly (no Redis round-trip, and a Redis
       outage cannot lose local pokes); the publish carries the origin VM's
-      token so subscribers skip self-originated messages.
+      token so subscribers skip self-originated messages. A per-queue
+      distributed dedup lock (`SET NX PX`) collapses a burst/stream of inserts
+      into at most **one broadcast per ~100ms window across the whole fleet**,
+      so the fan-out does not scale with the insert rate.
 
   Besides inserts, pokes announce every engine-driven wake: a signal flipping
   a parked row, a fan-out's freshly-inserted children (in *their* queues), and
@@ -24,6 +27,12 @@ defmodule GenDurable.Poke do
   correctness. The poll remains the discovery floor for what a poke cannot
   see: retry backoffs, the reaper's wakes (await timeouts, crash reclaims),
   and remote events under `:local`.
+
+  A poke only wakes an **idle** scheduler — the idle → work transition it
+  exists for. A scheduler with work in flight drops it and rediscovers new work
+  on its next task completion (or poll), so a fan-out never becomes N nodes all
+  picking on every insert. Together with the Redis dedup lock, a hot insert
+  stream stays a trickle of picks, not a herd.
   """
 
   # :redix is an optional dependency; these calls only execute when the
@@ -107,15 +116,38 @@ defmodule GenDurable.Poke do
     _, _ -> :ok
   end
 
-  # Publish the poke for OTHER nodes; the local leg already ran. Tagged with
-  # this VM's token so our own listener drops it (see Listener). Best-effort:
-  # Redis down or the publisher restarting loses nothing but latency.
+  # Publish the poke for OTHER nodes; the local leg already ran. A distributed
+  # dedup lock collapses a burst/stream of inserts for one queue into at most
+  # ONE broadcast per window across the whole fleet: `SET NX PX` wins the window
+  # and only the winner PUBLISHes, so the fan-out no longer scales with the
+  # insert rate (the herd it was slamming the DB with). One `EVAL` does the
+  # lock+publish atomically in a single round-trip. Tagged with this VM's token
+  # so our own listener drops it (see Listener). Best-effort: Redis down or the
+  # publisher restarting loses nothing but latency (the poll is the floor).
+  @poke_dedup_ms 100
+  @poke_dedup_lua "if redis.call('SET', KEYS[1], '1', 'NX', 'PX', ARGV[1]) then " <>
+                    "return redis.call('PUBLISH', KEYS[2], ARGV[2]) else return 0 end"
+
   defp publish(%{name: name, poke_token: token}, queue) do
-    Redix.noreply_command(publisher(name), ["PUBLISH", channel(name), token <> "|" <> queue])
+    Redix.noreply_command(publisher(name), [
+      "EVAL",
+      @poke_dedup_lua,
+      "2",
+      dedup_key(name, queue),
+      channel(name),
+      Integer.to_string(@poke_dedup_ms),
+      token <> "|" <> queue
+    ])
+
     :ok
   catch
     _, _ -> :ok
   end
+
+  @doc false
+  # Per-queue distributed-dedup lock key: `SET NX PX` on it gates the broadcast
+  # so a stream of inserts pokes the fleet at most once per window.
+  def dedup_key(name, queue), do: "gen_durable:#{inspect(name)}:pokelock:#{queue}"
 
   defmodule Listener do
     @moduledoc false

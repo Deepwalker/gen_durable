@@ -643,6 +643,61 @@ defmodule GenDurable.EngineTest do
     assert %{status: "runnable"} = status(id)
   end
 
+  test "poke idle-gate: a busy scheduler drops pokes, completion-refill picks the work" do
+    # concurrency 2 so a free slot exists WHILE one is busy; huge poll so only a
+    # poke or a completion can pick within the window
+    start_engine(queues: [default: 2], poll_interval: 60_000, max_poll_interval: 60_000)
+
+    # A: a sleeper — once picked it holds a slot in flight for ~300ms, so the
+    # scheduler is BUSY (but with a free second slot)
+    {:ok, a} = GenDurable.insert(GenDurable.Test.Sleeper, state: %{ms: 300})
+    assert %{status: "executing"} = wait_status(a, "executing")
+
+    # B inserted while A naps pokes the busy scheduler. The idle-gate drops it:
+    # with a 60s poll and A still napping, B stays runnable — a missing idle-gate
+    # would pick B straight into the free slot.
+    {:ok, b} = GenDurable.insert(GenDurable.Test.Plain)
+    Process.sleep(150)
+    assert %{status: "runnable"} = status(b)
+
+    # when A completes, completion-refill picks B — the work is never lost
+    assert %{status: "done"} = wait_status(b, "done")
+    assert %{status: "done"} = wait_status(a, "done")
+  end
+
+  test "redis poke: a distributed lock collapses an insert burst into one broadcast" do
+    start_engine(poke: {:redis, redis_url()}, poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    # a raw subscriber that counts every broadcast on the channel (no token filter)
+    {:ok, ps} = Redix.PubSub.start_link(redis_url())
+    {:ok, _} = Redix.PubSub.subscribe(ps, GenDurable.Poke.channel(GenDurable), self())
+    assert_receive {:redix_pubsub, ^ps, _, :subscribed, _}, 1_000
+
+    # clear any dedup key a prior test left, so the first insert here wins its window
+    {:ok, redix} = Redix.start_link(redis_url())
+    Redix.command!(redix, ["DEL", GenDurable.Poke.dedup_key(GenDurable, "default")])
+
+    # a burst of inserts to one queue, well within the 100ms dedup window
+    for _ <- 1..10, do: {:ok, _} = GenDurable.insert(GenDurable.Test.Plain)
+
+    Process.sleep(200)
+    msgs = for {:redix_pubsub, ^ps, _, :message, _} = m <- drain_mailbox(), do: m
+
+    # the SET NX PX lock let (about) one insert broadcast; without it there would
+    # be ~10. At least one means discovery is never lost.
+    assert msgs != [], "the first insert must broadcast — discovery not lost"
+    assert length(msgs) <= 3, "the dedup lock must collapse the burst, got #{length(msgs)} of 10"
+  end
+
+  defp drain_mailbox(acc \\ []) do
+    receive do
+      {:redix_pubsub, _, _, _, _} = m -> drain_mailbox([m | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   test "await: a fresh insert answers {:done, result} within the call (local push)" do
     # poll 60s: only poke discovers the row, only the executor's nudge (or the
     # 25ms watcher) can answer the await this fast

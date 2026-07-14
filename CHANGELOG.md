@@ -6,6 +6,21 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.8
+
+### Changed
+- **Poke no longer fans out into a DB thundering herd.** Enabling a
+  `:cluster`/`{:redis, _}` poke transport made every insert wake every node,
+  each firing a pick (one winning, the rest wasted) — the pick rate became
+  `insert_rate × nodes`. Two changes fix it: (1) a poke now only wakes an
+  **idle** scheduler — a queue with work in flight drops it and rediscovers new
+  work via completion-refill (the poll stays the floor), so busy nodes stop
+  self-poking; (2) the Redis transport gates each broadcast behind a per-queue
+  **distributed dedup lock** (`SET NX PX`, one `EVAL`), collapsing a burst/stream
+  of inserts into at most one broadcast per ~100 ms window across the whole
+  fleet — the fan-out no longer scales with the insert rate. Both keep
+  best-effort semantics (a lost poke costs one poll interval, never correctness).
+
 ## 0.2.7
 
 ### Changed
