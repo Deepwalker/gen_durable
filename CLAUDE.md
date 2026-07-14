@@ -19,6 +19,16 @@ The goal is a **small, correct, fast** engine. Correctness first (the durability
 concurrency/rate invariants, crash recovery), then keep the hot path cheap. Prefer one
 static SQL statement over a round-trip chain; prefer self-healing over bookkeeping.
 
+## Orientation — read this first
+
+**Before grepping the tree, read [`ARCHITECTURE.md`](ARCHITECTURE.md)** — the module map (what
+each `lib/gen_durable/*.ex` does), the data model (four tables + the indexes and the invariant
+each backs), the runtime topology, the core flows, and where each invariant lives. It exists so
+a fresh session orients in one read instead of reconstructing the design from code. From there,
+follow its "Going deeper" pointers to `guides/internals.md` (mechanics), `PERFORMANCE.md` (cost
+model), and `ISSUES.md` (why each mechanism exists). Keep `ARCHITECTURE.md` current when the
+module set, tables, or topology change — it's a map, not a snapshot.
+
 ## Running tests
 
 **Everything runs in the devcontainer** (Elixir 1.18 / OTP 27 + Postgres 17 + Redis 7,
@@ -95,8 +105,8 @@ Docs are part of the change, not a follow-up:
 
 - **Source of truth is `guides/*.md`** (jobs, machines, signals, children, rate_limiting,
   concurrency, identity, scheduling, testing, operations, internals) plus `README.md`,
-  `PERFORMANCE.md`, `CHANGELOG.md`, `ISSUES.md`. `doc/` is **generated** by ExDoc
-  (`make docs`) — never hand-edit it.
+  `ARCHITECTURE.md`, `PERFORMANCE.md`, `CHANGELOG.md`, `ISSUES.md`. `doc/` is **generated** by
+  ExDoc (`make docs`) — never hand-edit it.
 - `guides/internals.md` describes the actual mechanics (the pick, outcomes, locking,
   self-heal). When you change how something works, update the guide **in the same change** —
   a guide that describes a removed mechanism (e.g. a fused pick, a rider that's now
