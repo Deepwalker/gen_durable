@@ -6,6 +6,39 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.12
+
+### Changed
+- **Outcome commits are batched through a group-commit flusher (hot path).** Every step used
+  to commit its own outcome — one `complete_*` round-trip per instance per step, run in the
+  worker Task. Under fan-out that is a storm of individual writes (and WAL flushes) hammering
+  the database. Now the worker Task builds the outcome, hands it to `GenDurable.Flusher`, and
+  **blocks until it is durably written** (`commit_before_proceed` is preserved — the Task waits
+  for the write, it never runs ahead of it). The flusher coalesces every outcome waiting on it
+  into **one transaction**: a single guarded `UPDATE … FROM unnest(...)` applies the state
+  transition for all rows (kind encoded per row via `set_*` flags), then the signal-consume,
+  parent-join decrement, `:await` recheck, and `:schedule_childs` children-insert ride as their
+  own batched statements over the rows that committed. Step *execution* stays fully parallel;
+  only the commit is serialized-and-coalesced. **All** kinds go through it —
+  `:next` / `:retry` / `:done` / `:stop` / `:await` / `:schedule_childs` and inline run-ahead
+  (`continue_next`'s continuation is a keep-executing flush entry).
+
+  **Config: `flushers:`** (default `[%{queues: :all, max_batch: 100, max_delay_ms: 100}]`). A
+  list of coordinators; each queue routes to the **first** spec whose `queues` matches it
+  (`:all` matches everything — put specific selectors before it). Per-spec `max_batch` (flush at
+  N buffered) and `max_delay_ms` (flush this long after the first buffered outcome — the
+  durability/latency window). One `:all` flusher means no concurrent flush transactions at all.
+
+  **Tradeoff / why.** This trades a per-commit *latency* of up to `max_delay_ms` under light
+  load (no batch to amortize) for far fewer transactions/WAL-flushes/round-trips under load
+  (the batch auto-grows as waiters pile up). No schema change; no new round-trips on the
+  hot-path *statement* budget (a flush of N outcomes is a bounded number of statements, not N —
+  see `test/flush_test.exs`). The single-row `complete_*` / `continue_next` statements are
+  **retained** as `GenDurable.Queries`' unit-tested reference (the flush is verified equivalent),
+  no longer called by the executor. The parent-join decrement now **aggregates** siblings that
+  finish in the same batch into one `−cnt` on the parent row (was one decrement each,
+  serialized) — see `ISSUES.md`.
+
 ## 0.2.11
 
 ### Changed

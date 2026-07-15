@@ -1,19 +1,19 @@
 defmodule GenDurable.PerfTest do
   @moduledoc """
-  Round-trip guards for the outcome path. Each `complete_*` must be a SINGLE
-  database statement (one round-trip), not a `BEGIN … COMMIT` transaction — the
-  signal consume and parent-join are folded in as data-modifying CTEs (F4).
-  The one deliberate exception is `complete_await`: park + recheck in one
-  transaction, trading round trips for the lost-wakeup fix (see its test).
+  Round-trip guards for the hot path — the pick, `deliver_signal`, and the
+  batched outcome flush (`GenDurable.Queries.flush/1`, the group-commit path all
+  outcomes take; see `GenDurable.Flusher`).
 
-  These tests guard the *round-trip count* only — that the collapse didn't
-  silently revert to a multi-statement transaction. They say nothing about
-  whether that one statement is *cheap*: a fat CTE could still have a bad plan.
-  That is verified separately by EXPLAIN ANALYZE on a realistic table (every
-  node a PK index scan, faster than the old 3 statements) — see PERFORMANCE.md §3.
+  The key contract these guard is that a flush of N outcomes is a **bounded**
+  number of statements — not one per outcome. That is what makes the group commit
+  a win over the old per-instance `complete_*` round-trips (one statement per
+  instance per step). They guard the *statement count* only, not that each is
+  *cheap* — that is verified by EXPLAIN ANALYZE on a realistic table (see
+  PERFORMANCE.md).
 
-  The `:bench` test (excluded by default; `mix test --only bench`) prints the
-  old-vs-new wall-clock so the win is measurable, not asserted-on-flaky-timing.
+  The `:bench` test (excluded by default; `mix test --only bench`) prints one
+  batched flush vs N per-outcome flushes so the win is measurable, not
+  asserted-on-flaky-timing.
   """
   use ExUnit.Case, async: false
 
@@ -101,157 +101,86 @@ defmodule GenDurable.PerfTest do
     assert hd(sql) =~ "WITH target"
   end
 
-  test "complete_next is a single statement (one round-trip)" do
-    id = setup_executing()
+  test "a batched flush commits N outcomes in a bounded number of statements (not N)" do
+    small = executing_ids(3)
+    big = executing_ids(30)
 
-    sql =
-      statements(fn ->
-        Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1, :keep)
-      end)
+    a = statements(fn -> Queries.flush(Repo, Enum.map(small, &next_entry/1)) end)
+    b = statements(fn -> Queries.flush(Repo, Enum.map(big, &next_entry/1)) end)
 
-    assert length(sql) == 1
-    assert hd(sql) =~ "consumed AS"
-  end
-
-  test "continue_next (inline run-ahead commit) is a single statement" do
-    id = setup_executing()
-
-    sql =
-      statements(fn ->
-        Queries.continue_next(
-          Repo,
-          id,
-          "w",
-          "next",
-          ~s({"n":1}),
-          [],
-          nil,
-          1,
-          false,
-          nil,
-          false,
-          nil,
-          60_000
-        )
-      end)
-
-    assert length(sql) == 1
-    assert hd(sql) =~ "committed AS"
-  end
-
-  test "an inline chained step is continue_next + one batched enrich (2 loads), no claim scan" do
-    id = setup_executing()
-
-    # The re-enrich a run-ahead step runs to refresh its inbox/children snapshot — the same
-    # 2 batched loads the pick uses, and NOT the claim scan. So a chained step is 1 + 2 = 3
-    # statements (plus one Limiter.admit only when the step is rate-limited or adopts a
-    # configured concurrency key), vs a full re-pick (claim + admit + 2 loads) plus the
-    # requeue write and task respawn it avoids.
-    commit =
-      statements(fn ->
-        Queries.continue_next(
-          Repo,
-          id,
-          "w",
-          "next",
-          ~s({"n":1}),
-          [],
-          nil,
-          1,
-          false,
-          nil,
-          false,
-          nil,
-          60_000
-        )
-      end)
-
-    enrich = statements(fn -> Queries.enrich_jobs(Repo, [%{id: id}]) end)
-
-    assert length(commit) == 1
-    assert length(enrich) == 2
-  end
-
-  test "complete_retry is a single statement" do
-    id = setup_executing()
-    assert length(statements(fn -> Queries.complete_retry(Repo, id, "w", ~s({}), 0) end)) == 1
-  end
-
-  test "complete_await is park + recheck in one transaction (lost-wakeup fix)" do
-    id = setup_executing()
-
-    sql =
-      statements(fn -> Queries.complete_await(Repo, id, "w", ~s({}), ["go"], "woke", [], nil) end)
-
-    # Deliberately NOT a single statement: the park takes the row lock, then a
-    # second fresh-snapshot statement rechecks the inbox — closing the lost-wakeup
-    # race with deliver_signal (see Queries.complete_await). Guard the exact shape
-    # so an extra statement doesn't creep in unnoticed.
-    assert [_begin, park, recheck, _commit] = sql
-    assert park =~ "awaiting_signal"
-    assert recheck =~ "EXISTS"
-  end
-
-  test "complete_done is a single statement (consume + done + parent-join folded in)" do
-    id = setup_executing()
-    sql = statements(fn -> Queries.complete_done(Repo, id, "w", ~s({"ok":true})) end)
-
-    assert length(sql) == 1
-    assert hd(sql) =~ "WITH terminal"
-    assert hd(sql) =~ "children_pending"
-  end
-
-  test "complete_stop is a single statement" do
-    id = setup_executing()
-    assert length(statements(fn -> Queries.complete_stop(Repo, id, "w", "boom") end)) == 1
-  end
-
-  test "complete_schedule_childs is a single statement (consume + insert + park)" do
-    id = setup_executing()
-    children = [params(%{fsm: "child"}), params(%{fsm: "child"})]
-
-    sql =
-      statements(fn ->
-        Queries.complete_schedule_childs(Repo, id, "w", "join", ~s({}), children, [])
-      end)
-
-    assert length(sql) == 1
-    assert hd(sql) =~ "INSERT INTO gen_durable"
+    # One BEGIN + one UPDATE + one COMMIT — independent of batch size (these :next
+    # entries consume nothing and have no parent join). The per-instance commit
+    # storm the flush replaces would be one statement PER row instead.
+    assert length(a) == 3
+    assert length(b) == length(a)
   end
 
   @tag :bench
-  test "bench: collapsed outcome vs explicit transaction" do
-    id = setup_executing()
-    iters = 500
+  test "bench: one batched flush vs N per-outcome flushes" do
+    iters = 50
+    n = 50
 
-    # Re-claim before each call (equal overhead on both sides): the ownership
-    # guard makes complete_next a no-op on an unclaimed row, which would bench
-    # nothing.
-    new =
+    batched =
       bench(iters, fn ->
-        reclaim(id)
-        Queries.complete_next(Repo, id, "w", "tick", ~s({"n":1}), [], nil, 1, :keep)
+        ids = executing_ids(n)
+        Queries.flush(Repo, Enum.map(ids, &next_entry/1))
       end)
 
-    old =
+    per =
       bench(iters, fn ->
-        reclaim(id)
-        complete_next_tx(id, "tick", ~s({"n":1}))
+        ids = executing_ids(n)
+        for id <- ids, do: Queries.flush(Repo, [next_entry(id)])
       end)
 
-    IO.puts("\n  complete_next over #{iters} iters (median µs/call):")
-    IO.puts("    collapsed (1 statement):  #{new} µs")
-    IO.puts("    explicit txn (BEGIN+2+COMMIT): #{old} µs")
-    IO.puts("    speedup: #{Float.round(old / new, 2)}x")
+    IO.puts("\n  #{n} outcomes over #{iters} iters (median us):")
+    IO.puts("    one batched flush:        #{batched} us")
+    IO.puts("    #{n} per-outcome flushes:  #{per} us")
+    IO.puts("    speedup: #{Float.round(per / batched, 2)}x")
 
-    assert new < old
+    assert batched < per
   end
 
-  defp reclaim(id) do
-    Repo.query!(
-      "UPDATE gen_durable SET status = 'executing', locked_by = 'w' WHERE id = $1",
-      [id]
-    )
+  defp executing_ids(n) do
+    for _ <- 1..n, do: {:ok, _} = Queries.insert(Repo, params(%{}))
+    Queries.pick(Repo, "default", n, "w", 60_000) |> Enum.map(& &1.id)
+  end
+
+  defp next_entry(id) do
+    %{
+      kind: :state,
+      id: id,
+      worker: "w",
+      slot: nil,
+      notify: false,
+      status: "runnable",
+      attempt: 0,
+      delay_ms: 0,
+      set_attempt: true,
+      set_eligible: true,
+      keep_lock: false,
+      set_shard: true,
+      shard_value: nil,
+      lease_ttl_ms: 0,
+      set_step: true,
+      step: "next",
+      set_state: true,
+      state: ~s({"n":1}),
+      set_result: false,
+      result: nil,
+      set_error: false,
+      error: nil,
+      clear_awaits: true,
+      set_rate: true,
+      rate_limit: nil,
+      weight: 1.0,
+      set_ck: false,
+      ck_value: nil,
+      consumed_ids: [],
+      awaits_json: nil,
+      timeout_ms: nil,
+      presented_ids: [],
+      children: []
+    }
   end
 
   # Median per-call microseconds over `n` runs.
@@ -264,22 +193,5 @@ defmodule GenDurable.PerfTest do
       end
 
     Enum.at(Enum.sort(times), div(n, 2))
-  end
-
-  # The pre-F4 form: consume + update inside an explicit transaction.
-  defp complete_next_tx(id, step, state_json) do
-    Repo.transaction(fn ->
-      Repo.query!(
-        "DELETE FROM signals s USING gen_durable g WHERE s.target_id=$1 AND g.id=$1 AND s.name=ANY(g.awaits)",
-        [id]
-      )
-
-      Repo.query!(
-        "UPDATE gen_durable SET step=$2, state=$3::jsonb, status='runnable', eligible_at=now(), attempt=0, awaits=null, locked_by=null, lease_expires_at=null, updated_at=now() WHERE id=$1",
-        [id, step, state_json]
-      )
-    end)
-
-    :ok
   end
 end

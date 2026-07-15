@@ -2,8 +2,10 @@ defmodule GenDurable.Queries do
   @moduledoc """
   Every database statement, one function each, as raw SQL.
 
-  All functions take the `repo` explicitly. The `complete_*` functions run the
-  outcome `UPDATE` and the consumed-signal `DELETE` in one transaction.
+  All functions take the `repo` explicitly. Step outcomes commit through the
+  batched `flush/1` (group commit — see `GenDurable.Flusher`): one guarded
+  `UPDATE … FROM unnest(...)` for the whole batch plus the consume / parent-join /
+  await-recheck / children-insert riders, in one transaction.
   `concurrency_key` serialization is enforced by the database — the UNIQUE
   partial index `gen_durable_concurrency_active` makes a second executing row
   per key uncommittable, so the pick's claim IS the lock (held exactly for the
@@ -28,7 +30,7 @@ defmodule GenDurable.Queries do
   """
 
   # --- shared insert shape -----------------------------------------------------
-  # The 12 insert columns, used by insert / insert_all / complete_schedule_childs.
+  # The 12 insert columns, used by insert / insert_all / the schedule_childs flush.
 
   @insert_cols "fsm, fsm_version, step, state, queue, priority, concurrency_key, eligible_at, correlation_key, correlation_scope, rate_limit, weight"
 
@@ -75,11 +77,6 @@ defmodule GenDurable.Queries do
   # (upsert_rate_configs) stays uncached.
   defp q!(repo, name, sql, params),
     do: repo.query!(sql, params, cache_statement: "gen_durable/" <> name)
-
-  # An outcome's ownership guard matched (1, committed) or not (0, the worker no
-  # longer owns the row — the outcome was dropped).
-  defp committed?(1), do: :ok
-  defp committed?(0), do: :stale
 
   # --- picker ----------------------------------------------------------------
 
@@ -575,435 +572,354 @@ defmodule GenDurable.Queries do
     n
   end
 
-  # --- step outcomes -----------------------------------------
-  #
-  # Each outcome is a SINGLE statement, not a transaction (one round-trip instead
-  # of BEGIN + … + COMMIT) — except `:await`, which is deliberately a two-statement
-  # transaction (park + recheck): the extra round trips close the lost-wakeup race
-  # with deliver_signal (see complete_await). The signal consume rides along as a
-  # data-modifying CTE, `consumed`, atomic with the outcome UPDATE because one
-  # statement is its own implicit transaction; it runs to completion even though
-  # the main query never reads it — Postgres guarantees data-modifying CTEs always
-  # execute fully. What `consumed` deletes depends on the outcome:
-  #   * progressing (:next / :schedule_childs) — exactly the awaited-signal ids the
-  #     step received (`id = ANY($consumed)`); latecomers and non-awaited signals
-  #     survive. Empty list ⇒ no-op.
-  #   * terminal (:done / :stop) — the whole inbox (`target_id = $id`): the instance
-  #     is finished, so nothing will read its signals again (cleanup).
-  #   * :retry / :await consume nothing (the step is redone / still waiting).
-  #
-  # OWNERSHIP GUARD: every outcome commits only while the worker still owns the
-  # claim — `locked_by = $worker AND status = 'executing'`. An orphaned task (its
-  # scheduler crashed, so nobody heartbeats its rows) can outlive the lease; the
-  # reaper then hands the row to a new claimant, and the orphan's late commit
-  # must NOT land on top — unguarded it would rewind step/state mid-flight, null
-  # the new claimant's locked_by (silencing its heartbeat), or, terminally,
-  # delete the inbox and decrement the parent join barrier. Guarded, the stale
-  # outcome affects zero rows and every side effect is gated on the guarded
-  # UPDATE via CTE references (reading the update's RETURNING, never the table —
-  # a table re-read would see the pre-update snapshot and fire the side effects
-  # even when the guard EPQ-failed). Each complete_* returns :ok | :stale; the
-  # executor emits [:gen_durable, :outcome, :stale] telemetry on the drop, and
-  # the step's work is redone by the current claimant (at-least-once).
-
-  # The join-barrier decrement, a CTE of the terminal outcomes. Reads the child's
-  # `parent_id` from the guarded `terminal` CTE's RETURNING — empty when the
-  # ownership guard failed, so a stale worker never touches the parent. No-op
-  # when the row has no parent (the join yields nothing). The decrement that hits
-  # zero releases the barrier; concurrent siblings serialize on the parent row
-  # lock. `terminal` updates the child; this updates the parent (a different
-  # row), so the two table-modifications never touch the same row. The final
-  # SELECT reports whether the outcome committed (1) or was stale (0).
-  # RETURNING reads the post-update row: a parent whose join just completed
-  # comes back 'runnable' — its queue is surfaced so the executor can poke it
-  # (the parent may live in a different queue than the child that woke it).
-  @notify_parent """
-  notify AS (
-    UPDATE gen_durable p
-    SET children_pending = p.children_pending - 1,
-        status = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
-                      THEN 'runnable' ELSE p.status END,
-        eligible_at = CASE WHEN p.children_pending - 1 <= 0 AND p.status = 'awaiting_children'
-                           THEN now() ELSE p.eligible_at END,
-        updated_at = now()
-    FROM terminal c
-    WHERE c.parent_id = p.id
-    RETURNING p.status, p.queue
-  )
-  SELECT (SELECT count(*) FROM terminal),
-         (SELECT n.queue FROM notify n WHERE n.status = 'runnable' LIMIT 1)
-  """
-
-  # The concurrency-gate release is now out-of-band: the row still nulls its
-  # `concurrency_shard` on every outcome (leaving `executing`), but the slot is
-  # credited back by `GenDurable.Limiter.credit/2`, called by the executor after a
-  # committed (non-stale) outcome — see `GenDurable.Executor.apply_outcome`. A stale
-  # outcome credits nothing (the executor skips it); a crash between commit and credit
-  # leaks in the conservative direction (under-admission), healed by the reconciler.
-
-  # :next sets the row's rate_limit key ($5, NULL ⇒ not limited) and weight ($6) for the
-  # next step. No bucket rider: a missing bucket is minted, pre-debited, by the
-  # first pick that grants from it (see r_mint) — cold keys admit with zero lag.
-  #
-  # `concurrency_key` is :keep (the default — identity keys persist across
-  # steps), nil (release the key for the next steps), or a new key. The shard is
-  # always cleared (the row leaves executing; a re-claim assigns a fresh one)
-  # and the old slot is credited via the `credit` rider.
-  def complete_next(repo, id, worker, step, state_json, consumed_ids, rate_limit, weight, ck) do
-    {ck_change, ck_value} = if ck == :keep, do: {false, nil}, else: {true, ck}
-
-    %{rows: [[n]]} =
-      q!(
-        repo,
-        "complete_next",
-        """
-        WITH committed AS (
-          UPDATE gen_durable
-          SET step = $2, state = $3::text::jsonb, status = 'runnable', eligible_at = now(),
-              attempt = 0, awaits = null, rate_limit = $5, weight = $6,
-              concurrency_key = CASE WHEN $8::bool THEN $9 ELSE concurrency_key END,
-              concurrency_shard = null,
-              locked_by = null, lease_expires_at = null, updated_at = now()
-          WHERE id = $1 AND locked_by = $7 AND status = 'executing'
-          RETURNING id
-        ),
-        consumed AS (
-          DELETE FROM signals
-          WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
-        )
-        SELECT count(*) FROM committed
-        """,
-        [id, step, state_json, consumed_ids, rate_limit, weight, worker, ck_change, ck_value]
-      )
-
-    committed?(n)
-  end
-
-  # INLINE CONTINUATION (run-ahead): commit the `:next` transition WITHOUT leaving
-  # `executing` — the same worker keeps the claim and runs the next step in place,
-  # skipping the requeue → re-pick round-trip. Durability is unchanged: the next
-  # step's state is committed here, before that step runs; a crash re-runs it via the
-  # reaper exactly as a requeued `:next` would. Same ownership guard as every outcome
-  # (`locked_by = $worker AND status = 'executing'`): an orphaned chained task whose
-  # lease expired commits nothing (`:stale`) — critically, this guarded commit runs
-  # BEFORE the executor calls the (unguarded) out-of-band `Limiter.admit`, so an orphan
-  # never debits/stamps a row a new claimant now owns.
-  #
-  # Concurrency handoff between steps (the executor computed the directives):
-  #   * `set_key`   — false keeps the current `concurrency_key` (`:keep`); true sets it
-  #                   to `key_value` (a new key, or NULL to release).
-  #   * `set_shard` — false keeps the current shard; true sets it to `shard_value`:
-  #                     NULL — release / unconfigured new key (re-enters the K=1 arbiter;
-  #                            a unique violation here means the key is taken → `:contended`,
-  #                            and the executor requeues through the picker), or
-  #                     0    — provisional for a CONFIGURED new key (non-null ⇒ out of the
-  #                            K=1 index); the real shard is stamped by the subsequent
-  #                            `Limiter.admit`, mirroring the claim path.
-  # The lease is extended so a long inline chain never relies solely on the heartbeat.
-  def continue_next(
-        repo,
-        id,
-        worker,
-        step,
-        state_json,
-        consumed_ids,
-        rate_limit,
-        weight,
-        set_key,
-        key_value,
-        set_shard,
-        shard_value,
-        lease_ttl_ms
-      ) do
-    %{rows: [[n]]} =
-      q!(
-        repo,
-        "continue_next",
-        """
-        WITH committed AS (
-          UPDATE gen_durable
-          SET step = $2, state = $3::text::jsonb, status = 'executing', eligible_at = now(),
-              attempt = 0, awaits = null, rate_limit = $5, weight = $6,
-              concurrency_key = CASE WHEN $8::bool THEN $9 ELSE concurrency_key END,
-              concurrency_shard = CASE WHEN $10::bool THEN $11 ELSE concurrency_shard END,
-              lease_expires_at = now() + $12::int * interval '1 millisecond', updated_at = now()
-          WHERE id = $1 AND locked_by = $7 AND status = 'executing'
-          RETURNING id
-        ),
-        consumed AS (
-          DELETE FROM signals
-          WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
-        )
-        SELECT count(*) FROM committed
-        """,
-        [
-          id,
-          step,
-          state_json,
-          consumed_ids,
-          rate_limit,
-          weight,
-          worker,
-          set_key,
-          key_value,
-          set_shard,
-          shard_value,
-          lease_ttl_ms
-        ]
-      )
-
-    committed?(n)
-  rescue
-    e in Postgrex.Error ->
-      # An unconfigured new concurrency_key that another executing row already holds trips
-      # the K=1 arbiter (gen_durable_concurrency_active). The whole statement rolls back —
-      # nothing committed — so the executor falls back to a normal requeue (`complete_next`)
-      # and the picker arbitrates the key, exactly as a first pick would.
-      if is_map(e.postgres) && e.postgres[:constraint] == "gen_durable_concurrency_active",
-        do: :contended,
-        else: reraise(e, __STACKTRACE__)
-  end
+  # --- enrichment (shared with the pick) -------------------------------------
 
   # Reload the signal inbox and children snapshot for already-claimed jobs — the same
   # batched enrichment the pick runs, exposed for the inline-continuation path (a run-ahead
   # step gets a fresh snapshot, identical to what a re-pick would hand it).
   def enrich_jobs(repo, jobs), do: enrich(repo, jobs)
 
-  # :retry redoes the same step, so it consumes nothing and KEEPS `awaits` — the
-  # redo must see the same awaited signals it was handed. The gate slot is
-  # released (the row leaves executing); the redo re-claims through admission.
-  def complete_retry(repo, id, worker, state_json, delay_ms) do
-    %{rows: [[n]]} =
-      q!(
-        repo,
-        "complete_retry",
-        """
-        WITH committed AS (
-          UPDATE gen_durable
-          SET state = $2::text::jsonb, status = 'runnable',
-              eligible_at = now() + $3::int * interval '1 millisecond',
-              attempt = attempt + 1, concurrency_shard = null,
-              locked_by = null, lease_expires_at = null, updated_at = now()
-          WHERE id = $1 AND locked_by = $4 AND status = 'executing'
-          RETURNING id
+  # --- batched flush (group commit) ------------------------------------------
+  #
+  # One transaction commits a WHOLE batch of outcomes, replacing the per-instance
+  # complete_* round-trips (see GenDurable.Flusher). A single guarded
+  # `UPDATE … FROM unnest(...)` applies every row's state transition — the kind is
+  # encoded per row via set_* flags and precomputed values — and the two riders
+  # (signal consume, parent-join decrement) follow as their own statements, scoped
+  # to the rows that actually committed (the guard's RETURNING). No CTE stack: the
+  # dedup/aggregation (which parent gets −cnt, which signals to drop) is resolved
+  # in Elixir between the statements, in one place.
+  #
+  # Covers the four kinds that LEAVE `executing` — :next (requeue), :retry, :done,
+  # :stop — so the multi-row UPDATE never trips the K=1 arbiter
+  # (gen_durable_concurrency_active is a WHERE status='executing' partial index).
+  # :await and :schedule_childs carry extra per-row riders and are folded in
+  # separately; inline-continue keeps the row executing and rides its own variant.
+  #
+  # Entry arrays are sorted by id (parents by parent_id in `notify`) as best-effort
+  # lock ordering — but a set-based `UPDATE … FROM unnest` acquires row locks in
+  # PLAN order, so the sort is not the real guarantee. Deadlock-safety comes from
+  # concurrent flushers owning DISJOINT queue (row) sets and executing the same
+  # cached plan, so any rows they do share (parent rows in `notify`, up an acyclic
+  # tree) are locked in one deterministic order. The sort just keeps that order
+  # aligned with the maintenance statements' id-ordered SKIP LOCKED.
+  #
+  # `entries` — a list of maps, one per outcome (see GenDurable.Flusher.entry/2).
+  # Returns %{committed: [id], woken_queues: [queue], stale: [id]}.
+  @flush_update_sql """
+  UPDATE gen_durable g SET
+    status = u.status::durable_status,
+    step = CASE WHEN u.set_step THEN u.step ELSE g.step END,
+    state = CASE WHEN u.set_state THEN u.state::jsonb ELSE g.state END,
+    result = CASE WHEN u.set_result THEN u.result::jsonb ELSE g.result END,
+    last_error = CASE WHEN u.set_error THEN u.error ELSE g.last_error END,
+    eligible_at = CASE WHEN u.set_eligible
+                       THEN now() + u.delay_ms * interval '1 millisecond' ELSE g.eligible_at END,
+    attempt = CASE WHEN u.set_attempt THEN u.attempt ELSE g.attempt END,
+    awaits = CASE WHEN u.clear_awaits THEN NULL ELSE g.awaits END,
+    rate_limit = CASE WHEN u.set_rate THEN u.rate_limit ELSE g.rate_limit END,
+    weight = CASE WHEN u.set_rate THEN u.weight ELSE g.weight END,
+    concurrency_key = CASE WHEN u.set_ck THEN u.ck_value ELSE g.concurrency_key END,
+    concurrency_shard = CASE WHEN u.set_shard THEN u.shard_value ELSE g.concurrency_shard END,
+    -- inline-continue (keep_lock) keeps the claim and extends the lease; every other
+    -- kind leaves executing, releasing the lock.
+    locked_by = CASE WHEN u.keep_lock THEN g.locked_by ELSE NULL END,
+    lease_expires_at = CASE WHEN u.keep_lock
+                            THEN now() + u.lease_ttl_ms * interval '1 millisecond' ELSE NULL END,
+    updated_at = now()
+  FROM unnest(
+    $1::bigint[], $2::text[], $3::text[], $4::int[], $5::int[],
+    $6::bool[], $7::text[], $8::bool[], $9::text[], $10::bool[], $11::text[],
+    $12::bool[], $13::text[], $14::bool[], $15::bool[], $16::text[], $17::float8[],
+    $18::bool[], $19::text[], $20::bool[], $21::bool[],
+    $22::bool[], $23::bool[], $24::int[], $25::int[]
+  ) AS u(id, worker, status, attempt, delay_ms,
+         set_step, step, set_state, state, set_result, result,
+         set_error, error, clear_awaits, set_rate, rate_limit, weight,
+         set_ck, ck_value, set_attempt, set_eligible,
+         keep_lock, set_shard, shard_value, lease_ttl_ms)
+  WHERE g.id = u.id AND g.locked_by = u.worker AND g.status = 'executing'
+  RETURNING g.id, g.parent_id, g.status::text
+  """
+
+  @flush_notify_sql """
+  UPDATE gen_durable p SET
+    children_pending = p.children_pending - d.cnt,
+    status = CASE WHEN p.children_pending - d.cnt <= 0 AND p.status = 'awaiting_children'
+                  THEN 'runnable' ELSE p.status END,
+    eligible_at = CASE WHEN p.children_pending - d.cnt <= 0 AND p.status = 'awaiting_children'
+                       THEN now() ELSE p.eligible_at END,
+    updated_at = now()
+  FROM unnest($1::bigint[], $2::int[]) AS d(parent_id, cnt)
+  WHERE p.id = d.parent_id
+  RETURNING CASE WHEN p.status = 'runnable' THEN p.queue ELSE NULL END
+  """
+
+  # :await park — the await park + lost-wakeup recheck, batched. `awaits` rides in
+  # as a JSON array text per row (robust to commas in signal names, unlike the
+  # comma-join trick) and is decoded server-side. A NULL timeout ⇒ NULL deadline.
+  @flush_await_park_sql """
+  UPDATE gen_durable g SET
+    step = u.step, state = u.state::jsonb,
+    awaits = ARRAY(SELECT jsonb_array_elements_text(u.awaits::jsonb)),
+    status = 'awaiting_signal', eligible_at = now(), attempt = 0, rate_limit = NULL, weight = 1,
+    concurrency_shard = NULL,
+    await_deadline = now() + u.timeout_ms * interval '1 millisecond',
+    locked_by = NULL, lease_expires_at = NULL, updated_at = now()
+  FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[], $5::int[], $6::text[])
+    AS u(id, worker, step, state, timeout_ms, awaits)
+  WHERE g.id = u.id AND g.locked_by = u.worker AND g.status = 'executing'
+  RETURNING g.id
+  """
+
+  # :await recheck — the delivery side of the lost-wakeup fix, batched over the
+  # parked ids, in the SAME transaction as the park (park holds the row lock; a
+  # racing delivery queues on it). A matching signal already in the inbox (that
+  # the step did NOT already see — the per-row `presented` pairs) flips the row
+  # straight back to runnable. READ COMMITTED gives the recheck a fresh snapshot.
+  @flush_await_recheck_sql """
+  UPDATE gen_durable g SET status = 'runnable', updated_at = now()
+  FROM unnest($1::bigint[]) AS a(id)
+  WHERE g.id = a.id AND g.status = 'awaiting_signal'
+    AND EXISTS (
+      SELECT 1 FROM signals s
+      WHERE s.target_id = g.id AND s.name = ANY(g.awaits)
+        AND NOT EXISTS (
+          SELECT 1 FROM unnest($2::bigint[], $3::bigint[]) AS p(tid, sid)
+          WHERE p.tid = g.id AND p.sid = s.id
         )
-        SELECT count(*) FROM committed
-        """,
-        [id, state_json, delay_ms, worker]
-      )
+    )
+  """
 
-    committed?(n)
-  end
+  def flush(_repo, []), do: %{committed: [], woken_queues: [], stale: []}
 
-  # Park on a name set ($3, text[]), transitioning to `next_step` ($4): when any named
-  # signal arrives the row becomes runnable at `next_step`, which reads the matching
-  # subset as `ctx.awaited`.
-  #
-  # Two statements in ONE transaction — the park side of the lost-wakeup fix:
-  #   1. park — flips to awaiting_signal and takes the row lock (held to commit).
-  #   2. recheck — a fresh snapshot: a matching signal already in the inbox (its
-  #      delivery committed before this statement) flips straight to runnable.
-  # A delivery the recheck cannot see must commit after it — but its wake UPDATE
-  # matches the row unconditionally (see deliver_signal), so it queues on our row
-  # lock and performs the flip itself once we commit. Either the recheck or the
-  # delivery wakes the row; no interleaving leaves a matching signal with a
-  # parked instance. A single statement cannot do this: under READ COMMITTED its
-  # EXISTS runs on the statement snapshot, blind to a concurrently-committing
-  # delivery, while that delivery's status-guarded wake skips the not-yet-parked
-  # row without locking. The extra round trips buy the race away.
-  #
-  # `presented_ids` — the awaited-signal ids the parking step was HANDED
-  # (ctx.awaited; :await consumes nothing, so they are still in the inbox). The
-  # recheck excludes them: waking on a signal the step already saw and chose to
-  # re-await would spin the accumulate-a-pack pattern (park → recheck flips →
-  # immediate re-pick → re-await → …) at full speed until the pack completes.
-  # A set-difference, not a max-id watermark: signal ids commit out of order, so
-  # "id greater than the newest presented" could skip a signal that was inserted
-  # earlier but committed later (invisible to the step's enrichment snapshot).
-  # Deliveries are unaffected — a delivered signal is a fresh insert, never in
-  # the presented set, and the wake checks only the name.
-  # `timeout_ms` (nil ⇒ no deadline) arms `await_deadline`: the reaper's sweep
-  # returns an expired park to runnable, and the woken step sees whatever is in
-  # the inbox — for a fresh await an empty ctx.awaited means timeout. The park is
-  # the only writer of the column (NULL propagation: a nil timeout stores NULL),
-  # so a stale deadline left on a woken row is always overwritten by the next park
-  # and never matches the sweep's status filter in between.
-  def complete_await(repo, id, worker, state_json, names, next_step, presented_ids, timeout_ms) do
+  def flush(repo, entries) do
+    # Lock in id order (deadlock discipline shared with the maintenance statements).
+    entries = Enum.sort_by(entries, & &1.id)
+    by_kind = Enum.group_by(entries, &Map.get(&1, :kind, :state))
+
     {:ok, result} =
       repo.transaction(fn ->
-        %{rows: [[parked]]} =
-          q!(
-            repo,
-            "await_park",
-            """
-            WITH park AS (
-              UPDATE gen_durable
-              SET step = $4, state = $2::text::jsonb, awaits = $3::text[], eligible_at = now(),
-                  status = 'awaiting_signal', attempt = 0, rate_limit = null, weight = 1,
-                  concurrency_shard = null,
-                  await_deadline = now() + $6::int * interval '1 millisecond',
-                  locked_by = null, lease_expires_at = null, updated_at = now()
-              WHERE id = $1 AND locked_by = $5 AND status = 'executing'
-              RETURNING id
-            )
-            SELECT count(*) FROM park
-            """,
-            [id, state_json, names, next_step, worker, timeout_ms]
-          )
+        # Each kind's state transition is its own batched statement; the riders
+        # (consume, notify) then run over the rows that actually committed.
+        committed =
+          flush_state(repo, Map.get(by_kind, :state, [])) ++
+            flush_await(repo, Map.get(by_kind, :await, [])) ++
+            flush_schedule_childs(repo, Map.get(by_kind, :schedule_childs, []))
 
-        # Guard failed ⇒ the row is someone else's now — skip the recheck (its
-        # own claimant parks and rechecks for itself).
-        if parked == 1 do
-          q!(
-            repo,
-            "await_recheck",
-            """
-            UPDATE gen_durable
-            SET status = 'runnable', updated_at = now()
-            WHERE id = $1 AND status = 'awaiting_signal'
-              AND EXISTS (SELECT 1 FROM signals
-                          WHERE target_id = $1 AND name = ANY(gen_durable.awaits)
-                            AND id != ALL($2::bigint[]))
-            """,
-            [id, presented_ids]
-          )
+        committed_ids = MapSet.new(committed, fn {id, _, _} -> id end)
 
-          :ok
-        else
-          :stale
-        end
+        flush_consume(repo, entries, committed, committed_ids)
+        woken = flush_notify(repo, committed)
+
+        stale = for e <- entries, not MapSet.member?(committed_ids, e.id), do: e.id
+
+        %{committed: MapSet.to_list(committed_ids), woken_queues: woken, stale: stale}
       end)
 
     result
   end
 
-  # Returns {:ok, woken_parent_queue | nil} | :stale — the queue rides back so
-  # the executor can poke a parent whose join this completion satisfied.
-  def complete_done(repo, id, worker, result_json) do
-    %{rows: [[n, wake]]} =
-      q!(
-        repo,
-        "complete_done",
-        """
-        WITH terminal AS (
-          UPDATE gen_durable
-          SET result = $2::text::jsonb, status = 'done', awaits = null,
-              concurrency_shard = null,
-              locked_by = null, lease_expires_at = null, updated_at = now()
-          WHERE id = $1 AND locked_by = $3 AND status = 'executing'
-          RETURNING id, parent_id
-        ),
-        consumed AS (
-          DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
-        ),
-        """ <> @notify_parent,
-        [id, result_json, worker]
-      )
+  # The batched state transition for :next/:retry/:done/:stop. Returns
+  # {id, parent_id, status} for every row that committed (guard held).
+  defp flush_state(_repo, []), do: []
 
-    if n == 1, do: {:ok, wake}, else: :stale
+  defp flush_state(repo, entries) do
+    %{rows: returned} =
+      q!(repo, "flush_update", @flush_update_sql, [
+        Enum.map(entries, & &1.id),
+        Enum.map(entries, & &1.worker),
+        Enum.map(entries, & &1.status),
+        Enum.map(entries, & &1.attempt),
+        Enum.map(entries, & &1.delay_ms),
+        Enum.map(entries, & &1.set_step),
+        Enum.map(entries, & &1.step),
+        Enum.map(entries, & &1.set_state),
+        Enum.map(entries, & &1.state),
+        Enum.map(entries, & &1.set_result),
+        Enum.map(entries, & &1.result),
+        Enum.map(entries, & &1.set_error),
+        Enum.map(entries, & &1.error),
+        Enum.map(entries, & &1.clear_awaits),
+        Enum.map(entries, & &1.set_rate),
+        Enum.map(entries, & &1.rate_limit),
+        Enum.map(entries, & &1.weight),
+        Enum.map(entries, & &1.set_ck),
+        Enum.map(entries, & &1.ck_value),
+        Enum.map(entries, & &1.set_attempt),
+        Enum.map(entries, & &1.set_eligible),
+        Enum.map(entries, & &1.keep_lock),
+        Enum.map(entries, & &1.set_shard),
+        Enum.map(entries, & &1.shard_value),
+        Enum.map(entries, & &1.lease_ttl_ms)
+      ])
+
+    Enum.map(returned, fn [id, parent_id, status] -> {id, parent_id, status} end)
   end
 
-  def complete_stop(repo, id, worker, reason_text) do
-    %{rows: [[n, wake]]} =
-      q!(
-        repo,
-        "complete_stop",
-        """
-        WITH terminal AS (
-          UPDATE gen_durable
-          SET status = 'failed', last_error = $2, awaits = null,
-              concurrency_shard = null,
-              locked_by = null, lease_expires_at = null, updated_at = now()
-          WHERE id = $1 AND locked_by = $3 AND status = 'executing'
-          RETURNING id, parent_id
-        ),
-        consumed AS (
-          DELETE FROM signals WHERE target_id IN (SELECT id FROM terminal)
-        ),
-        """ <> @notify_parent,
-        [id, reason_text, worker]
-      )
+  # :await — park (all rows) then recheck (the parked ids, with per-row presented
+  # exclusion). Returns {id, nil, "awaiting_signal"} for parked rows (a recheck may
+  # have flipped some back to runnable — harmless, they get re-picked).
+  defp flush_await(_repo, []), do: []
 
-    if n == 1, do: {:ok, wake}, else: :stale
+  defp flush_await(repo, entries) do
+    %{rows: parked} =
+      q!(repo, "flush_await_park", @flush_await_park_sql, [
+        Enum.map(entries, & &1.id),
+        Enum.map(entries, & &1.worker),
+        Enum.map(entries, & &1.step),
+        Enum.map(entries, & &1.state),
+        Enum.map(entries, & &1.timeout_ms),
+        Enum.map(entries, & &1.awaits_json)
+      ])
+
+    parked_ids = List.flatten(parked)
+    parked_set = MapSet.new(parked_ids)
+
+    {ptids, psids} =
+      entries
+      |> Enum.filter(&(MapSet.member?(parked_set, &1.id) and &1.presented_ids != []))
+      |> Enum.flat_map(fn e -> Enum.map(e.presented_ids, &{e.id, &1}) end)
+      |> Enum.unzip()
+
+    if parked_ids != [],
+      do: q!(repo, "flush_await_recheck", @flush_await_recheck_sql, [parked_ids, ptids, psids])
+
+    for id <- parked_ids, do: {id, nil, "awaiting_signal"}
   end
 
-  # :schedule_childs — spawn the batch and park the parent on the join
-  # barrier, in one statement (consume + insert children + park). children_pending
-  # is set to the number of children actually inserted; zero inserted ⇒ barrier
-  # pre-satisfied ⇒ runnable.
-  def complete_schedule_childs(repo, parent_id, worker, next_step, state_json, [], consumed_ids) do
-    %{rows: [[n]]} =
-      q!(
-        repo,
-        "schedule_childs_empty",
-        """
-        WITH committed AS (
-          UPDATE gen_durable
-          SET step = $2, state = $3::text::jsonb, children_pending = 0, status = 'runnable',
-              eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1,
-              concurrency_shard = null,
-              locked_by = null, lease_expires_at = null, updated_at = now()
-          WHERE id = $1 AND locked_by = $5 AND status = 'executing'
-          RETURNING id
-        ),
-        consumed AS (
-          DELETE FROM signals
-          WHERE target_id IN (SELECT id FROM committed) AND id = ANY($4::bigint[])
+  # :schedule_childs — batched across parents. First insert every child (each gated on
+  # ITS parent's ownership, RETURNING parent_id), then park each parent with the count
+  # of children that actually landed (post-dedup) — awaiting_children, or runnable when
+  # zero. The parent's own awaited-signal consume rides the generic consume (its entry
+  # carries consumed_ids). Children insert ORDER BY correlation_key (arbiter-deadlock
+  # discipline, as insert_all); parents park in id order.
+  @flush_childs_insert_sql "INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>
+                             "SELECT t.fsm, t.fsm_version, t.step, t.state::jsonb, t.queue, t.priority, " <>
+                             "t.concurrency_key, COALESCE(t.eligible_at, now()), t.correlation_key, " <>
+                             "string_to_array(t.scope, ',')::durable_status[], t.rate_limit, t.weight, t.parent_id " <>
+                             "FROM unnest($1::text[], $2::int[], $3::text[], $4::text[], $5::text[], $6::int[], " <>
+                             "$7::text[], $8::timestamptz[], $9::text[], $10::text[], $11::text[], $12::float8[], " <>
+                             "$13::bigint[], $14::text[]) AS t(fsm, fsm_version, step, state, queue, priority, " <>
+                             "concurrency_key, eligible_at, correlation_key, scope, rate_limit, weight, parent_id, worker) " <>
+                             "WHERE EXISTS (SELECT 1 FROM gen_durable p WHERE p.id = t.parent_id " <>
+                             "AND p.locked_by = t.worker AND p.status = 'executing') " <>
+                             "ORDER BY t.correlation_key " <>
+                             "ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING " <>
+                             "RETURNING parent_id"
+
+  @flush_childs_park_sql """
+  UPDATE gen_durable p SET
+    step = u.step, state = u.state::jsonb, children_pending = u.cnt,
+    status = (CASE WHEN u.cnt = 0 THEN 'runnable' ELSE 'awaiting_children' END)::durable_status,
+    eligible_at = now(), attempt = 0, awaits = NULL, rate_limit = NULL, weight = 1,
+    concurrency_shard = NULL, locked_by = NULL, lease_expires_at = NULL, updated_at = now()
+  FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[], $5::int[])
+    AS u(id, worker, step, state, cnt)
+  WHERE p.id = u.id AND p.locked_by = u.worker AND p.status = 'executing'
+  RETURNING p.id
+  """
+
+  # Lock the parents FIRST, for the whole flush transaction — the old
+  # complete_schedule_childs was ONE statement (a `claim … FOR NO KEY UPDATE`
+  # gated the child insert and the parent park), so the reaper's ordered
+  # `FOR NO KEY UPDATE SKIP LOCKED` skipped a parent mid-spawn. Splitting the
+  # insert (whose FK takes only `FOR KEY SHARE` — compatible with the reaper's
+  # `NO KEY UPDATE`) from the park would otherwise let the reaper reclaim a
+  # parent between them, committing orphan children whose `parent_id` decrements a
+  # join barrier the reclaimed parent will re-arm — a join-barrier violation. This
+  # NO KEY UPDATE lock (id order, matching the reaper) makes the reaper SKIP the
+  # parent, restoring the all-or-nothing property.
+  @flush_childs_lock_sql "SELECT id FROM gen_durable WHERE id = ANY($1::bigint[]) " <>
+                           "AND status = 'executing' ORDER BY id FOR NO KEY UPDATE"
+
+  defp flush_schedule_childs(_repo, []), do: []
+
+  defp flush_schedule_childs(repo, entries) do
+    q!(repo, "flush_childs_lock", @flush_childs_lock_sql, [Enum.map(entries, & &1.id)])
+
+    flat = for e <- entries, child <- e.children, do: {child, e.id, e.worker}
+
+    counts =
+      case flat do
+        [] ->
+          %{}
+
+        _ ->
+          children = Enum.map(flat, fn {c, _, _} -> c end)
+          parent_ids = Enum.map(flat, fn {_, pid, _} -> pid end)
+          workers = Enum.map(flat, fn {_, _, w} -> w end)
+
+          %{rows: rows} =
+            q!(repo, "flush_childs_insert", @flush_childs_insert_sql, column_arrays(children) ++ [parent_ids, workers])
+
+          rows |> List.flatten() |> Enum.frequencies()
+      end
+
+    %{rows: parked} =
+      q!(repo, "flush_childs_park", @flush_childs_park_sql, [
+        Enum.map(entries, & &1.id),
+        Enum.map(entries, & &1.worker),
+        Enum.map(entries, & &1.step),
+        Enum.map(entries, & &1.state),
+        Enum.map(entries, fn e -> Map.get(counts, e.id, 0) end)
+      ])
+
+    for [id] <- parked,
+        do: {id, nil, if(Map.get(counts, id, 0) == 0, do: "runnable", else: "awaiting_children")}
+  end
+
+  # consume — terminal rows drop their whole inbox; progressing rows drop the exact
+  # awaited ids they saw. Both scoped to committed (a stale row's signals belong to
+  # its new claimant; an :await/:retry consumes nothing — empty consumed_ids).
+  defp flush_consume(repo, entries, committed, committed_ids) do
+    terminal_ids = for {id, _p, s} <- committed, s in ["done", "failed"], do: id
+
+    if terminal_ids != [],
+      do:
+        q!(
+          repo,
+          "flush_consume_terminal",
+          "DELETE FROM signals WHERE target_id = ANY($1::bigint[])",
+          [terminal_ids]
         )
-        SELECT count(*) FROM committed
-        """,
-        [parent_id, next_step, state_json, consumed_ids, worker]
-      )
 
-    committed?(n)
+    {tids, sids} =
+      entries
+      |> Enum.filter(&(MapSet.member?(committed_ids, &1.id) and &1.consumed_ids != []))
+      |> Enum.flat_map(fn e -> Enum.map(e.consumed_ids, &{e.id, &1}) end)
+      |> Enum.unzip()
+
+    if tids != [],
+      do:
+        q!(
+          repo,
+          "flush_consume_pairs",
+          "DELETE FROM signals s USING unnest($1::bigint[], $2::bigint[]) AS d(tid, sid) " <>
+            "WHERE s.target_id = d.tid AND s.id = d.sid",
+          [tids, sids]
+        )
+
+    :ok
   end
 
-  # Children ride in as 12 parallel arrays via `unnest` (base 4: $5..$16), so the
-  # parameter count is fixed — 17 for any batch size (the wire protocol caps a
-  # statement at 65535 parameters, ~5400 rows in per-row-placeholder form) — and
-  # the SQL text is static (statement-cacheable). $1 doubles as the parent_id column.
-  # The ownership guard lives in a leading `claim` CTE (SELECT … FOR UPDATE): the
-  # children insert, the consume, and the parent park are all gated on it, because
-  # the park needs the inserted-children count and so cannot itself be the guard.
-  # Children insert ORDER BY correlation_key — same arbiter-deadlock discipline
-  # as insert_all (see there).
-  def complete_schedule_childs(
-        repo,
-        parent_id,
-        worker,
-        next_step,
-        state_json,
-        children,
-        consumed_ids
-      ) do
-    sql =
-      "WITH claim AS (SELECT id FROM gen_durable " <>
-        "WHERE id = $1 AND locked_by = $17 AND status = 'executing' FOR NO KEY UPDATE), " <>
-        "consumed AS (DELETE FROM signals WHERE target_id IN (SELECT id FROM claim) " <>
-        "AND id = ANY($4::bigint[])), " <>
-        "ins AS (INSERT INTO gen_durable (#{@insert_cols}, parent_id) " <>
-        @unnest_row_select <>
-        ", $1 " <>
-        unnest_from(4) <>
-        " WHERE EXISTS (SELECT 1 FROM claim)" <>
-        " ORDER BY t.correlation_key" <>
-        " ON CONFLICT (correlation_guard) WHERE correlation_guard IS NOT NULL DO NOTHING RETURNING 1), " <>
-        "cnt AS (SELECT count(*) AS n FROM ins) " <>
-        "UPDATE gen_durable SET step = $2, state = $3::text::jsonb, " <>
-        "children_pending = (SELECT n FROM cnt), " <>
-        "status = (CASE WHEN (SELECT n FROM cnt) = 0 THEN 'runnable' " <>
-        "ELSE 'awaiting_children' END)::durable_status, " <>
-        "eligible_at = now(), attempt = 0, awaits = null, rate_limit = null, weight = 1, " <>
-        "concurrency_shard = null, " <>
-        "locked_by = null, lease_expires_at = null, updated_at = now() " <>
-        "WHERE id IN (SELECT id FROM claim)"
+  # notify — one aggregated decrement per parent (dedup collapses N siblings in this
+  # batch into a single −cnt on the parent row). parent_id order for the lock
+  # discipline. Returns the queues of parents this batch woke (their join completed).
+  defp flush_notify(repo, committed) do
+    committed
+    |> Enum.filter(fn {_id, p, s} -> not is_nil(p) and s in ["done", "failed"] end)
+    |> Enum.frequencies_by(fn {_id, p, _s} -> p end)
+    |> Enum.sort()
+    |> case do
+      [] ->
+        []
 
-    args =
-      [parent_id, next_step, state_json, consumed_ids] ++
-        column_arrays(children) ++ [worker]
-
-    %{num_rows: n} = q!(repo, "schedule_childs", sql, args)
-    committed?(n)
+      pairs ->
+        {pids, cnts} = Enum.unzip(pairs)
+        %{rows: wrows} = q!(repo, "flush_notify", @flush_notify_sql, [pids, cnts])
+        Enum.uniq(for [q] <- wrows, not is_nil(q), do: q)
+    end
   end
 
   # --- signals ---------------------------------------------------------------
@@ -1088,7 +1004,7 @@ defmodule GenDurable.Queries do
   #   ins    — the inbox row; ON CONFLICT makes dedup_key redelivery idempotent.
   #   wake   — the delivery side of the lost-wakeup fix. Joins target by id with
   #            the flip condition in CASE, not WHERE, so it always locks the
-  #            row: racing a park (complete_await) it queues behind the park's
+  #            row: racing a park (the flush await) it queues behind the park's
   #            row lock and re-evaluates the CASE against the committed row
   #            (READ COMMITTED follows the update chain), flipping the freshly-
   #            parked row. A status-guarded WHERE would skip the not-yet-parked

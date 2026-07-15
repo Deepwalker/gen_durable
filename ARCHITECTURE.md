@@ -23,8 +23,9 @@ death.
 | `GenDurable` (`gen_durable.ex`) | Public API: `insert`/`insert_all`/`await`/`signal`/`child_spec`; builds insert params; fires pokes. |
 | `Supervisor` (`supervisor.ex`) | Engine supervisor. Parses opts, builds the `config` (into `:persistent_term` `{GenDurable, name}`), seeds limiter policy, starts the per-node component tree. **Start here to see what runs.** |
 | `Scheduler` (`scheduler.ex`) | Per-queue feeder+executor loop. Claims into a small buffer, spawns ≤`concurrency` Tasks, heartbeats claimed rows, discovers work by poke/poll, drains on shutdown. |
-| `Executor` (`executor.ex`) | Runs one picked job: resolve FSM → load state → `step/2` (guarded) → apply outcome → credit the limiter slot → poke downstream wakes. With `inline_execution:`, loops a `:next` into the next step in the SAME task (guarded `continue_next` + out-of-band admit) instead of requeuing. |
-| `Queries` (`queries.ex`) | **Every SQL statement, one function each.** The pick (`@claim_sql`), the `complete_*` outcomes, heartbeat/reap/reclaim, GC + bucket reconcile, insert/signal. The single largest and most invariant-dense file. |
+| `Executor` (`executor.ex`) | Runs one picked job: resolve FSM → load state → `step/2` (guarded) → build the outcome and commit it through the queue's `Flusher` (blocks until durable). With `inline_execution:`, loops a `:next` into the next step in the SAME task (keep-executing continue commit + out-of-band admit) instead of requeuing. |
+| `Flusher` (`flusher.ex`) | Group-commit coordinator. Worker Tasks block on it; it coalesces their outcomes into one batched `Queries.flush/1` transaction (triggers: `max_batch` ∨ `max_delay_ms`), then runs batched side effects (credit/notify/poke). One per `flushers:` spec, owning a queue set. |
+| `Queries` (`queries.ex`) | **Every SQL statement, one function each.** The pick (`@claim_sql`), the batched outcome `flush/1`, heartbeat/reap/reclaim, GC + bucket reconcile, insert/signal. The single largest and most invariant-dense file. |
 | `Limiter` (`limiter.ex`) | Behaviour + dispatch for **out-of-band admission** of configured limits: `admit`/`credit`/`renew`/`sync_config`/`reconcile`. A limiter is a `{module, handle}`. |
 | `Limiter.Postgres` (`limiter/postgres.ex`) | Default backend: the sharded `gen_durable_buckets` admission math (`@admit_sql`), as standalone statements over the claimed batch. |
 | `Limiter.Redis` (`limiter/redis.ex`) | Redis backend: a lease-scored ZSET semaphore (self-heals on lease expiry) + a Lua token bucket. Single-node Redis. Requires optional `:redix`. |
@@ -76,6 +77,7 @@ Indexes worth knowing (each backs a specific invariant/scan):
 - a **`Task.Supervisor`** (runs the step Tasks)
 - **poke children** — a Redis publisher + `Poke.Listener`, only under `{:redis,_}`
 - **limiter children** — a Redix connection, only under `limiter: {:redis,_}`
+- **`Flusher`(s)** — one group-commit coordinator per `flushers:` spec (default one `:all`)
 - **`Reaper`** and **`GC`** — each optional per node (`reaper: false`/`gc: false` for
   web-only/worker-only topologies; the cluster needs ≥1 of each somewhere)
 - one **`Scheduler`** per configured queue
@@ -87,18 +89,19 @@ coexist and the public API resolves the right one.
 
 - **Insert → run.** `insert` writes a `runnable` row and pokes the queue → the `Scheduler`
   `pick`s (claim `runnable→executing` leased, K=1 in-band, configured limits admitted
-  out-of-band — see below) → an `Executor` Task runs `step/2` → a `complete_*` outcome commits
-  the next state under the ownership guard (`locked_by` + `executing`) and credits the limiter
-  slot → downstream pokes fire.
+  out-of-band — see below) → an `Executor` Task runs `step/2` → it hands the outcome to the
+  queue's `Flusher` and **blocks until durable**; the flusher coalesces waiting outcomes into
+  one batched `flush/1` transaction (guarded by `locked_by` + `executing`), then batches the
+  side effects (credit / notify / downstream pokes).
 - **Inline execution (run-ahead).** For an `inline_execution:` FSM, a `:next` doesn't requeue:
-  the Executor commits the next state with `continue_next` (KEEPS the row `executing`, same
-  claim — same guard, durability unchanged) and runs the next step in the same task. The
-  guarded commit runs FIRST so it re-proves ownership before the (unguarded) out-of-band
-  admit; then `Limiter.admit` secures the next step's rate token / configured concurrency slot
-  (an unconfigured new key rides the K=1 arbiter inside `continue_next` itself). Denied ⇒ the
-  row requeues and the picker admits it — inline is a fast path, not a semantic change. A
-  changed slot is reported to the scheduler (`{:slot_swap, …}`) so the heartbeat renews the
-  right one.
+  the Executor commits the next state through the flush as a keep-executing continue entry
+  (KEEPS the row `executing`, same claim — same guard, durability unchanged) and runs the next
+  step in the same task. The guarded commit runs FIRST so it re-proves ownership before the
+  (unguarded) out-of-band admit; then `Limiter.admit` secures the next step's rate token /
+  configured concurrency slot. An unconfigured new key is **not inlined** (its NULL-shard
+  continue could abort the shared batch on the K=1 arbiter) — it requeues and the picker
+  serializes it. Denied ⇒ requeue. A changed slot is reported to the scheduler
+  (`{:slot_swap, …}`) so the heartbeat renews the right one.
 - **Limiter (configured rate/concurrency).** The pick claims candidates lock-light, then
   `Limiter.admit/2` decides who runs (debiting tokens / taking slots) as a separate statement;
   denied rows are released back to `runnable`. On outcome, `Limiter.credit/2` returns the slot;
@@ -116,7 +119,7 @@ coexist and the public API resolves the right one.
 
 ## Invariants (and where they live)
 
-- **Durability / at-least-once** — the outcome commits before proceeding (`Queries.complete_*`);
+- **Durability / at-least-once** — the outcome commits before proceeding (the batched `Queries.flush/1`; the Task blocks until durable);
   a pre-commit crash re-runs the step.
 - **Ownership guard** — every outcome commits only while `locked_by = $worker AND status =
   'executing'`; side effects ride the guarded UPDATE's `RETURNING` (`Queries`).

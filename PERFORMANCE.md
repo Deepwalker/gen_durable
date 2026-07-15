@@ -30,23 +30,28 @@ The database work per step, and where it goes:
 |---|---|---|---|
 | **pick** | 3 (window-dedup claim + batched signal load + batched children load) | ~`3/B` per step | one pick claims and enriches a batch of `B`; the feeder amortizes it |
 | **user `step/2`** | 0 | 0 | runs outside any transaction |
-| **outcome** | 1 CTE (`consumed` DELETE + outcome UPDATE [+ parent-join]) | **1** | folded from a 4–5-stmt transaction into one statement (F4) |
+| **outcome** | batched flush: `UPDATE … FROM unnest` [+ consume / parent-join / recheck / children] | ~`3/F` per step | one flush transaction commits `F` outcomes across instances (group commit) |
 
-So a plain `:next` step is **~1 round-trip** — its outcome — with the pick (including the
-inbox/children enrichment) amortized to near-zero by batching. The outcome used to be a
-4-statement `BEGIN`/consume/`UPDATE`/`COMMIT` transaction (+1 for `:done`/`:stop`'s
-parent-join); folding it into a single data-modifying CTE made it **1** — measured at
-exactly one statement (`test/perf_test.exs`), and consistently faster than the
-transaction form on wall-clock (the round-trips are the cost). The two per-step loads
-(signals, children) that used to add 2 round-trips per step are gone: the pick
-batch-loads them for the whole claim set (asserted at exactly 3 statements per pick in
-`test/perf_test.exs`). The exception is `:await` — deliberately a 4-round-trip
-transaction (park + recheck buys the lost-wakeup fix; parking is externally-paced).
+So a plain `:next` step is **~1 round-trip's worth of DB work** — its outcome — with both the
+pick (including inbox/children enrichment) and the commit amortized across a batch. The commit
+goes through `GenDurable.Flusher`: the worker Task blocks until durable, and the flusher
+coalesces every outcome waiting on it into **one transaction** — a single
+`UPDATE gen_durable … FROM unnest(...)` for the whole batch, plus the consume / parent-join /
+await-recheck / children-insert riders. A flush of `F` outcomes is a **bounded** number of
+statements (not `F`) — `test/perf_test.exs` asserts three for a plain-`:next` batch regardless
+of size — so the per-instance commit storm (one transaction per instance per step, each its own
+lock footprint and WAL flush) is gone.
+
+The tradeoff is latency: an outcome waits up to `max_delay_ms` (default 100 ms) under light load
+(no batch to amortize). Under load the batch **auto-grows** — waiters pile up while a flush runs
+— so throughput is decoupled from that delay, and the single coordinator is not a linear
+bottleneck (step *execution* stays fully parallel; only the commit is coalesced). Tune
+`flushers: [%{queues:, max_batch:, max_delay_ms:}]` per queue.
 
 Round-trips, not query execution time, dominate: every statement below executes in
 **well under 1 ms** at the database, but each client↔Postgres hop is a network round-trip
-(~0.3–1 ms across hosts). The cost is the count of hops, which is why collapsing the
-outcome from 4 hops to 1 matters more than any single statement's plan.
+(~0.3–1 ms across hosts). The cost is the count of hops — which is why coalescing N per-instance
+commits into one batched transaction matters more than any single statement's plan.
 
 ### 1.1 Inline execution (run-ahead) — trading the re-pick for a held claim
 
@@ -56,7 +61,7 @@ claim already held:
 
 | Phase (chained step) | Statements | Notes |
 |---|---|---|
-| **`continue_next`** | 1 | guarded commit that keeps the row `executing` (durability unchanged) |
+| **continue commit** | batched flush | keep-executing continue entry, coalesced with other outcomes (durability unchanged) |
 | **enrich** | 2 | the same batched inbox + children loads a re-pick would run — a fresh snapshot |
 | **`Limiter.admit`** | 0 or 1 | only when the next step is rate-limited or adopts a *configured* concurrency key |
 
@@ -394,14 +399,18 @@ the drain loop's backoff, not the engine.
 Every outcome and every signal/insert touches rows **by primary key or a covering index** —
 constant work regardless of table size.
 
-### The collapsed outcome (F4) — the plan, not the statement count
+### The batched flush — the plan, not the statement count
 
-Each `complete_*` is one statement (§1): the signal consume rides as a leading `consumed`
-CTE, and `:done`/`:stop` carry the parent-join as the main `UPDATE` after a `terminal` CTE.
-Counting "one statement" only proves the *round-trip* — the plan has to prove the single
-statement is *cheap*. Here is the heaviest outcome, `complete_done` on a **child** (all
-three parts: consume + done + parent decrement), measured with **50,000 children present**
-so the parent path is real, not a one-row fixture:
+The outcome flush is one transaction (§1): the guarded `UPDATE gen_durable … FROM unnest(...)`
+joins the parameter arrays to `gen_durable` **by primary key** (a nested loop over the batch,
+one PK probe per row — the same shape `insert_all` relies on), and the riders (signal consume,
+parent-join, await-recheck, children-insert) are each index scans over the committed set.
+Counting statements only proves the *round-trip* — the plan has to prove each is *cheap*, and
+each is **O(1) per row** (PK/covering-index bound), so a batch of `F` is `O(F)` index probes in
+one transaction, not `O(table)`. Below is the per-row shape of the heaviest case, a terminal on
+a **child** (consume + terminal update + parent decrement), measured with **50,000 children
+present** so the parent path is real, not a one-row fixture — the batched flush runs this shape
+once for the whole batch, every node a PK/index scan:
 
 ```
 Update on gen_durable p                                          ← the parent decrement
@@ -627,7 +636,7 @@ The pick is amortized out by the feeder batch (`0.7 ms / 50 rows ≈ 14 µs/row`
 
 ## 7. Optimization backlog — ordered by payoff
 
-1. ✅ **Collapse the outcome transaction into one CTE statement** — done (F4): a 4–5-stmt
+1. ✅ **Collapse the outcome transaction into one statement** — done (F4), later superseded by the batched group-commit flush (§1): a 4–5-stmt
    `BEGIN … COMMIT` became one data-modifying CTE, ~4 round-trips → 1, the biggest single
    win on the hot path. Asserted single-statement in `test/perf_test.exs`.
 2. ✅ **Kill the per-step `load_signals` / `load_childs`** — done, and better than the

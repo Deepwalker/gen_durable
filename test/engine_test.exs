@@ -16,7 +16,11 @@ defmodule GenDurable.EngineTest do
       poll_interval: 25,
       lease_ttl: 1_000,
       heartbeat_interval: 300,
-      reaper: [interval: 150]
+      reaper: [interval: 150],
+      # Tests run one instance at a time, so the group-commit deadline is pure
+      # latency (no batch to amortize) — keep it short so the suite stays fast.
+      # Production keeps the 100ms default.
+      flushers: [%{queues: :all, max_delay_ms: 5}]
     ]
 
     start_supervised!({GenDurable, Keyword.merge(defaults, opts)})
@@ -547,8 +551,19 @@ defmodule GenDurable.EngineTest do
 
     eventually(fn -> if row_count(id) == 0, do: {:ok, :gone}, else: :retry end)
 
-    assert_receive {:telemetry, [:gen_durable, :gc, :swept], %{count: c}, _}, 2_000
-    assert c >= 1
+    # The row is gone, so a sweep with count>=1 happened; find it among any
+    # count-0 sweeps (GC also emits :swept for bucket/gate reconciliation, which
+    # can tick before the :done commit lands through the group-commit flush).
+    assert_swept_count_at_least_one()
+  end
+
+  defp assert_swept_count_at_least_one do
+    receive do
+      {:telemetry, [:gen_durable, :gc, :swept], %{count: c}, _} when c >= 1 -> :ok
+      {:telemetry, [:gen_durable, :gc, :swept], _, _} -> assert_swept_count_at_least_one()
+    after
+      2_000 -> flunk("expected a :gc :swept event with count >= 1")
+    end
   end
 
   test "gc: false runs no GC on this node; terminal rows persist" do
@@ -793,7 +808,10 @@ defmodule GenDurable.EngineTest do
       [id]
     )
 
-    {:ok, _} = GenDurable.Queries.complete_done(Repo, id, "foreign", ~s({"via": "watcher"}))
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'done', result = $2::jsonb, locked_by = null, updated_at = now() WHERE id = $1",
+      [id, ~s({"via": "watcher"})]
+    )
 
     assert {:done, %{"via" => "watcher"}} = Task.await(waiter)
   end
@@ -810,7 +828,10 @@ defmodule GenDurable.EngineTest do
       [id]
     )
 
-    {:ok, _} = GenDurable.Queries.complete_done(Repo, id, "bare", ~s({}))
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'done', result = $2::jsonb, locked_by = null, updated_at = now() WHERE id = $1",
+      [id, ~s({})]
+    )
 
     assert {:done, %{}} = Task.await(waiter)
   end
@@ -847,7 +868,10 @@ defmodule GenDurable.EngineTest do
       [id]
     )
 
-    {:ok, _} = GenDurable.Queries.complete_done(Repo, id, "foreign", ~s({"via": "rearm"}))
+    Repo.query!(
+      "UPDATE gen_durable SET status = 'done', result = $2::jsonb, locked_by = null, updated_at = now() WHERE id = $1",
+      [id, ~s({"via": "rearm"})]
+    )
 
     assert {:done, %{"via" => "rearm"}} = Task.await(waiter, 11_000)
     # well under the deadline: the re-arm pass (≤1s) picked it up

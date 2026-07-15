@@ -149,6 +149,9 @@ defmodule GenDurable.Scheduler do
       heartbeat_interval: opts.heartbeat_interval,
       drain_timeout: opts.drain_timeout,
       task_sup: opts.task_sup,
+      # The queue's group-commit coordinator: stamped on every dispatched job so
+      # the worker Task commits its outcome through the batched flush.
+      flusher: opts.flusher,
       buffer: [],
       in_flight: %{},
       # A pending debounced poke-fill (nil = none armed); coalesces a poke stream — see :poke.
@@ -374,6 +377,7 @@ defmodule GenDurable.Scheduler do
   defp drain(%{buffer: [job | rest]} = state)
        when map_size(state.in_flight) < state.concurrency do
     sched = self()
+    job = Map.put(job, :flusher, state.flusher)
 
     task =
       Task.Supervisor.async_nolink(state.task_sup, fn ->

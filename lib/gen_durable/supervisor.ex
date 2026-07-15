@@ -91,7 +91,8 @@ defmodule GenDurable.Supervisor do
     max_poll_interval: 5_000,
     drain_timeout: 5_000,
     rate_limits: [],
-    concurrency_limits: []
+    concurrency_limits: [],
+    flushers: [%{queues: :all}]
   ]
 
   @reaper_defaults [interval: 30_000]
@@ -177,6 +178,26 @@ defmodule GenDurable.Supervisor do
 
     task_sup = Module.concat(name, TaskSupervisor)
 
+    # Group-commit coordinators. Each `flushers:` spec becomes one Flusher owning
+    # the queues that route to it (first-match-wins); a queue's scheduler stamps
+    # its flusher on every dispatched job so the worker Task commits through it.
+    flusher_specs = parse_flushers(Keyword.fetch!(opts, :flushers))
+    validate_flusher_coverage!(flusher_specs, Keyword.fetch!(opts, :queues))
+
+    flusher_children =
+      for {spec, i} <- Enum.with_index(flusher_specs) do
+        Supervisor.child_spec(
+          {GenDurable.Flusher,
+           [
+             name: flusher_name(name, i),
+             config: config,
+             max_batch: spec.max_batch,
+             max_delay_ms: spec.max_delay_ms
+           ]},
+          id: {GenDurable.Flusher, i}
+        )
+      end
+
     schedulers =
       for {queue_name, concurrency} <- Keyword.fetch!(opts, :queues) do
         queue = to_string(queue_name)
@@ -194,7 +215,8 @@ defmodule GenDurable.Supervisor do
           max_poll_interval: Keyword.fetch!(opts, :max_poll_interval),
           heartbeat_interval: Keyword.fetch!(opts, :heartbeat_interval),
           drain_timeout: drain_timeout,
-          task_sup: task_sup
+          task_sup: task_sup,
+          flusher: flusher_name(name, resolve_flusher_index(flusher_specs, queue))
         }
 
         # Give terminate/2 room to drain: shutdown must outlast drain_timeout, or
@@ -234,7 +256,7 @@ defmodule GenDurable.Supervisor do
         limiter_children ++
         poke_children(name, poke) ++
         reaper_child(repo, name, reaper_cfg) ++
-        gc_child(repo, limiter, name, gc_cfg) ++ schedulers
+        gc_child(repo, limiter, name, gc_cfg) ++ flusher_children ++ schedulers
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -263,6 +285,47 @@ defmodule GenDurable.Supervisor do
   end
 
   defp poke_children(_name, _mode), do: []
+
+  # `flushers:` — a list of specs, each a group-commit coordinator for the queues
+  # that route to it. A queue picks the FIRST spec whose `queues` matches it
+  # (`:all` matches everything), so specific selectors go before an `:all` catch-all.
+  # Per-spec `max_batch`/`max_delay_ms` tune that flusher. Default: one `:all` flusher.
+  defp parse_flushers(specs) when is_list(specs) and specs != [] do
+    Enum.map(specs, fn spec ->
+      %{
+        queues: normalize_flusher_queues(Map.get(spec, :queues, :all)),
+        max_batch: Map.get(spec, :max_batch, 100),
+        max_delay_ms: Map.get(spec, :max_delay_ms, 100)
+      }
+    end)
+  end
+
+  defp parse_flushers(other),
+    do: raise(ArgumentError, ":flushers must be a non-empty list of specs, got: #{inspect(other)}")
+
+  defp normalize_flusher_queues(:all), do: :all
+  defp normalize_flusher_queues(list) when is_list(list), do: Enum.map(list, &to_string/1)
+  defp normalize_flusher_queues(one), do: [to_string(one)]
+
+  defp flusher_matches?(:all, _queue), do: true
+  defp flusher_matches?(list, queue), do: queue in list
+
+  defp resolve_flusher_index(specs, queue),
+    do: Enum.find_index(specs, &flusher_matches?(&1.queues, queue))
+
+  defp flusher_name(name, i), do: Module.concat(name, "Flusher#{i}")
+
+  defp validate_flusher_coverage!(specs, queues) do
+    for {queue_name, _concurrency} <- queues do
+      queue = to_string(queue_name)
+
+      unless resolve_flusher_index(specs, queue) do
+        raise ArgumentError,
+              "no :flushers spec matches queue #{inspect(queue)} — " <>
+                "add a %{queues: :all} spec (last) to cover it"
+      end
+    end
+  end
 
   # Build the limiter `{module, handle}` and any children it needs. Postgres needs none;
   # Redis needs a dedicated (sync-connecting) Redix connection, ordered before the schedulers.

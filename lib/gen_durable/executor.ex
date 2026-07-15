@@ -12,11 +12,12 @@ defmodule GenDurable.Executor do
 
   Inline execution (run-ahead): an `inline_execution:` FSM's `:next` runs the
   next step in THIS task on the same claim instead of requeuing — a guarded
-  `continue_next` commit (keeps the row `executing`; durability unchanged) then
-  an out-of-band `Limiter.admit` for the next step's tokens; denied ⇒ the row
-  requeues and the picker admits it. The chained step gets a fresh inbox/children
-  snapshot (re-enriched per step), so its `ctx` matches what a re-pick would hand
-  it. Disabled when `run/3`'s `sched` is `nil` (the `Testing.drain/1` path).
+  continue commit through the flush that KEEPS the row `executing` (durability
+  unchanged; the Task blocks until it lands) then an out-of-band `Limiter.admit`
+  for the next step's tokens; denied ⇒ the row requeues and the picker admits it.
+  The chained step gets a fresh inbox/children snapshot (re-enriched per step), so
+  its `ctx` matches what a re-pick would hand it. Disabled when `run/3`'s `sched`
+  is `nil` (the `Testing.drain/1` path).
 
   Signal consumption: a step sees the awaited subset as `ctx.awaited`
   (only the signals whose name is in the set it parked on) and the whole inbox as
@@ -26,13 +27,13 @@ defmodule GenDurable.Executor do
   Deletion happens in SQL, by id.
 
   Outcomes commit only while this worker still owns the claim (`locked_by` +
-  `status = 'executing'` guard in every `complete_*`): an orphaned task whose
+  `status = 'executing'` guard in the flush): an orphaned task whose
   lease expired and whose row was reclaimed gets its late outcome dropped —
   observable as `[:gen_durable, :outcome, :stale]` — and the current claimant
   redoes the step (at-least-once).
   """
 
-  alias GenDurable.{Context, Outcome, Queries, Registry, State}
+  alias GenDurable.{Context, Flusher, Outcome, Queries, Registry, State}
 
   @doc """
   Execute `job` (a map returned by `Queries.pick/5`). `config` is `%{repo: ...}`.
@@ -97,7 +98,7 @@ defmodule GenDurable.Executor do
   # --- inline continuation (run-ahead) ---------------------------------------
   #
   # A `:next` whose FSM (or this transition's opts) enables `inline_execution` tries to run
-  # the next step in place. The commit that keeps the row `executing` (`continue_next`) is
+  # the next step in place. The commit that keeps the row `executing` (a continue flush entry) is
   # GUARDED and runs FIRST — it doubles as the ownership proof, so the subsequent (unguarded,
   # out-of-band) `Limiter.admit` can never fire from an orphaned task onto a row a new
   # claimant owns. If the next step's rate/concurrency tokens can't be secured, the row is
@@ -133,38 +134,68 @@ defmodule GenDurable.Executor do
   defp attempt_inline(config, job, step, state_json, opts, consumed, sched, outcome) do
     plan = conc_plan(opts.concurrency_key, job, config)
 
-    # Phase 1: guarded commit that KEEPS the row executing (durability + ownership proof).
-    case Queries.continue_next(
-           config.repo,
-           job.id,
-           job.worker,
-           step,
-           state_json,
-           consumed,
-           opts.rate_limit,
-           opts.weight,
-           plan.set_key,
-           plan.key_value,
-           plan.set_shard,
-           plan.shard_value,
-           config.lease_ttl_ms
-         ) do
-      :stale ->
-        # Lease expired mid-step and the row was reclaimed — drop, the new claimant redoes
-        # it (at-least-once), exactly like a stale outcome. Nothing admitted yet, nothing leaks.
-        emit_stale(job, outcome)
-        :done
+    if plan.inline_ok do
+      # Phase 1: guarded commit that KEEPS the row executing (durability + ownership proof),
+      # through the SAME batched flush as every other commit — the Task blocks until it lands.
+      case Flusher.commit(
+             job.flusher,
+             continue_entry(job, step, state_json, opts, plan, consumed, config.lease_ttl_ms)
+           ) do
+        :stale ->
+          # Lease expired mid-step and the row was reclaimed — drop, the new claimant redoes
+          # it (at-least-once). Nothing admitted yet, nothing leaks.
+          emit_stale(job, outcome)
+          :done
 
-      :contended ->
-        # An unconfigured new concurrency_key is already held — requeue and let the picker's
-        # K=1 arbiter serialize it. Nothing committed by continue_next (it rolled back).
-        emit_yield(job, outcome, :contended)
-        apply_outcome(config, config.repo, job, outcome, consumed)
-        :done
+        {:error, _reason} ->
+          # The flush transaction failed; the row stays executing for the reaper.
+          :done
 
-      :ok ->
-        finish_inline(config, job, step, state_json, opts, consumed, plan, sched, outcome)
+        :committed ->
+          finish_inline(config, job, step, state_json, opts, consumed, plan, sched, outcome)
+      end
+    else
+      # An unconfigured new concurrency_key can collide on the K=1 arbiter, which in a batched
+      # flush would abort the WHOLE batch — so never inline it; requeue and let the picker's
+      # arbiter serialize the key (as a fused pick would).
+      emit_yield(job, outcome, :contended)
+      apply_outcome(config, config.repo, job, outcome, consumed)
+      :done
     end
+  end
+
+  # The inline-continue flush entry: like a :next, but KEEPS the row executing
+  # (keep_lock, lease extended) so the same Task runs the next step in place. Shard/key
+  # follow the plan (provisional 0 for a configured new key; the subsequent admit stamps
+  # the real shard).
+  defp continue_entry(job, step, state_json, opts, plan, consumed, lease_ttl_ms) do
+    %{
+      base_entry(job)
+      | status: "executing",
+        keep_lock: true,
+        # The row KEEPS its concurrency slot across the inline step (it stays executing) — so the
+        # flush must NOT credit it. Slot lifecycle on an inline chain is handled explicitly in
+        # `finish_inline` (credit the old slot only on a key change). base_entry set slot: job.slot.
+        slot: nil,
+        lease_ttl_ms: lease_ttl_ms,
+        set_step: true,
+        step: step,
+        set_state: true,
+        state: state_json,
+        set_attempt: true,
+        attempt: 0,
+        set_eligible: true,
+        delay_ms: 0,
+        clear_awaits: true,
+        set_rate: true,
+        rate_limit: opts.rate_limit,
+        weight: opts.weight * 1.0,
+        set_ck: plan.set_key,
+        ck_value: plan.key_value,
+        set_shard: plan.set_shard,
+        shard_value: plan.shard_value,
+        consumed_ids: consumed
+    }
   end
 
   # Phase 2: secure the next step's tokens out-of-band. The guarded commit already landed, so
@@ -194,7 +225,7 @@ defmodule GenDurable.Executor do
 
   # Call the limiter only when the next step actually needs a token: a fresh rate token, or a
   # slot for a CONFIGURED new concurrency key. `:keep`, a key release, and an unconfigured new
-  # key (K=1, handled in-band by continue_next) need no admission.
+  # key (K=1, handled in-band by the flush continue) need no admission.
   defp admit_inline(config, job, plan, opts) do
     rate = if opts.rate_limit, do: {opts.rate_limit, opts.weight}
 
@@ -217,13 +248,13 @@ defmodule GenDurable.Executor do
   defp resolve_slot(%{new_slot: :none}, _job, _admitted), do: nil
   defp resolve_slot(%{new_slot: :from_admit}, _job, admitted), do: admitted
 
-  # Directives for `continue_next` + admission, from the next step's `concurrency_key`:
+  # Directives for the continue flush entry + admission, from the next step's `concurrency_key`:
   #   :keep — hold the current key/shard/slot, admit nothing.
   #   nil   — release the key (clear key + shard), credit the old slot, admit nothing.
   #   configured new key — set key + PROVISIONAL shard (out of K=1); admit stamps the real
   #                        shard and draws the slot; credit the old one.
   #   unconfigured new key — set key + NULL shard (re-enters the K=1 arbiter, enforced by
-  #                          continue_next); no slot, credit the old one.
+  #                          the flush continue); no slot, credit the old one.
   defp conc_plan(:keep, _job, _config),
     do: %{
       set_key: false,
@@ -232,7 +263,8 @@ defmodule GenDurable.Executor do
       shard_value: nil,
       admit_conc: nil,
       credit_old: false,
-      new_slot: :keep
+      new_slot: :keep,
+      inline_ok: true
     }
 
   defp conc_plan(nil, _job, _config),
@@ -243,7 +275,8 @@ defmodule GenDurable.Executor do
       shard_value: nil,
       admit_conc: nil,
       credit_old: true,
-      new_slot: :none
+      new_slot: :none,
+      inline_ok: true
     }
 
   defp conc_plan(key, _job, config) when is_binary(key) do
@@ -257,9 +290,12 @@ defmodule GenDurable.Executor do
         shard_value: 0,
         admit_conc: key,
         credit_old: true,
-        new_slot: :from_admit
+        new_slot: :from_admit,
+        inline_ok: true
       }
     else
+      # A NEW unconfigured key would go NULL-shard into the K=1 arbiter — unsafe to inline
+      # through a shared flush batch (a collision aborts the batch). Route it through a requeue.
       %{
         set_key: true,
         key_value: key,
@@ -267,7 +303,8 @@ defmodule GenDurable.Executor do
         shard_value: nil,
         admit_conc: nil,
         credit_old: true,
-        new_slot: :none
+        new_slot: :none,
+        inline_ok: false
       }
     end
   end
@@ -401,117 +438,164 @@ defmodule GenDurable.Executor do
   # outcomes delete the whole inbox regardless (cleanup), :retry/:await delete nothing.
   # An :await passes them as the PRESENTED set instead: the park's recheck must not
   # re-wake on a signal the step already saw and chose to re-await (see
-  # Queries.complete_await). Every outcome carries the claim's worker id (ownership
+  # the flush await recheck). Every outcome carries the claim's worker id (ownership
   # guard): a `:stale` return means the lease expired and the row was reclaimed
   # while this step ran — the outcome is dropped (the new claimant redoes the
   # work) and the drop is made observable via telemetry.
-  defp apply_outcome(config, repo, job, outcome, consumed) do
-    %{id: id, worker: worker} = job
+  # Router: the four kinds that LEAVE `executing` (:next, :retry, :done, :stop)
+  # commit through the batched flush (group commit); :await and :schedule_childs
+  # carry per-row riders (park+recheck, children insert) and stay on their own
+  # single-statement path for now.
+  # Every outcome now commits through the batched flush.
+  defp apply_outcome(config, _repo, job, outcome, consumed) do
+    commit_batched(config, job, outcome, consumed)
+  end
+
+  # Hand the row's entry to the queue's flusher and block until the group commit
+  # lands (`commit_before_proceed` is preserved — the Task waits for the write).
+  # With no flusher — the `Testing.drain/1` path — flush synchronously. The flush
+  # runs every side effect (credit, notify_local, parent poke) in one place, so
+  # there is nothing to do here on success. `:stale` ⇒ the row was reclaimed; the
+  # new claimant redoes the step (at-least-once), the drop is telemetry.
+  defp commit_batched(config, job, outcome, consumed) do
+    entry = build_entry(job, outcome, consumed)
 
     result =
-      case outcome do
-        {:next, step, state_json, opts} ->
-          Queries.complete_next(
-            repo,
-            id,
-            worker,
-            step,
-            state_json,
-            consumed,
-            opts.rate_limit,
-            opts.weight,
-            opts.concurrency_key
-          )
+      case Map.get(job, :flusher) do
+        nil ->
+          committed = Flusher.commit_sync(config, [entry])
+          if MapSet.member?(committed, entry.id), do: :committed, else: :stale
 
-        {:retry, state_json, delay} ->
-          Queries.complete_retry(repo, id, worker, state_json, delay)
-
-        {:await, names, next_step, state_json, opts} ->
-          Queries.complete_await(
-            repo,
-            id,
-            worker,
-            state_json,
-            names,
-            next_step,
-            consumed,
-            opts.timeout
-          )
-
-        {:schedule_childs, next_step, child_params, state_json} ->
-          Queries.complete_schedule_childs(
-            repo,
-            id,
-            worker,
-            next_step,
-            state_json,
-            child_params,
-            consumed
-          )
-
-        {:done, result_json} ->
-          Queries.complete_done(repo, id, worker, result_json)
-
-        {:stop, reason_text} ->
-          Queries.complete_stop(repo, id, worker, reason_text)
+        flusher ->
+          Flusher.commit(flusher, entry)
       end
 
     case result do
-      :stale ->
-        :telemetry.execute(
-          [:gen_durable, :outcome, :stale],
-          %{count: 1},
-          %{id: id, fsm: job.fsm, step: job.step, kind: Outcome.kind(outcome)}
-        )
-
-      committed ->
-        # The row left `executing` — credit its concurrency slot back, out-of-band
-        # (replaces the old `credit_gate` rider). Only for a CONFIGURED gate (a slot was
-        # drawn); plain / unconfigured K=1 rows carry none. Skipped on `:stale` above: the
-        # row was reclaimed and its slot belongs to the new claimant.
-        credit_slot(config, job)
-
-        # The committed outcome may have settled the instance (terminal or
-        # parked) — nudge this node's awaiters. A hint only: awaiters re-check
-        # the row, so over-nudging (e.g. an empty schedule_childs that left the
-        # row runnable) costs one read, never correctness.
-        if Outcome.kind(outcome) in [:await, :done, :stop, :schedule_childs] do
-          GenDurable.Await.notify_local(config.name, id)
-        end
-
-        # Cross-queue wakes ride the poke transport like inserts do. Same-queue
-        # runnable rows need none of this — the scheduler that ran this step
-        # refills on its completion.
-        case outcome do
-          # freshly-inserted children may live in other queues
-          {:schedule_childs, _next, child_params, _state} ->
-            GenDurable.Poke.dispatch_rows(config.name, child_params)
-
-          _ ->
-            :ok
-        end
-
-        # a parent whose join this terminal completion satisfied (its queue
-        # rides back in the outcome's result — see Queries.complete_done)
-        case committed do
-          {:ok, parent_queue} when is_binary(parent_queue) ->
-            GenDurable.Poke.dispatch(config.name, parent_queue)
-
-          _ ->
-            :ok
-        end
+      :committed -> :ok
+      :stale -> emit_stale(job, outcome)
+      {:error, _reason} -> :ok
     end
-
-    :ok
   end
 
-  # Credit the concurrency slot the job held (the opaque handle the limiter drew at pick time)
-  # back to its backend. A configured gate carries a slot; plain / unconfigured K=1 rows carry
-  # none (`nil`).
-  defp credit_slot(config, %{slot: slot}) when not is_nil(slot),
-    do: GenDurable.Limiter.credit(config.limiter, [slot])
+  # A flush entry mirrors a `complete_*` statement, one per outcome. Every column
+  # the batched UPDATE can touch is present; `set_*` flags say which the CASE
+  # applies (unset columns keep their current value). `slot`/`notify` drive the
+  # post-flush side effects. Terminal outcomes leave `consumed_ids` empty — the
+  # flush drops their whole inbox by status; :retry keeps its awaited signals.
+  defp base_entry(job) do
+    %{
+      kind: :state,
+      id: job.id,
+      worker: job.worker,
+      slot: job.slot,
+      notify: false,
+      status: nil,
+      attempt: 0,
+      delay_ms: 0,
+      # :done/:stop keep attempt and eligible_at (terminal rows are never repicked);
+      # :next/:retry flip these on.
+      set_attempt: false,
+      set_eligible: false,
+      # inline-continue keeps the claim (keep_lock) and sets a provisional/kept shard;
+      # every other kind leaves executing (set_shard true → NULL, keep_lock false).
+      keep_lock: false,
+      set_shard: true,
+      shard_value: nil,
+      lease_ttl_ms: 0,
+      set_step: false,
+      step: nil,
+      set_state: false,
+      state: nil,
+      set_result: false,
+      result: nil,
+      set_error: false,
+      error: nil,
+      clear_awaits: false,
+      set_rate: false,
+      rate_limit: nil,
+      weight: 1.0,
+      set_ck: false,
+      ck_value: nil,
+      consumed_ids: []
+    }
+  end
 
-  defp credit_slot(_config, _job), do: :ok
+  defp build_entry(job, {:next, step, state_json, opts}, consumed) do
+    {set_ck, ck_value} =
+      if opts.concurrency_key == :keep, do: {false, nil}, else: {true, opts.concurrency_key}
+
+    %{
+      base_entry(job)
+      | status: "runnable",
+        set_attempt: true,
+        attempt: 0,
+        set_eligible: true,
+        delay_ms: 0,
+        set_step: true,
+        step: step,
+        set_state: true,
+        state: state_json,
+        clear_awaits: true,
+        set_rate: true,
+        rate_limit: opts.rate_limit,
+        weight: opts.weight * 1.0,
+        set_ck: set_ck,
+        ck_value: ck_value,
+        consumed_ids: consumed
+    }
+  end
+
+  defp build_entry(job, {:retry, state_json, delay}, _consumed) do
+    # Same step, keeps awaits and rate_limit; attempt bumps, eligible_at delays.
+    %{
+      base_entry(job)
+      | status: "runnable",
+        set_state: true,
+        state: state_json,
+        set_attempt: true,
+        attempt: job.attempt + 1,
+        set_eligible: true,
+        delay_ms: delay
+    }
+  end
+
+  defp build_entry(job, {:done, result_json}, _consumed) do
+    %{base_entry(job) | status: "done", set_result: true, result: result_json, clear_awaits: true, notify: true}
+  end
+
+  defp build_entry(job, {:stop, reason_text}, _consumed) do
+    %{base_entry(job) | status: "failed", set_error: true, error: reason_text, clear_awaits: true, notify: true}
+  end
+
+  # :await parks on `names` and transitions to `next_step`. `consumed` here is the
+  # PRESENTED set (the awaited ids the step already saw) — the recheck must not
+  # re-wake on those. Releases the slot (park leaves executing) and notifies
+  # awaiters (the instance settled).
+  defp build_entry(job, {:await, names, next_step, state_json, opts}, presented) do
+    Map.merge(base_entry(job), %{
+      kind: :await,
+      notify: true,
+      step: next_step,
+      state: state_json,
+      awaits_json: Jason.encode!(names),
+      timeout_ms: opts.timeout,
+      presented_ids: presented
+    })
+  end
+
+  # :schedule_childs spawns a child batch and parks the parent on the join barrier.
+  # `children` (child insert params) drive the batched insert in the flush and the
+  # cross-queue child poke in the side effects; `consumed` is the parent's awaited ids.
+  defp build_entry(job, {:schedule_childs, next_step, child_params, state_json}, consumed) do
+    Map.merge(base_entry(job), %{
+      kind: :schedule_childs,
+      notify: true,
+      step: next_step,
+      state: state_json,
+      children: child_params,
+      consumed_ids: consumed
+    })
+  end
 
   defp format_reason(reason) when is_binary(reason), do: reason
   defp format_reason(%{__exception__: true} = e), do: Exception.message(e)

@@ -10,9 +10,11 @@ semantics, the individual guides.
 
 Two design rules explain most of what follows:
 
-- **One statement per hot-path operation.** Claims, outcomes, and signal delivery are each a
-  single data-modifying CTE chain — one round-trip, atomic without an explicit transaction.
-  User step code runs *between* statements, outside any transaction.
+- **Few statements per hot-path operation, batched across rows.** A claim and a signal delivery
+  are each a single data-modifying CTE chain (one round-trip, atomic without an explicit
+  transaction); step outcomes are coalesced across instances into one batched flush transaction
+  (group commit — see Outcomes below). User step code runs *between* statements, outside any
+  transaction.
 - **Invalid states are uncommittable, not checked-for.** Where two nodes can race, the
   schema carries a constraint that makes the losing write impossible to commit; the loser
   retries against the winner's committed truth.
@@ -118,57 +120,77 @@ same claim plus two batched `SELECT`s enriching the whole claim set (pending sig
 children) — three statements per batch, regardless of batch size. A limited pick adds the
 admit round-trip (and a release when a limit bites).
 
-### Outcomes — one guarded statement each
+### Outcomes — the batched flush (group commit)
 
-Every outcome is `UPDATE gen_durable SET ... WHERE id = $1 AND locked_by = $worker AND
-status = 'executing'` as the guarded head of a CTE chain, with riders gated on it
-(`WHERE EXISTS (SELECT 1 FROM committed)`), so a stale outcome commits *nothing at all*:
+Every step outcome commits through **one shared path**. The worker Task builds the outcome,
+hands it to its queue's `GenDurable.Flusher`, and **blocks until it is durably written** —
+`commit_before_proceed` holds (the Task waits for the write; it does not run ahead of it;
+batching is orthogonal to durability). The flusher coalesces every outcome waiting on it into
+**one transaction** (`Queries.flush/1`): a single guarded `UPDATE gen_durable … FROM unnest(...)`
+applies every row's transition (the kind encoded per row via `set_*` flags), locking in `id`
+order. A row whose guard (`locked_by = $worker AND status = 'executing'`) fails is absent from
+`RETURNING`, commits nothing, and is reported `:stale` (the reclaiming claimant redoes the step).
 
 | Outcome | Row flip | Riders |
 |---|---|---|
-| `:next` | → `runnable`, new step/state, new `rate_limit`/`weight`, optional `concurrency_key` change, `concurrency_shard` cleared | `consumed` (DELETE handled signals) |
-| `:retry` | → `runnable` with backoff, `attempt` kept incrementing, `awaits` kept | — |
-| `:await` | → `awaiting_signal` + `awaits`/deadline | the one **multi-statement** op: park + recheck in a short transaction (the recheck closes the signal-raced-the-park window) |
-| `:done` / `:stop` | → `done`/`failed` + `result`/`last_error` | `consumed`, and the parent join: decrement the parent's `children_pending`, waking it at zero |
-| `schedule_childs` | → `awaiting_children` (or `runnable` when none inserted) | `consumed`, the children `INSERT` (same unnest/conflict shape as `insert_all`) |
+| `:next` | → `runnable`, new step/state, new `rate_limit`/`weight`, optional `concurrency_key` change, `concurrency_shard` cleared | consume the awaited ids |
+| `:retry` | → `runnable` with backoff, `attempt` incremented, `awaits` kept | — |
+| `:await` | → `awaiting_signal` + `awaits`/deadline | the recheck (below) |
+| `:done` / `:stop` | → `done`/`failed` + `result`/`last_error` | consume the whole inbox; the parent join |
+| `schedule_childs` | → `awaiting_children` (or `runnable` when none inserted) | consume; the children `INSERT` |
 
-Every outcome clears `concurrency_shard` (the row is leaving `executing`), but the gate slot
-is **credited out-of-band**: the executor calls `Limiter.credit/2` after a *committed*
-(non-stale) outcome, with the `{key, shard}` the job held. A stale outcome credits nothing
-(the executor skips it, exactly as the old inline `credit` rider affected zero rows under a
-failed guard); a crash between commit and credit leaks the slot in the safe direction
-(under-admission), healed by the reconciler.
+The **riders** run as their own batched statements over the rows that committed:
 
-### Inline continuation — `continue_next`, the run-ahead commit
+- **consume** — terminal rows drop their whole inbox (`target_id = ANY`); progressing rows drop
+  the exact awaited ids (per-row `(target_id, id)` pairs); `:retry`/`:await` consume nothing.
+- **parent join** — terminal children decrement their parent, **aggregated**: N siblings in one
+  batch collapse into a single `−cnt` on the parent row (was N separate, serialized decrements);
+  a parent reaching zero wakes to `runnable`. Parents locked in `parent_id` order.
+- **await recheck** — the park's lost-wakeup fix, batched over the parked ids with per-row
+  `presented` exclusion, in the **same transaction** as the park (so a delivery racing the park
+  queues on the park's row lock and is seen either way).
+- **children insert** — `:schedule_childs` inserts every parent's children in one `unnest` INSERT
+  (each gated on its parent's ownership, `ORDER BY correlation_key` for the arbiter discipline),
+  then parks each parent with the count that actually landed (post-dedup).
 
-An `inline_execution:` FSM's `:next` does **not** leave `executing`. `continue_next` is the
-same guarded head (`WHERE id = $1 AND locked_by = $worker AND status = 'executing'`) but
-commits the next step/state while the row **stays `executing` under the same worker** and
-extends the lease — so the executor runs the next step in the same task, skipping the requeue
-→ re-pick round-trip. Durability is identical to a requeued `:next`: the next state is
-committed before that step runs; a crash re-runs it via the reaper.
+Side effects run **once, batched**, after the flush: `Limiter.credit/2` for every freed gate slot
+(the `{key, shard}` each job held; a stale outcome frees none; a crash between commit and credit
+leaks in the safe direction, healed by the reconciler), `notify_local` for settled instances, and
+deduped queue pokes (a woken parent's queue, a fan-out's cross-queue children).
 
-The concurrency handoff between steps is what the extra parameters drive:
+**Triggers & config.** A flusher flushes at `max_batch` (100) buffered outcomes ∨ `max_delay_ms`
+(100 ms) after the first. Under load the batch **auto-grows** — waiters pile up while a flush runs
+— so the single serialization point is not a linear bottleneck; under light load `max_delay_ms`
+bounds the per-commit latency the batching adds. `flushers: [%{queues: …, max_batch:,
+max_delay_ms:}]` routes each queue to the **first** matching coordinator (`:all` matches
+everything; default one `:all` flusher → no concurrent flush transactions). A blocked Task stays in
+the scheduler's `in_flight`, so the heartbeat keeps its lease alive until the flush —
+heartbeat-until-flush is automatic.
 
-| Next `concurrency_key` | `continue_next` sets | Admission (out-of-band, AFTER the commit) |
+### Inline continuation — the run-ahead commit
+
+An `inline_execution:` FSM's `:next` does **not** leave `executing`. Its continue entry is committed
+by the same flush with `keep_lock` — the row **stays `executing` under the same worker** and the
+lease is extended — so the executor runs the next step in the same task, skipping the requeue →
+re-pick round-trip. Durability is identical to a requeued `:next`: the next state is committed
+(the Task blocks on the flush) before that step runs; a crash re-runs it via the reaper.
+
+The concurrency handoff between steps:
+
+| Next `concurrency_key` | continue entry sets | Admission (out-of-band, AFTER the commit) |
 |---|---|---|
-| `:keep` (default) | nothing — same key/shard/slot held across the step | none (still holding the slot) |
+| `:keep` (default) | nothing — same key/shard/slot held | none (still holding the slot) |
 | `nil` (release) | `concurrency_key` = NULL, `concurrency_shard` = NULL | none; the old slot is credited |
-| configured new key | key = new, shard = **provisional 0** (out of the K=1 index) | `Limiter.admit` debits the bucket, **stamps the real shard**, draws the slot; old slot credited |
-| unconfigured new key | key = new, shard = NULL (re-enters the K=1 arbiter) | none; a `gen_durable_concurrency_active` violation ⇒ **`:contended`**, the row requeues and the picker serializes the key; old slot credited |
+| configured new key | key = new, shard = **provisional 0** (out of the K=1 index) | `Limiter.admit` debits the bucket, **stamps the real shard**, draws the slot; old credited |
+| unconfigured new key | **not inlined** | the row requeues (a NULL-shard continue that stays `executing` could collide on `gen_durable_concurrency_active` and abort the whole batch); the picker serializes the key |
 
-**Ordering is a correctness invariant, not a preference.** The guarded `continue_next` runs
-**before** `Limiter.admit`, because the PG limiter's admit `stamp`s `concurrency_shard` by id
-**unguarded** by `locked_by`. If an orphaned chained task (its lease expired, its row
-reclaimed) reached admit, that stamp would land on a row a new claimant owns — corrupting its
-shard and, for an unconfigured key, dropping it out of the K=1 index (breaking exclusion). By
-committing first, an orphan fails the guard (`:stale`) and never admits. If admit then denies
-(rate token unaffordable / configured slot full), the row is requeued through the normal
-outcome path and the picker admits it — inline never over-runs a limit.
-
-A slot that changed mid-chain is reported to the scheduler (`{:slot_swap, id, slot}`) so the
-heartbeat's `Limiter.renew` bumps the **current** slot; a lease-native backend (Redis) would
-otherwise prune a slot it stops hearing about and double-book the key.
+**Ordering is a correctness invariant.** The guarded continue commit runs **before**
+`Limiter.admit`, because the PG limiter's admit `stamp`s `concurrency_shard` by id **unguarded** by
+`locked_by`. An orphaned chained task (lease expired, row reclaimed) fails the flush guard
+(`:stale`) and never admits — so its stamp never lands on a row a new claimant owns. Denied admit
+(rate token unaffordable / configured slot full) requeues the row through the normal flush and the
+picker admits it — inline never over-runs a limit. A slot that changed mid-chain is reported to the
+scheduler (`{:slot_swap, id, slot}`) so the heartbeat's `Limiter.renew` bumps the **current** slot.
 
 ### Signals — `deliver_signal`, one statement
 

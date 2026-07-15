@@ -707,6 +707,86 @@ full-scan **1.65×**, **~1.5–2 µs/candidate-row** of string CPU removed (PERF
 paid once: the `ADD COLUMN … STORED` rewrites the table under `ACCESS EXCLUSIVE` (~125 ms/50k rows;
 a maintenance-window migration on a large install).
 
+### 30. Per-instance outcome commits were a write storm — group commit (`mix.exs` 0.2.12)
+
+Every step committed its own outcome: one `complete_*` round-trip per instance per step, run in
+the worker Task. Under fan-out that is N instances × K steps individual transactions — each its own
+lock footprint and WAL flush — hammering the database. The single-connection microbench that
+"proved" the collapsed `complete_*` (item at §5) measured latency, not concurrent contention, so
+the storm axis was never captured.
+
+**Fix.** A `GenDurable.Flusher` group-commit coordinator. The worker Task builds the outcome and
+**blocks until it is durably written** — `commit_before_proceed` is preserved (the Task waits for
+the write; it does not run ahead of it; batching is orthogonal to durability). The flusher coalesces
+every outcome waiting on it into **one transaction**: a single guarded `UPDATE … FROM unnest(...)`
+for the whole batch (kind encoded per row via `set_*` flags), then consume / parent-notify /
+await-recheck / children-insert as batched riders over the rows that committed. **All** kinds go
+through it — `:next` / `:retry` / `:done` / `:stop` / `:await` / `:schedule_childs` and inline
+run-ahead (a keep-executing continue entry). Triggers: `max_batch` (100) ∨ `max_delay_ms` (100),
+configured via `flushers: [%{queues: …}]` (first-match-wins routing; default one `:all` flusher).
+
+**Adversarial validation — how each risk is closed (not just asserted):**
+
+- **Parallel → serial regression.** The blocking coordinator could funnel all commits + side effects
+  through one process. Closed by: the flush runs off the scheduler's hot path; step *execution* stays
+  fully parallel; side effects are themselves batched (`Limiter.credit(list)` once, poke deduped). The
+  only serial point is one batched statement per flush.
+- **Arbiter abort of the whole batch.** A unique violation on `gen_durable_concurrency_active` in a
+  multi-row UPDATE aborts *everyone*. The four batchable kinds and `:await`/`:schedule_childs` all
+  **leave `executing`** → out of the partial index → cannot collide. Inline-continue stays executing
+  but only for `:keep` / release / *configured* keys (shard≠NULL) — an unconfigured new key is
+  **never inlined** (it requeues through the picker), so no continue entry creates a colliding NULL-shard
+  arbiter row.
+- **Lock-order deadlock.** The multi-row UPDATE locks rows in **id order**, notify in **parent_id order**
+  (the maintenance discipline, item 17); child sets are disjoint across flushers and parents sit up an
+  acyclic tree, so concurrent flushers serialize on a shared parent, never cycle. One `:all` flusher
+  (default) has no concurrent flush at all.
+- **Lease expiry under a slow flush.** A blocked Task stays in `in_flight`, so the scheduler's heartbeat
+  keeps its lease alive until the flush — heartbeat-until-flush is automatic. `max_delay_ms` bounds the
+  window.
+- **fsync over-claim.** "B commits → B fsyncs → 1" was overstated (Postgres group commit already coalesces
+  concurrent commits); the real, honest win is fewer transactions / round-trips / lock-manager entries,
+  plus the parent-join **aggregating** N sibling decrements into one `−cnt` (was N serialized decrements).
+
+**Tradeoff taken.** Up to `max_delay_ms` of per-commit latency under light load (no batch to amortize),
+for far fewer transactions under load (the batch auto-grows as waiters pile up). No schema change; no new
+hot-path *statement* round-trips (`test/perf_test.exs`: a flush of N outcomes is a bounded 3 statements,
+not N). The single-row `complete_*` / `continue_next` were **removed** (they had become a parallel,
+tests-only implementation of each outcome); `test/queries_test.exs`/`perf_test.exs`/`engine_test.exs`
+reach parked/terminal/next state through the flush now. Verified: full suite 174/0, `--warnings-as-errors`
+clean.
+
+**Post-implementation adversarial review (4 parallel reviewers) — two FATALs found and FIXED:**
+
+- **F1 — inline continue credited a still-held concurrency slot → over-admission.** `continue_entry`
+  inherited `slot: job.slot` from `base_entry` while setting `keep_lock: true` (the row stays `executing`
+  and keeps its slot), so `Flusher.side_effects` credited the slot back on every inline continue. Under a
+  configured gate an inline `:keep` chain (identity key held across steps) freed its slot mid-run →
+  a second instance admitted concurrently under a limit-1 gate (the limiter's one guarantee). The old
+  `continue_next` ran no side effects; crediting is done solely in `finish_inline` (only on a key change).
+  **Fix:** `continue_entry` carries `slot: nil` (the slot is credited exactly once — at the terminal, or in
+  `finish_inline` on a key change). Regression test: `test/inline_slot_credit_test.exs` (limit-1 keep-chain
+  must serialize). Uncaught before because no inline test held a configured slot across a continue.
+- **F2 — `flush_schedule_childs` lost the parent-lock atomicity → orphan children / join-barrier
+  violation.** The old `complete_schedule_childs` was one statement with a `claim … FOR NO KEY UPDATE`
+  gating both the child insert and the parent park, so the reaper's ordered `SKIP LOCKED` skipped the
+  parent. The batched split (insert children, then park) held only a `FOR KEY SHARE` (the FK) on the
+  parent between the two — compatible with the reaper's `NO KEY UPDATE`, so the reaper could reclaim the
+  parent in the gap: children committed with `parent_id = P` while the park's guard failed, so `P` re-runs
+  and re-spawns, and the orphan children decrement a join barrier `P` re-arms → parent wakes early. **Fix:**
+  a leading `FOR NO KEY UPDATE` lock over the parents (id order) for the whole flush transaction, so the
+  reaper skips them — restoring the all-or-nothing property. Regression test: `test/queries_test.exs`
+  "schedule_childs's parent lock makes the reaper skip the parent mid-spawn". Trigger was timing-narrow
+  (needs the parent's heartbeat to stop and the reaper to fire inside the flush window), but the old code
+  was structurally immune.
+
+Reviewer MINORs (not fatal): the `notify` RETURNING can report an already-`runnable` parent as woken →
+one spurious poke (benign); the "locked in id order" comment overstates what the array sort guarantees for
+a set-based `UPDATE` (real safety is disjoint per-flusher row sets + a deterministic cached plan); one
+flusher spanning multiple queues means a failing batch rolls back all those queues' outcomes together
+(at-least-once-correct, but a cross-queue blast radius worth noting). Post-fix: full suite **176/0** across
+seeds, `--warnings-as-errors` clean.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;
