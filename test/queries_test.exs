@@ -298,6 +298,33 @@ defmodule GenDurable.QueriesTest do
       assert length(pick("default", 10, @worker, @ttl)) == 3
     end
 
+    test "a SHARD-STAMPED executing row does not block an unconfigured claim of its key" do
+      # The documented config-change caveat (ISSUES.md #30, guides/concurrency.md).
+      # The picker's guard asks "is a K=1 (shard-NULL) row executing on this key?" —
+      # matching the arbiter's own predicate — so a row left executing under a gate that
+      # has since been REMOVED from `concurrency_limits:` (it carries a stamped shard)
+      # stops blocking. The window is a config change; the shipped code is already
+      # asymmetric in the mirror direction (a gate ADDED lets the gated branch skip the
+      # guard and stand beside a shard-NULL executing row), and this makes both alike.
+      {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "gate:x"}))
+      {:ok, b} = Queries.insert(Repo, params(%{concurrency_key: "gate:x"}))
+
+      # `a` executes as a GATED row: shard stamped, hence outside the K=1 arbiter index.
+      Repo.query!(
+        "UPDATE gen_durable SET status = 'executing', concurrency_shard = 0, locked_by = 'other' WHERE id = $1",
+        [a]
+      )
+
+      # "gate" is no longer configured, so `b` is an unconfigured K=1 candidate: it is
+      # admitted (the stamped row is invisible to the guard) and takes the arbiter slot.
+      assert [%{id: ^b}] = pick("default", 10, @worker, @ttl)
+
+      %{rows: [[shard]]} =
+        Repo.query!("SELECT concurrency_shard FROM gen_durable WHERE id = $1", [b])
+
+      assert is_nil(shard), "an unconfigured claim must keep a NULL shard (stays in the arbiter)"
+    end
+
     test "the unique arbiter makes a second executing row per key uncommittable" do
       # The picker's guard is the optimization; THIS is the correctness layer:
       # a cross-node claim race resolves by unique violation, never by two

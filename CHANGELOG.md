@@ -6,6 +6,45 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.15
+
+### Changed
+- **Picker: the K=1 concurrency guard no longer reads the whole `executing` set on every
+  claim (hot path).** The guard was a `NOT EXISTS` inside the candidate filter's `OR`, where
+  Postgres cannot pull it up into an anti-join — it compiled to a **hashed SubPlan** that read
+  the *entire* `executing` set into a hash before emitting a single candidate row. A pick's
+  cost therefore scaled with how much work the whole cluster had in flight rather than with how
+  much that pick was claiming. It is now a `LEFT JOIN LATERAL … LIMIT 1` (a LATERAL cannot be
+  de-correlated or hashed, so the correlation becomes an index condition on
+  `gen_durable_concurrency_active`), with `FOR NO KEY UPDATE OF g` — a locking clause may not
+  target the nullable side of an outer join.
+
+  Shipped together with the second half of the same report: **the claim updates by `ctid`**
+  (a `Tid Scan`) instead of re-finding rows by primary key, valid because the same statement
+  already located and locked those tuples. The two go together on purpose — at a full batch
+  with a quiet `executing` set the LATERAL alone is a slight buffer regression, which the
+  `ctid` half pays back; the pair beats the old form in every measured cell.
+
+  **Measured** (PG 17, 1M rows, `executing` scattered; full tables in `PERFORMANCE.md` §2.8):
+  claiming one row goes from O(rows executing) — 131b → **2047b / 3172µs** as executing grows
+  5 → 2000 — to flat (**24b / 762µs**). Batch 100 at 2000 executing: 3840b/2915µs →
+  1895b/1855µs. Contended keys widen the gap further. End to end the shipped `Queries.pick` is
+  ~1.5× faster. No schema change, no new index, statement counts unchanged (claim is still one
+  statement; `test/perf_test.exs` holds at 1/3).
+
+  **Behavioural caveat — one window.** The probe carries the partial index's own
+  `concurrency_shard IS NULL` predicate; that is what makes the index usable (without it the
+  probe is *slower* than what it replaces — 8.7 ms — so this is the price of the speedup, not
+  an oversight). It narrows the guard to exactly the rows the K=1 arbiter polices, so a row
+  still executing under a gate whose name was **removed** from `concurrency_limits:` (it carries
+  a stamped shard) stops blocking a now-unconfigured claim of that key. The shipped code was
+  **already** asymmetric here — a name *added* to `concurrency_limits:` lets the gated branch
+  skip the guard entirely and run beside a shard-NULL executing row — so both directions now
+  behave alike, each admitting at most one row beyond what the just-changed config promises,
+  until the pre-change rows finish. Documented in `guides/concurrency.md` ("Changing a gate's
+  config while its rows are executing"), pinned by a regression test, analysed in `ISSUES.md`
+  #30. Reported externally as issue #3; re-measured independently before taking it.
+
 ## 0.2.14
 
 ### Added

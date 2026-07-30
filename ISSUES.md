@@ -787,6 +787,84 @@ flusher spanning multiple queues means a failing batch rolls back all those queu
 (at-least-once-correct, but a cross-queue blast radius worth noting). Post-fix: full suite **176/0** across
 seeds, `--warnings-as-errors` clean.
 
+### 30. The K=1 guard read the whole `executing` set on every claim — FIXED (external report, verified here)
+
+Reported externally against 0.2.12 with measurements; re-measured independently on PG 17
+before taking it (the report was on PG 15.14).
+
+**The finding.** The guard `OR NOT EXISTS (SELECT 1 FROM gen_durable e WHERE
+e.concurrency_key = g.concurrency_key AND e.status = 'executing')` sits inside an `OR`, where
+Postgres cannot pull it up into an anti-join. It compiled to a **hashed SubPlan** that read the
+*entire* `executing` set before emitting a single candidate — so one pick's cost tracked how
+much work the whole cluster had in flight, not how much that pick claimed. Confirmed: 2047
+buffers / 5.7 ms to claim **one** row with 2000 rows executing; flat ~30 buffers with the fix.
+
+**Fix (0.2.15), both halves of the report, shipped together:**
+- the guard is a `LEFT JOIN LATERAL … LIMIT 1` (a LATERAL cannot be de-correlated or hashed, so
+  the correlation becomes an index condition), with `FOR NO KEY UPDATE OF g` — a locking clause
+  may not target the nullable side of an outer join;
+- the `claimed` CTE updates by `ctid` instead of re-finding rows by primary key (a `Tid Scan`),
+  valid because `cand` locked those tuples in the same statement.
+
+**Verified.** Suite green (184/0); statement counts unchanged (claim still one statement, perf
+tests hold at 1/3). Full tables in PERFORMANCE.md §2.8. Highlights: batch 1 goes from
+O(executing) (131b → 2047b as executing grows 5 → 2000) to flat (27b → 24b); batch 100 at 2000
+executing 3840b/2915µs → 1895b/1855µs; contended keys widen the gap (batch 1: 2048b/1.83ms →
+25b/0.08ms). The shipped `Queries.pick` is ~1.5× faster end to end, conservatively measured.
+
+**Three corrections to the report's reasoning, found while verifying:**
+1. *It is not a bad row estimate.* The report blamed the planner underestimating `executing`
+   (51 vs 2008). With a freshly-`ANALYZE`d fixture the estimate was good (1633 vs 2000) and the
+   plan was **still** the hashed SubPlan — the `OR` blocks the pullup regardless of statistics.
+   Stronger conclusion than the report's: this cannot be tuned away.
+2. *The `LATERAL` alone is not a win at a full batch.* At batch 100 with a quiet executing set
+   it is a slight buffer regression (2307 vs 2115) — the report said so, and it reproduced. The
+   `ctid` half pays it back; the pair beats the old form in every measured cell, so they must
+   ship together.
+3. *Exact-parity-and-fast does not exist here.* Measured the LATERAL **without**
+   `e.concurrency_shard IS NULL` (identical semantics to the old guard): it cannot use
+   `gen_durable_concurrency_active` (a partial index carrying that predicate), falls back to a
+   per-candidate `gen_durable_lease` scan, and costs **8.7 ms — worse than the 5.7 ms it
+   replaces**. The narrowed predicate *is* the speedup. The alternative, a new index over
+   `(concurrency_key) WHERE executing`, adds write amplification to every claim and every
+   return-to-runnable — rejected for the same reason the report rejected it.
+
+**The behavioural change, and why it is smaller than it looks — DOCUMENTED.** Narrowing the
+probe to shard-NULL rows aligns the guard with the arbiter's own predicate, but means a row
+executing under a gate whose name was **removed** from `concurrency_limits:` (it carries a
+stamped shard) stops blocking a now-unconfigured claim of that key. Measured: old refuses, new
+claims → two executing rows for one key, and the arbiter does not catch it (the stamped row is
+outside its partial index).
+
+Probed the shipped 0.2.14 code for the mirror direction and found it **already asymmetric**:
+
+```
+1. no gate configured, blocker shard=NULL   -> claimed 0   (guard blocks)
+2. gate ADDED,   blocker shard=NULL         -> claimed 1   <-- already allowed, pre-existing
+3. gate REMOVED, blocker shard=0 (stamped)  -> claimed 0   (the strictness at stake)
+```
+
+Row 2 is today's code: when a name becomes configured, the candidate takes the gated branch and
+never consults the guard, standing beside a shard-NULL executing row. So the invariant was
+already open in one direction; this change makes both directions behave alike, and the
+magnitude in each is "one row beyond what the *current* config promises", during a window where
+the config itself just changed. Root cause is the design, not this patch: `concurrency_shard`
+carries two meanings at once (which counter shard the slot came from **and** which regime
+polices the row), and the regime marker is written at claim time and cannot be re-stamped when
+the config moves. Curing it properly means splitting those two roles or re-stamping live rows on
+config change — a much larger change with no performance motive. Written up in
+`guides/concurrency.md` ("Changing a gate's config while its rows are executing") with the
+operational advice (drain the key first, or change `limit` rather than adding/removing the
+name), and pinned by a regression test in `test/queries_test.exs`.
+
+**NOTED — not measured.** Everything above is single-client on a warm cache. The LATERAL probes
+an index a live cluster writes to constantly; behaviour under real concurrent claim churn was
+not tested. Re-run recipe: seed ~1M rows with `executing` laid out **at INSERT time** by modulo
+stride (promoting rows with `UPDATE` rewrites them into free space and clusters them, which
+understates the old guard by ~20× — the first cut of this measurement made exactly that
+mistake), then `EXPLAIN (ANALYZE, BUFFERS)` the claim at batch 1 and 100 across executing counts,
+`VACUUM ANALYZE` between readings.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

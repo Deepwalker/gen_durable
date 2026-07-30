@@ -124,15 +124,15 @@ Update on gen_durable g (actual time=0.400..0.983 rows=50 loops=1)
     ->  WindowAgg (rows=50)                                     ← dedup: row_number() per key
           ->  Sort  Sort Key: concurrency_key, priority, eligible_at  (27kB)  ← raw key, no synth
                 ->  Limit (rows=50)
-                      ->  LockRows (rows=50)                    ← FOR NO KEY UPDATE SKIP LOCKED, in-scan
-                            ->  Index Scan using gen_durable_pick (rows=50)
-                                  Index Cond: ((queue = 'default') AND (eligible_at <= now()))
-                                  Filter: ((concurrency_key IS NULL) OR (concurrency_name = ANY($5)) OR (NOT (… hashed SubPlan 2)))
-                                  SubPlan 2
-                                    ->  Index Scan using gen_durable_lease (never executed)
+                      ->  LockRows (rows=50)                    ← FOR NO KEY UPDATE OF g SKIP LOCKED, in-scan
+                            ->  Nested Loop Left Join (rows=50)
+                                  ->  Index Scan using gen_durable_pick (rows=50)
+                                        Index Cond: ((queue = 'default') AND (eligible_at <= now()))
+                                  ->  Limit (rows=0 loops=50)   ← the K=1 guard, LATERAL
+                                        ->  Index Only Scan using gen_durable_concurrency_active
   ->  Nested Loop (rows=50)                                     ← the one, optimal join
         ->  CTE Scan on cand  Filter: ((concurrency_key IS NULL) OR (rn = 1) OR gated)
-        ->  Index Scan using gen_durable_pkey on gen_durable g (rows=1 loops=50)
+        ->  Tid Scan on gen_durable g (rows=1 loops=50)         ← by ctid, not a PK descent
 Planning Time: 0.582 ms
 Execution Time: 1.122 ms
 ```
@@ -146,12 +146,13 @@ What to read here:
   (`DISTINCT ON` → re-lock → update) had a second nested loop that scaled per-row with
   the batch; folding the dedup into a window function removed it (measured −19% at
   batch 5000, §2.4).
-- **`SubPlan 2` (the concurrency_key `NOT EXISTS`) was `never executed`** here because the top
-  50 rows were non-keyed (`concurrency_key IS NULL` short-circuits the guard). A
-  non-keyed queue pays **nothing** for the concurrency machinery. When concurrency-keyed
-  rows *are* in the window, the guard probes `gen_durable_concurrency_active` — a partial
-  index over only the executing rows with a **non-null** `concurrency_key`, so a
-  non-keyed claim never even writes to it.
+- **The K=1 guard is a `LEFT JOIN LATERAL`, and it probes an index per candidate** —
+  `gen_durable_concurrency_active`, a partial index over exactly the executing rows the K=1
+  arbiter polices, with `LIMIT 1` stopping at the first match. A non-keyed row
+  short-circuits (`concurrency_key IS NULL`) and pays nothing. It is a LATERAL rather than
+  the obvious `NOT EXISTS` for a specific reason — see §2.8: inside an `OR` a `NOT EXISTS`
+  cannot become an anti-join, so the planner hashes the **whole executing set** before
+  emitting a single row.
 - **Gate membership is a column comparison, not a per-row parse.** `concurrency_name = ANY($5)`
   reads the STORED generated split of `concurrency_key` (materialized once per write, see
   `Migration` change(3)) against the configured-gate array threaded from the caller. The pick
@@ -160,10 +161,14 @@ What to read here:
   all-NULL keys land in one partition but are kept wholesale by the `concurrency_key IS NULL`
   branch of `winners`, so there is no synthetic per-row partition string either.
 - **The single `Nested Loop` is the `UPDATE` join, and it is optimal** — outer = `batch`
-  rows, inner = one primary-key point lookup each (`loops=50, rows=1`). That is O(batch)
-  point updates, the textbook-best way to update N rows by id; see §2.5 for the proof
-  that forcing it off is ~10× slower. The per-key losers (`rn > 1`) were locked but not
-  updated, so they stay `runnable` and their lock releases at commit.
+  rows, inner = one point lookup each (`loops=50, rows=1`). That is O(batch) point updates,
+  the textbook-best way to update N rows; see §2.5 for the proof that forcing it off is
+  ~10× slower. The inner side is a **`Tid Scan`**, not a `gen_durable_pkey` descent: `cand`
+  already located *and locked* those exact tuples in this same statement, so their `ctid`
+  cannot move and the update can address them physically (~300 buffers per 100-row batch,
+  §2.8). **That lock is the correctness** — splitting the lock from the update across two
+  statements would silently start updating the wrong rows. The per-key losers (`rn > 1`)
+  were locked but not updated, so they stay `runnable` and their lock releases at commit.
 
 ### 2.3 The bounded-window trade-off
 
@@ -276,6 +281,76 @@ column removed. Statement counts are unchanged (claim is still one statement; `t
 holds at 1 / 3). The cost paid once: `change(3)`'s `ADD COLUMN … STORED` rewrites the table
 under `ACCESS EXCLUSIVE` (~125 ms / 50k rows here; scales with row count — a maintenance-window
 migration on a large install).
+
+### 2.8 The K=1 guard: why a LATERAL, not a `NOT EXISTS` (measured)
+
+The guard that keeps two executing rows off one unconfigured `concurrency_key` used to be a
+`NOT EXISTS` sitting inside the candidate filter's `OR`. A `NOT EXISTS` in that position
+**cannot be pulled up into an anti-join**, so the planner compiles it to a *hashed SubPlan*:
+it reads the **entire `executing` set** into a hash table before emitting a single candidate
+row. A pick's cost therefore scaled with how much work the whole cluster had in flight, not
+with how much that pick was claiming — the wrong axis entirely.
+
+Postgres 17, 1M rows, 3000 runnable all carrying distinct unconfigured keys, N rows
+`executing` **scattered across the heap** (laid out at INSERT time — promoting them with
+`UPDATE` rewrites the tuples into free space and clusters them, which understates the old
+guard's heap fetches by ~20×; the first cut of this measurement got that wrong). Median of 5,
+`VACUUM ANALYZE` before each reading.
+
+**batch 1 — claiming a single row** (buffers / median µs):
+
+| rows `executing` | `NOT EXISTS` (old) | LATERAL | LATERAL + ctid |
+|---|---|---|---|
+| 5 | 131b 769µs | 30b 690µs | 27b 640µs |
+| 100 | 129b 717µs | 30b 694µs | 27b 593µs |
+| 500 | 529b 922µs | 30b 793µs | 27b 745µs |
+| 2000 | **2047b 3172µs** | 35b 698µs | **24b 762µs** |
+
+**batch 100** (the `UPDATE` dominates, so the guard is a minority of the statement):
+
+| rows `executing` | `NOT EXISTS` (old) | LATERAL | LATERAL + ctid |
+|---|---|---|---|
+| 5 | 2115b 1940µs | 2307b 2038µs | 2007b 2049µs |
+| 500 | 2610b 2208µs | 2307b 1956µs | 2007b 2059µs |
+| 2000 | **3840b 2915µs** | 2231b 1913µs | **1895b 1855µs** |
+
+Read carefully:
+
+- **The old form is O(rows executing); both new forms are flat.** That is the point.
+- **At a full batch with a quiet `executing` set the LATERAL alone is a slight buffer
+  regression** (2307 vs 2115) — 100 index probes versus one small hash build. The `ctid`
+  change pays that back, which is why the two ship **together**: `LATERAL + ctid` beats the
+  old form in *every* cell above on buffers. On time, at batch 100 with a near-empty
+  executing set, it is a wash (~3% either way, inside the noise).
+- **Contended keys make the gap wider, not narrower.** With 988 of the runnable rows blocked
+  by a live key: batch 1 → old 2048b/1.83ms vs LATERAL 25b/0.08ms; batch 100 → 3756b/2.82ms
+  vs 2102b/1.38ms, identical claimed-row counts. `LIMIT 1` stops at the first match instead
+  of building the whole hash.
+- **It is not a bad row estimate.** The often-cited symptom is the planner underestimating
+  `executing` (a fast-churning subset). With a freshly-`ANALYZE`d fixture the estimate was
+  good (1633 vs 2000 actual) and the plan was *still* the hashed SubPlan — the `OR` blocks
+  the pullup regardless of statistics, so no amount of `ANALYZE` fixes it.
+- **It survives the generic plan.** Production runs this through Postgrex's prepared
+  statements (`cache_statement:`), and Postgres switches to a generic plan after ~5
+  executions. Under `plan_cache_mode = force_generic_plan` the shapes hold: old keeps the
+  hashed SubPlan (7.0 ms at batch 1), new keeps the `concurrency_active` probe (0.38 ms).
+- **End to end**, on that fixture, the shipped `Queries.pick` is ~1.5× faster than the old
+  claim at both batch 1 and batch 100 — and that comparison is *conservative*: the baseline
+  is the old claim statement alone, while `pick` also runs the two batched enrichment
+  `SELECT`s.
+
+**The predicate that makes it work is also the one behavioural change.**
+`e.concurrency_shard IS NULL` is what lets the probe use `gen_durable_concurrency_active`
+(a partial index carrying exactly that predicate). Without it the probe cannot use the index
+and falls back to a per-candidate `gen_durable_lease` scan — **8.7 ms, slower than the
+hashed SubPlan it replaced**. So exact-parity-and-fast is not on the menu with the current
+indexes; the speedup *is* the narrowed predicate. It narrows the guard to precisely the rows
+the arbiter polices, which changes behaviour in one window — a `concurrency_limits:` name
+removed while its rows still execute. See `ISSUES.md` #30 and the concurrency guide.
+
+Not measured, and worth knowing before leaning on these numbers: everything above is
+single-client on a warm cache. The LATERAL probes an index that a live cluster is writing to
+constantly; behaviour under real claim concurrency was not tested.
 
 ---
 

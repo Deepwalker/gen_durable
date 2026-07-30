@@ -63,9 +63,9 @@ Each index exists for exactly one hot query; every partial predicate matches its
 | Index | Definition | Serves |
 |---|---|---|
 | `gen_durable_pick` | `(queue, priority, eligible_at) WHERE status = 'runnable'` | the picker's candidate scan — equality on `queue` keeps the index pre-ordered so `LIMIT batch` stops after ~batch rows |
-| `gen_durable_lease` | `(lease_expires_at) WHERE status = 'executing'` | the reaper's expired-lease sweep; also the executing set the picker's K = 1 guard probes |
+| `gen_durable_lease` | `(lease_expires_at) WHERE status = 'executing'` | the reaper's expired-lease sweep |
 | `gen_durable_await_deadline` | partial over parked rows with an armed deadline | the await-timeout sweep |
-| `gen_durable_concurrency_active` | **UNIQUE** `(concurrency_key) WHERE executing AND key IS NOT NULL AND shard IS NULL` | the K = 1 arbiter: a second executing row per unconfigured key cannot commit. Gated claims set `concurrency_shard` and drop out of the predicate |
+| `gen_durable_concurrency_active` | **UNIQUE** `(concurrency_key) WHERE executing AND key IS NOT NULL AND shard IS NULL` | the K = 1 arbiter: a second executing row per unconfigured key cannot commit. Gated claims set `concurrency_shard` and drop out of the predicate. Also serves the picker's guard, which probes it per candidate via `LATERAL` (same predicate, hence same rows — see the concurrency guide's config-change caveat) |
 | `gen_durable_correlation` | **UNIQUE** `(correlation_guard) WHERE NOT NULL` | double duty: uniqueness among "occupied" statuses *and* the signal address lookup |
 | `gen_durable_parent` | `(parent_id) WHERE NOT NULL` | the parent join when a child terminates; the GC's mid-join guard |
 | `gen_durable_gc` | `(updated_at) WHERE status IN ('done','failed')` | the GC candidate scan, ordered by termination instant |
@@ -93,14 +93,19 @@ built at boot from `concurrency_limits:` only, so a `concurrency_key` whose pref
 *rate*-limit name is naturally not in it and never reads as a gate):
 
 1. **claim** (`@claim_sql`, one lock-light statement) — up to `batch` runnable rows via
-   `gen_durable_pick`, locked in-scan with `FOR NO KEY UPDATE SKIP LOCKED`, flipped to
-   `executing`. Gate membership is `concurrency_name = ANY($5)` — the stored generated split of
-   the key (no per-row `split_part`, no join to `gen_durable_bucket_configs`) against that gate
-   array. The K = 1 guard rides in the `WHERE` (an *unconfigured* keyed row with an executing
-   sibling is filtered *before* the `LIMIT`), and `gen_durable_concurrency_active` is its
-   correctness backstop. A configured gate keeps ALL its candidates — a provisional non-null
-   `concurrency_shard` drops them out of that arbiter (their cap is the bucket). No bucket table
-   is touched here.
+   `gen_durable_pick`, locked in-scan with `FOR NO KEY UPDATE OF g SKIP LOCKED`, flipped to
+   `executing` by a `ctid` join (the same statement located and locked those tuples, so their
+   physical address is stable — splitting lock from update would break it). Gate membership is
+   `concurrency_name = ANY($5)` — the stored generated split of the key (no per-row
+   `split_part`, no join to `gen_durable_bucket_configs`) against that gate array. The K = 1
+   guard is a `LEFT JOIN LATERAL` probing `gen_durable_concurrency_active` with `LIMIT 1`, so an
+   *unconfigured* keyed row with an executing sibling is filtered *before* the `LIMIT` at
+   O(candidates) — a `NOT EXISTS` in that `OR` would hash the whole executing set per pick
+   (PERFORMANCE.md §2.8). The index stays the correctness backstop. Because the probe carries
+   the index's own `concurrency_shard IS NULL` predicate, the guard sees exactly the rows the
+   arbiter polices — see the config-change caveat in the concurrency guide. A configured gate
+   keeps ALL its candidates — a provisional non-null `concurrency_shard` drops them out of that
+   arbiter (their cap is the bucket). No bucket table is touched here.
 2. **admit** (`Limiter.admit/2`) — the claimed batch, ordered `(priority, eligible_at)`, goes
    to the backend. `Limiter.Postgres` runs the same capacity math as the old fused pick — gate
    ranges over `grabbed ∪ cold` shards; cumulative rate weight over per-shard refilled

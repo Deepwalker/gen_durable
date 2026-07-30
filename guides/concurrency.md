@@ -27,7 +27,9 @@ thirty-second calls at once; `limit: 10` never has more than 10 in flight.
 - **K = 1 (unconfigured)**: a unique partial index over executing keys — a second
   executing row per key is *uncommittable*. The claim is the lock: held exactly for the
   step window, released by any outcome, or by the [reaper](operations.md) if the worker
-  dies. No per-step locks, no pinned connections.
+  dies. No per-step locks, no pinned connections. The picker additionally *pre-filters*
+  candidates whose key is already executing, so a blocked row is skipped instead of
+  bouncing off the arbiter — an optimization over the index, which stays the correctness.
 - **Gates (configured)**: per-key slot counters with a database `CHECK` — over-admission
   is uncommittable. The pick debits slots in one batched pass; every outcome credits its
   slot back. Counters are minted lazily, **pre-debited, by the first claim itself** — a
@@ -85,6 +87,37 @@ order:42 never overlap" into "five at a time" and breaks the exclusion. Keep gat
 (integrations: `stripe`, `openai`) disjoint from identity names (entities: `order`,
 `account`), and treat adding a config as a semantics change for every existing key with
 that prefix.
+
+## ⚠ Changing a gate's config while its rows are executing
+
+Which regime a row belongs to is decided **when it is claimed** and recorded on the row, in
+`concurrency_shard`: a K = 1 claim leaves it `NULL` (the unique arbiter polices the row), a
+gated claim stamps a shard number (the slot counters police it, and the row drops out of the
+arbiter's partial index). That marker lives until the row leaves `executing` — so if the
+config changes in between, a running row keeps being policed by the regime it was *born*
+into, while new claims for the same key use the new one.
+
+Both directions can therefore admit **one row more than the current config promises**, for
+as long as the pre-change rows keep running:
+
+| Change | What happens |
+|---|---|
+| Name **added** to `concurrency_limits:` | Rows already executing under K = 1 carry a `NULL` shard. New claims take the gated path, which does not consult the K = 1 guard at all, so a gated row can run beside that pre-existing one — `limit + 1` in flight. |
+| Name **removed** from `concurrency_limits:` | Rows already executing under the gate carry a stamped shard, which puts them outside both the arbiter's index and the K = 1 guard. A new unconfigured claim of the same key is admitted beside them — two executing rows where K = 1 now promises one. |
+
+This is not a transient of the *deploy command*, it is a transient of the **rolling deploy**:
+each node builds its gate-name set from its own config at boot, so while a release rolls out,
+some nodes read a key as gated and others as K = 1 for minutes at a time.
+
+The window closes by itself once the pre-change rows finish. If a key must never
+double-execute across a config change, drain it first (stop enqueuing, let it go quiet) and
+change the config after — or keep the gate name and change only its `limit`, which never
+reclassifies a row.
+
+> The "removed" row of that table became reachable in 0.2.15, when the picker's K = 1 guard
+> was narrowed to exactly the rows the arbiter polices — the change that made a claim's cost
+> independent of how much work the cluster has in flight (see [performance notes](../PERFORMANCE.md)
+> §2.8 and `ISSUES.md` #30). The "added" row has always behaved this way.
 
 ## Concurrency key vs queue concurrency vs rate limit
 

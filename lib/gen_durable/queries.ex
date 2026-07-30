@@ -93,12 +93,33 @@ defmodule GenDurable.Queries do
   # (measured ~1.5 µs/candidate-row; PERFORMANCE.md §3). The pick no longer reads the configs
   # table at all — it stays the source of truth for the limiter/GC, not the hot claim.
   #
+  # The K=1 guard is a LEFT JOIN LATERAL, not a `NOT EXISTS` inside the OR. A `NOT EXISTS`
+  # there cannot be pulled up into an anti-join, so the planner compiles it to a HASHED
+  # SubPlan: it reads the ENTIRE `executing` set into a hash before emitting a single
+  # candidate row — making one pick's cost scale with how much work the whole cluster has
+  # in flight (measured: 2047 buffers / 5.7 ms to claim ONE row with 2000 executing; a
+  # correct row estimate does not change the plan, see PERFORMANCE.md §2.8). A LATERAL
+  # cannot be de-correlated or hashed, so the correlation becomes an index condition and
+  # `LIMIT 1` stops at the first match: 35 buffers / 0.35 ms, flat in the executing count.
+  #
+  # `e.concurrency_shard IS NULL` is what makes `gen_durable_concurrency_active` (a partial
+  # index with exactly that predicate) usable — without it the probe cannot use the index and
+  # is SLOWER than the hashed SubPlan it replaces (8.7 ms). It also aligns the guard with the
+  # invariant it protects: the arbiter polices exactly the shard-NULL rows. The cost is a
+  # config-change caveat — a gate name REMOVED from `concurrency_limits:` while its rows still
+  # execute leaves them shard-stamped, so they stop blocking a now-unconfigured claim of the
+  # same key. The shipped code is already asymmetric here (a gate name ADDED lets the gated
+  # branch skip the guard entirely and stand beside a shard-NULL executing row); this makes
+  # both directions behave alike. See ISSUES.md #30 and guides/concurrency.md.
+  #
   #   cand    — top-$2 runnable rows by (priority, eligible_at), locked once
-  #             (FOR NO KEY UPDATE SKIP LOCKED). A row whose concurrency_key is already
-  #             executing is excluded UNLESS the key is a configured gate; NULL keys
-  #             short-circuit. `row_number()` over the raw `concurrency_key` marks the
-  #             most-urgent row per key (all-NULL keys land in one partition but are kept
-  #             wholesale by the `IS NULL` branch below — no synthetic partition string).
+  #             (FOR NO KEY UPDATE OF g SKIP LOCKED — `OF g` because a locking clause may not
+  #             be applied to the nullable side of the outer join). A row whose concurrency_key
+  #             is held by an executing K=1 row is excluded UNLESS the key is a configured
+  #             gate; NULL keys short-circuit. `row_number()` over the raw `concurrency_key`
+  #             marks the most-urgent row per key (all-NULL keys land in one partition but are
+  #             kept wholesale by the `IS NULL` branch below — no synthetic partition string).
+  #             `ctid` rides along for the UPDATE join (see `claimed`).
   #   winners — keep a row when: its key is NULL (all pass), OR it is the rn=1 row of its
   #             key (unconfigured K=1 window dedup), OR it is `gated` (a CONFIGURED gate
   #             keeps ALL its candidates; the limiter trims them by capacity).
@@ -107,30 +128,42 @@ defmodule GenDurable.Queries do
   #             The alternative — holding the row locks across the admit round-trip — is the
   #             contention we are removing. A cross-node race on an unconfigured key trips
   #             the K=1 arbiter and aborts the whole claim; `pick_claim` retries warm.
+  #             Joined by `ctid` (a Tid Scan), not by `id` (a PK descent + heap fetch per
+  #             row): `cand` already located AND locked these exact tuples in this same
+  #             statement, so their ctid cannot move under us. THAT LOCK IS THE CORRECTNESS
+  #             — splitting the lock from the update (locking in one statement, updating in
+  #             another) would silently start updating the wrong rows. Worth ~300 buffers
+  #             per 100-row batch (PERFORMANCE.md §2.8).
   #
   # Returns the job fields plus the admission inputs (gated?, rate_limit, weight).
   @claim_sql """
   WITH cand AS (
-    SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at, gated,
+    SELECT ctid, id, concurrency_key, rate_limit, weight, priority, eligible_at, gated,
            row_number() OVER (PARTITION BY concurrency_key
                               ORDER BY priority, eligible_at) AS rn
     FROM (
-      SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at,
-             (concurrency_name IS NOT NULL AND concurrency_name = ANY($5::text[])) AS gated
+      SELECT g.ctid, g.id, g.concurrency_key, g.rate_limit, g.weight, g.priority, g.eligible_at,
+             (g.concurrency_name IS NOT NULL AND g.concurrency_name = ANY($5::text[])) AS gated
       FROM gen_durable g
+      LEFT JOIN LATERAL (
+        SELECT 1 AS blocked FROM gen_durable e
+        WHERE e.concurrency_key = g.concurrency_key
+          AND e.status = 'executing'
+          AND e.concurrency_key IS NOT NULL
+          AND e.concurrency_shard IS NULL
+        LIMIT 1
+      ) b ON true
       WHERE g.status = 'runnable' AND g.eligible_at <= now() AND g.queue = $1
         AND (g.concurrency_key IS NULL
              OR g.concurrency_name = ANY($5::text[])
-             OR NOT EXISTS (
-               SELECT 1 FROM gen_durable e
-               WHERE e.concurrency_key = g.concurrency_key AND e.status = 'executing'))
+             OR b.blocked IS NULL)
       ORDER BY g.priority, g.eligible_at
-      FOR NO KEY UPDATE SKIP LOCKED
+      FOR NO KEY UPDATE OF g SKIP LOCKED
       LIMIT $2
     ) s
   ),
   winners AS (
-    SELECT id, concurrency_key, rate_limit, weight, priority, eligible_at, gated
+    SELECT ctid, id, concurrency_key, rate_limit, weight, priority, eligible_at, gated
     FROM cand
     WHERE concurrency_key IS NULL OR rn = 1 OR gated
   ),
@@ -144,7 +177,7 @@ defmodule GenDurable.Queries do
         concurrency_shard = CASE WHEN w.gated THEN 0 ELSE NULL END,
         lease_expires_at = now() + $4::int * interval '1 millisecond', updated_at = now()
     FROM winners w
-    WHERE g.id = w.id
+    WHERE g.ctid = w.ctid
     RETURNING g.id, g.fsm, g.fsm_version, g.step, g.state, g.attempt, g.concurrency_key, g.awaits
   )
   SELECT c.id, c.fsm, c.fsm_version, c.step, c.state, c.attempt, c.concurrency_key, c.awaits,
