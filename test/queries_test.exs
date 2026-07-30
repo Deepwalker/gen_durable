@@ -101,7 +101,8 @@ defmodule GenDurable.QueriesTest do
   }
 
   defp flush1(id, worker, over),
-    do: Queries.flush(Repo, [Map.merge(@flush_defaults, Map.merge(%{id: id, worker: worker}, over))])
+    do:
+      Queries.flush(Repo, [Map.merge(@flush_defaults, Map.merge(%{id: id, worker: worker}, over))])
 
   defp park(id, names, next_step \\ "woke", opts \\ []) do
     flush1(id, Keyword.get(opts, :worker, @worker), %{
@@ -116,16 +117,34 @@ defmodule GenDurable.QueriesTest do
   end
 
   defp terminate(id, result \\ ~s({}), worker \\ @worker) do
-    flush1(id, worker, %{status: "done", set_result: true, result: result, clear_awaits: true, notify: true})
+    flush1(id, worker, %{
+      status: "done",
+      set_result: true,
+      result: result,
+      clear_awaits: true,
+      notify: true
+    })
   end
 
   defp fail(id, reason, worker \\ @worker) do
-    flush1(id, worker, %{status: "failed", set_error: true, error: reason, clear_awaits: true, notify: true})
+    flush1(id, worker, %{
+      status: "failed",
+      set_error: true,
+      error: reason,
+      clear_awaits: true,
+      notify: true
+    })
   end
 
   # :retry — requeue the same step with a delay (keeps awaits/attempt for setup).
   defp requeue_retry(id, state, delay, worker \\ @worker) do
-    flush1(id, worker, %{status: "runnable", set_state: true, state: state, set_eligible: true, delay_ms: delay})
+    flush1(id, worker, %{
+      status: "runnable",
+      set_state: true,
+      state: state,
+      set_eligible: true,
+      delay_ms: delay
+    })
   end
 
   defp progress_next(id, step, state, consumed, opts \\ []) do
@@ -465,7 +484,7 @@ defmodule GenDurable.QueriesTest do
 
       {:ok, id} = Queries.insert(Repo, params())
       [_] = pick("default", 10, @worker, @ttl)
-      progress_next(id, "commit", ~s({}), [], [ck: "fever:7"])
+      progress_next(id, "commit", ~s({}), [], ck: "fever:7")
 
       assert gate_buckets("fever:7") == []
       assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
@@ -489,7 +508,7 @@ defmodule GenDurable.QueriesTest do
     test ":next can release or swap the concurrency_key (nil / value; default keeps)" do
       {:ok, a} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
       [_] = pick("default", 10, @worker, @ttl)
-      progress_next(a, "tick", ~s({}), [], [ck: nil])
+      progress_next(a, "tick", ~s({}), [], ck: nil)
 
       %{rows: [[key]]} = Repo.query!("SELECT concurrency_key FROM gen_durable WHERE id = $1", [a])
       assert key == nil
@@ -499,7 +518,7 @@ defmodule GenDurable.QueriesTest do
       {:ok, b} = Queries.insert(Repo, params(%{concurrency_key: "k"}))
       jobs = pick("default", 10, @worker, @ttl)
       assert b in Enum.map(jobs, & &1.id)
-      progress_next(b, "tick", ~s({}), [], [ck: "k2"])
+      progress_next(b, "tick", ~s({}), [], ck: "k2")
 
       %{rows: [[key]]} = Repo.query!("SELECT concurrency_key FROM gen_durable WHERE id = $1", [b])
       assert key == "k2"
@@ -1216,7 +1235,7 @@ defmodule GenDurable.QueriesTest do
       {:ok, id} = Queries.insert(Repo, params())
       assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)
 
-      progress_next(id, "call", ~s({}), [], [rate_limit: "api:7"])
+      progress_next(id, "call", ~s({}), [], rate_limit: "api:7")
       assert rate_buckets("api:7") == []
 
       assert [%{id: ^id}] = pick("default", 10, @worker, @ttl)

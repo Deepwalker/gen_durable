@@ -15,7 +15,11 @@ defmodule GenDurable.FlusherTest do
   end
 
   defp config,
-    do: %{repo: Repo, limiter: {GenDurable.Limiter.Postgres, %{repo: Repo}}, name: __MODULE__.Engine}
+    do: %{
+      repo: Repo,
+      limiter: {GenDurable.Limiter.Postgres, %{repo: Repo}},
+      name: __MODULE__.Engine
+    }
 
   defp start_flusher(opts) do
     name = :"flusher_#{System.unique_integer([:positive])}"

@@ -64,7 +64,8 @@ defmodule GenDurable.Limiter do
 
   @typedoc "One configured limit, pushed to the backend by `sync_config/2`."
   @type config ::
-          {:rate, name :: String.t(), rate :: number(), burst :: number(), shards :: pos_integer()}
+          {:rate, name :: String.t(), rate :: number(), burst :: number(),
+           shards :: pos_integer()}
           | {:conc, name :: String.t(), capacity :: number(), shards :: pos_integer()}
 
   @typedoc """

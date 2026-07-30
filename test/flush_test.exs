@@ -126,7 +126,13 @@ defmodule GenDurable.FlushTest do
         clear_awaits: true,
         set_rate: true
       }),
-      entry(r, %{status: "runnable", attempt: 1, delay_ms: 1000, set_state: true, state: ~s({"r":1})}),
+      entry(r, %{
+        status: "runnable",
+        attempt: 1,
+        delay_ms: 1000,
+        set_state: true,
+        state: ~s({"r":1})
+      }),
       entry(d, %{status: "done", set_result: true, result: ~s({"ok":true}), clear_awaits: true}),
       entry(s, %{status: "failed", set_error: true, error: "boom", clear_awaits: true})
     ]
@@ -151,7 +157,10 @@ defmodule GenDurable.FlushTest do
   test "a row whose ownership guard fails is reported stale, not committed" do
     id = executing()
 
-    result = Queries.flush(Repo, [entry(id, %{worker: "someone-else", status: "done", set_result: true, result: ~s({})})])
+    result =
+      Queries.flush(Repo, [
+        entry(id, %{worker: "someone-else", status: "done", set_result: true, result: ~s({})})
+      ])
 
     assert result.committed == []
     assert result.stale == [id]
@@ -168,7 +177,14 @@ defmodule GenDurable.FlushTest do
       )
 
     Queries.flush(Repo, [
-      entry(id, %{status: "runnable", set_step: true, step: "x", set_state: true, state: ~s({}), consumed_ids: [sig]})
+      entry(id, %{
+        status: "runnable",
+        set_step: true,
+        step: "x",
+        set_state: true,
+        state: ~s({}),
+        consumed_ids: [sig]
+      })
     ])
 
     assert signal_ids(id) == []
@@ -188,11 +204,19 @@ defmodule GenDurable.FlushTest do
 
   test "sibling completions collapse into one parent decrement and wake the parent" do
     parent = insert()
-    Repo.query!("UPDATE gen_durable SET status='awaiting_children', children_pending=2 WHERE id=$1", [parent])
+
+    Repo.query!(
+      "UPDATE gen_durable SET status='awaiting_children', children_pending=2 WHERE id=$1",
+      [parent]
+    )
 
     c1 = executing()
     c2 = executing()
-    Repo.query!("UPDATE gen_durable SET parent_id=$1 WHERE id = ANY($2::bigint[])", [parent, [c1, c2]])
+
+    Repo.query!("UPDATE gen_durable SET parent_id=$1 WHERE id = ANY($2::bigint[])", [
+      parent,
+      [c1, c2]
+    ])
 
     result =
       Queries.flush(Repo, [

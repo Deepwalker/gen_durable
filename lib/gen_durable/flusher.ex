@@ -112,7 +112,8 @@ defmodule GenDurable.Flusher do
         {:noreply, flush(state)}
 
       state.timer == nil ->
-        {:noreply, %{state | timer: Process.send_after(self(), :flush_deadline, state.max_delay_ms)}}
+        {:noreply,
+         %{state | timer: Process.send_after(self(), :flush_deadline, state.max_delay_ms)}}
 
       true ->
         {:noreply, state}

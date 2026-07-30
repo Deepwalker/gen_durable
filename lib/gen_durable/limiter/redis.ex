@@ -112,7 +112,8 @@ defmodule GenDurable.Limiter.Redis do
   def sync_config(%{cfg_key: cfg_key}, configs) do
     index = %{
       conc: Map.new(for({:conc, name, cap, _shards} <- configs, do: {name, cap})),
-      rate: Map.new(for({:rate, name, rate, burst, _shards} <- configs, do: {name, {rate, burst}}))
+      rate:
+        Map.new(for({:rate, name, rate, burst, _shards} <- configs, do: {name, {rate, burst}}))
     }
 
     :persistent_term.put(cfg_key, index)

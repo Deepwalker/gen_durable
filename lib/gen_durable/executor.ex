@@ -560,11 +560,25 @@ defmodule GenDurable.Executor do
   end
 
   defp build_entry(job, {:done, result_json}, _consumed) do
-    %{base_entry(job) | status: "done", set_result: true, result: result_json, clear_awaits: true, notify: true}
+    %{
+      base_entry(job)
+      | status: "done",
+        set_result: true,
+        result: result_json,
+        clear_awaits: true,
+        notify: true
+    }
   end
 
   defp build_entry(job, {:stop, reason_text}, _consumed) do
-    %{base_entry(job) | status: "failed", set_error: true, error: reason_text, clear_awaits: true, notify: true}
+    %{
+      base_entry(job)
+      | status: "failed",
+        set_error: true,
+        error: reason_text,
+        clear_awaits: true,
+        notify: true
+    }
   end
 
   # :await parks on `names` and transitions to `next_step`. `consumed` here is the

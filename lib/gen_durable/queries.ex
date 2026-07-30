@@ -851,7 +851,12 @@ defmodule GenDurable.Queries do
           workers = Enum.map(flat, fn {_, _, w} -> w end)
 
           %{rows: rows} =
-            q!(repo, "flush_childs_insert", @flush_childs_insert_sql, column_arrays(children) ++ [parent_ids, workers])
+            q!(
+              repo,
+              "flush_childs_insert",
+              @flush_childs_insert_sql,
+              column_arrays(children) ++ [parent_ids, workers]
+            )
 
           rows |> List.flatten() |> Enum.frequencies()
       end

@@ -247,10 +247,20 @@ defmodule GenDurable.Limiter.Postgres do
   defp admit(%{repo: repo} = handle, entries, attempts) do
     ids = Enum.map(entries, & &1.id)
     conc = Enum.map(entries, & &1.conc)
-    rkey = Enum.map(entries, fn %{rate: {k, _w}} -> k; _ -> nil end)
+
+    rkey =
+      Enum.map(entries, fn
+        %{rate: {k, _w}} -> k
+        _ -> nil
+      end)
+
     # weight is `double precision` in the schema (weighted rate limits), so the array is
     # float8[]; a non-rate entry's slot is unused (its rkey is NULL) but must still encode.
-    weight = Enum.map(entries, fn %{rate: {_k, w}} -> w * 1.0; _ -> 1.0 end)
+    weight =
+      Enum.map(entries, fn
+        %{rate: {_k, w}} -> w * 1.0
+        _ -> 1.0
+      end)
 
     %{rows: rows} = repo.query!(@admit_sql, [ids, conc, rkey, weight])
     by_id = Map.new(entries, &{&1.id, &1})
