@@ -697,7 +697,7 @@ defmodule GenDurable.EngineTest do
     assert %{status: "done"} = wait_status(a, "done")
   end
 
-  test "redis poke: a distributed lock collapses an insert burst into one broadcast" do
+  test "redis poke: the emitter's in-VM window collapses an insert burst into one broadcast" do
     start_engine(poke: {:redis, redis_url()}, poll_interval: 60_000, max_poll_interval: 60_000)
     Process.sleep(100)
 
@@ -706,20 +706,73 @@ defmodule GenDurable.EngineTest do
     {:ok, _} = Redix.PubSub.subscribe(ps, GenDurable.Poke.channel(GenDurable), self())
     assert_receive {:redix_pubsub, ^ps, _, :subscribed, _}, 1_000
 
-    # clear any dedup key a prior test left, so the first insert here wins its window
-    {:ok, redix} = Redix.start_link(redis_url())
-    Redix.command!(redix, ["DEL", GenDurable.Poke.dedup_key(GenDurable, "default")])
-
-    # a burst of inserts to one queue, well within the 100ms dedup window
+    # a burst of inserts to one queue, well within the emitter's 100ms window. The
+    # per-instance emitter is fresh per start_engine, so the first insert always wins
+    # the leading edge — no cross-test dedup state to clear.
     for _ <- 1..10, do: {:ok, _} = GenDurable.insert(GenDurable.Test.Plain)
 
     Process.sleep(200)
     msgs = for {:redix_pubsub, ^ps, _, :message, _} = m <- drain_mailbox(), do: m
 
-    # the SET NX PX lock let (about) one insert broadcast; without it there would
-    # be ~10. At least one means discovery is never lost.
+    # the emitter's in-VM window (replacing the old SET NX PX lock) let ~one broadcast
+    # out (a leading edge + at most one trailing); without it there would be ~10. At
+    # least one means discovery is never lost.
     assert msgs != [], "the first insert must broadcast — discovery not lost"
-    assert length(msgs) <= 3, "the dedup lock must collapse the burst, got #{length(msgs)} of 10"
+    assert length(msgs) <= 3, "the emitter must collapse the burst, got #{length(msgs)} of 10"
+  end
+
+  test "postgres poke: an insert is discovered by the local scheduler under a huge poll" do
+    start_engine(poke: :postgres, poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    # only a poke can discover the row within the window (poll is 60s); the emitter's
+    # local leg pokes this node directly, so it runs fast — and pg_notify must not error.
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    assert %{status: "done"} = wait_status(id, "done")
+  end
+
+  test "postgres poke: the emitter's window collapses an insert burst into one NOTIFY" do
+    start_engine(poke: :postgres, poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    # a raw LISTEN subscriber that counts every NOTIFY on the channel (no token filter)
+    {:ok, notif} = Postgrex.Notifications.start_link(notif_conn())
+    {:ok, _ref} = Postgrex.Notifications.listen(notif, GenDurable.Poke.channel(GenDurable))
+
+    # a burst of inserts to one queue, well within the emitter's 100ms window
+    for _ <- 1..10, do: {:ok, _} = GenDurable.insert(GenDurable.Test.Plain)
+
+    Process.sleep(200)
+    msgs = for {:notification, _, _, _, _} = m <- drain_notifications(), do: m
+
+    assert msgs != [], "the first insert must NOTIFY — discovery not lost"
+    assert length(msgs) <= 3, "the emitter must collapse the burst, got #{length(msgs)} of 10"
+  end
+
+  test "none poke: no emitter is started; work waits for the poll" do
+    start_engine(poke: :none, poll_interval: 60_000, max_poll_interval: 60_000)
+    Process.sleep(100)
+
+    refute Process.whereis(GenDurable.Poke.emitter(GenDurable)),
+           ":none must start no emitter"
+
+    {:ok, id} = GenDurable.insert(GenDurable.Test.Plain)
+    Process.sleep(200)
+
+    # nothing pokes — a 60s poll is the only discovery, so it is still runnable
+    assert %{status: "runnable"} = status(id)
+  end
+
+  # Postgrex connection opts from the repo config (drop the Ecto-pool keys Postgrex rejects).
+  defp notif_conn,
+    do: Keyword.take(Repo.config(), [:hostname, :port, :username, :password, :database])
+
+  defp drain_notifications(acc \\ []) do
+    receive do
+      {:notification, _, _, _, _} = m -> drain_notifications([m | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   defp drain_mailbox(acc \\ []) do

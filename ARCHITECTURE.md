@@ -31,7 +31,7 @@ death.
 | `Limiter.Redis` (`limiter/redis.ex`) | Redis backend: a lease-scored ZSET semaphore (self-heals on lease expiry) + a Lua token bucket. Single-node Redis. Requires optional `:redix`. |
 | `Reaper` (`reaper.ex`) | Sweeps expired leases (`executing` past `lease_expires_at`) back to `runnable` — the crash-recovery floor. Optional per node. |
 | `GC` (`gc.ex`) | Prunes terminal rows past retention; drives `Limiter.reconcile` (bucket self-heal). Optional per node. |
-| `Poke` (`poke.ex`) | The poke transport (`:local`/`:cluster`/`{:redis,_}`): announce new runnable work to schedulers so it's discovered without waiting for the poll. Best-effort. |
+| `Poke` (`poke.ex`) | The poke transport (`:local`/`:cluster`/`{:redis,_}`/`:postgres`/`:none`): announce new runnable work to schedulers so it's discovered without waiting for the poll. Emitted out-of-band + coalesced per queue by a per-instance `Emitter` (≤1 broadcast/queue/window/node); subscribers `Listener` (Redis) / `PgListener` (LISTEN/NOTIFY). Best-effort. |
 | `Await` (`await.ex`) | Sync-over-async: the Watcher (same-node waiter table + batched cross-node poller) backing `await/3`. |
 | `FSM` (`fsm.ex`) | `use GenDurable.FSM` — the `step/2` / `perform/1` contract, queue binding, state-module wiring. |
 | `State` (`state.ex`) | `use GenDurable.State` — the typed `embedded_schema` state and its jsonb `to_db`/`from_db`. |
@@ -75,7 +75,7 @@ Indexes worth knowing (each backs a specific invariant/scan):
 - a `:pg` **scope** (poke membership — schedulers join their queue's group)
 - **`Await.Watcher`** (idle-free; backs `await/3`)
 - a **`Task.Supervisor`** (runs the step Tasks)
-- **poke children** — a Redis publisher + `Poke.Listener`, only under `{:redis,_}`
+- **poke children** — a per-instance `Poke.Emitter` (every mode except `:none`), plus a Redis publisher + `Poke.Listener` under `{:redis,_}` / a `Poke.PgListener` under `:postgres`
 - **limiter children** — a Redix connection, only under `limiter: {:redis,_}`
 - **`Flusher`(s)** — one group-commit coordinator per `flushers:` spec (default one `:all`)
 - **`Reaper`** and **`GC`** — each optional per node (`reaper: false`/`gc: false` for

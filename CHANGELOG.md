@@ -6,6 +6,36 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.13
+
+### Added
+- **Poke transport `:postgres` (Postgres `LISTEN`/`NOTIFY`).** A fourth cross-node poke
+  transport for clusters that share a Postgres but have **neither** Erlang distribution
+  (`:cluster`) **nor** Redis (`{:redis, _}`). No extra dependency — reuses the repo's
+  Postgrex. The caller's node is poked directly; other nodes receive a `NOTIFY` on the
+  instance channel (tagged with the origin VM token so a node drops its own message), and a
+  `GenDurable.Poke.PgListener` holds a dedicated `Postgrex.Notifications` connection that
+  turns foreign notifications into local pokes.
+- **Poke transport `:none`.** Never poke anyone; the poll interval is the sole discovery
+  mechanism. No emitter, no listener, no cross-node traffic — for deployments that accept
+  poll latency or where `NOTIFY`/distribution/Redis are unwanted.
+
+### Changed
+- **Pokes are emitted out-of-band and coalesced by a per-instance emitter.** `dispatch`/
+  `dispatch_rows` are now async casts to a `GenDurable.Poke.Emitter` process, so the caller
+  (insert, signal wake, outcome flush) does **zero** transport work on its hot path — and for
+  `:postgres` the `NOTIFY` no longer rides the insert's commit path (where it would serialize
+  fleet-wide on the notify-queue lock). The Emitter coalesces per queue over a ~100 ms in-VM
+  window (leading edge + at most one trailing fan-out), so a burst/stream of pokes for one
+  queue fans out **at most once per queue per window per node**.
+
+  **This in-VM window replaces the Redis `{:redis, _}` transport's distributed `SET NX PX`
+  dedup lock** (removed): dedup is now per-node, so fleet fan-in is bounded by node count
+  rather than a single fleet-wide broadcast per window. `publish` is a plain `PUBLISH`. The
+  receive-side idle-scheduler debounce is unchanged and composes with the new send-side
+  window. Every transport except `:none` now runs the emitter. See `GenDurable.Poke` and
+  issue #1.
+
 ## 0.2.12
 
 ### Changed

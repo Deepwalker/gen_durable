@@ -29,8 +29,12 @@ defmodule GenDurable.Supervisor do
       `GenDurable.Poke`): `:local` (default) — the caller's node only;
       `:cluster` — every node, over Erlang distribution; `{:redis, url_or_opts}`
       — Redis Pub/Sub, for clusters without distribution (requires the optional
-      `:redix` dependency; the value is passed to `Redix.start_link/1`).
-      Best-effort in every mode — the poll interval is the discovery floor.
+      `:redix` dependency; the value is passed to `Redix.start_link/1`);
+      `:postgres` — Postgres `LISTEN`/`NOTIFY`, for clusters that share a Postgres
+      but have neither distribution nor Redis (no extra dependency); `:none` —
+      never poke, poll-only. Every poke is emitted out-of-band and coalesced per
+      queue by a per-instance emitter. Best-effort in every mode — the poll
+      interval is the discovery floor (the sole mechanism under `:none`).
     * `:await` — tuning for `GenDurable.await/3`: `[tick: 25]` (ms between the
       batched watcher's probes — the latency granularity for results committed
       on OTHER nodes; same-node results are pushed instantly). Idle-free, so
@@ -254,17 +258,20 @@ defmodule GenDurable.Supervisor do
         {Task.Supervisor, name: task_sup}
       ] ++
         limiter_children ++
-        poke_children(name, poke) ++
+        poke_children(name, poke, config) ++
         reaper_child(repo, name, reaper_cfg) ++
         gc_child(repo, limiter, name, gc_cfg) ++ flusher_children ++ schedulers
 
     Supervisor.init(children, strategy: :one_for_one)
   end
 
-  # The {:redis, _} transport needs two processes: a publisher connection (the
-  # insert side) and the Pub/Sub listener (the subscriber side). :local and
-  # :cluster need nothing beyond the :pg scope.
-  defp poke_children(name, {:redis, redis}) do
+  # Every transport except `:none` runs a per-instance Emitter — the out-of-band,
+  # coalescing send side that `dispatch` casts to. `{:redis, _}` additionally needs a
+  # publisher connection + Pub/Sub listener; `:postgres` a dedicated LISTEN connection.
+  # `:local`/`:cluster` need only the Emitter (plus the always-started `:pg` scope).
+  defp poke_children(_name, :none, _config), do: []
+
+  defp poke_children(name, {:redis, redis}, config) do
     publisher = GenDurable.Poke.publisher(name)
 
     publisher_arg =
@@ -275,16 +282,38 @@ defmodule GenDurable.Supervisor do
 
     [
       Supervisor.child_spec({Redix, publisher_arg}, id: {Redix, publisher}),
+      emitter_child(name, config),
       %{
         id: GenDurable.Poke.Listener,
         start:
           {GenDurable.Poke.Listener, :start_link,
-           [%{name: name, redis: redis, token: GenDurable.Scheduler.vm_id()}]}
+           [%{name: name, redis: redis, token: config.poke_token}]}
       }
     ]
   end
 
-  defp poke_children(_name, _mode), do: []
+  defp poke_children(name, :postgres, config) do
+    [
+      emitter_child(name, config),
+      %{
+        id: GenDurable.Poke.PgListener,
+        start:
+          {GenDurable.Poke.PgListener, :start_link,
+           [%{name: name, repo: config.repo, token: config.poke_token}]}
+      }
+    ]
+  end
+
+  defp poke_children(name, _mode, config), do: [emitter_child(name, config)]
+
+  defp emitter_child(name, config) do
+    %{
+      id: GenDurable.Poke.Emitter,
+      start:
+        {GenDurable.Poke.Emitter, :start_link,
+         [[name: GenDurable.Poke.emitter(name), config: config]]}
+    }
+  end
 
   # `flushers:` — a list of specs, each a group-commit coordinator for the queues
   # that route to it. A queue picks the FIRST spec whose `queues` matches it
@@ -301,7 +330,8 @@ defmodule GenDurable.Supervisor do
   end
 
   defp parse_flushers(other),
-    do: raise(ArgumentError, ":flushers must be a non-empty list of specs, got: #{inspect(other)}")
+    do:
+      raise(ArgumentError, ":flushers must be a non-empty list of specs, got: #{inspect(other)}")
 
   defp normalize_flusher_queues(:all), do: :all
   defp normalize_flusher_queues(list) when is_list(list), do: Enum.map(list, &to_string/1)
@@ -366,7 +396,7 @@ defmodule GenDurable.Supervisor do
     raise ArgumentError, "limiter {:redis, _} needs a url or opts, got: #{inspect(other)}"
   end
 
-  defp validate_poke!(mode) when mode in [:local, :cluster], do: mode
+  defp validate_poke!(mode) when mode in [:local, :cluster, :postgres, :none], do: mode
 
   defp validate_poke!({:redis, redis} = mode) when is_binary(redis) or is_list(redis) do
     if Code.ensure_loaded?(Redix) do
@@ -380,7 +410,8 @@ defmodule GenDurable.Supervisor do
 
   defp validate_poke!(other) do
     raise ArgumentError,
-          ":poke must be :local, :cluster, or {:redis, url_or_opts}, got: #{inspect(other)}"
+          ":poke must be :local, :cluster, :postgres, :none, or {:redis, url_or_opts}, " <>
+            "got: #{inspect(other)}"
   end
 
   defp reaper_child(repo, name, cfg) do
