@@ -120,6 +120,53 @@ defmodule GenDurable do
   end
 
   @doc """
+  Enqueue one FSM instance **without waiting for the write** — the params are buffered
+  in an in-memory batcher and inserted as a batch (see the `:insert_batcher` engine
+  option). Returns `:ok` immediately.
+
+  This is the **fire-and-forget, lossy** counterpart to `insert/2`: there is **no id**
+  (it is assigned only when the batch flushes) and a row still buffered when the VM dies
+  abruptly is **lost**. Use it for throughput workloads where an occasional dropped
+  insert is acceptable; use `insert/2` for at-least-once work. Correlation-key dedup
+  still applies at flush (a duplicate is dropped, but the caller does not learn of it).
+
+  Always safe to call: it falls back to a synchronous, durable `insert` when no batcher
+  is configured for the instance, or when the batcher's buffer is saturated
+  (`:max_buffer`) — degrading to a durable write rather than dropping under pressure or
+  losing the row when there is nowhere to buffer it. Takes the same options as `insert/2`.
+  """
+  def insert_async(fsm_module, opts \\ []) do
+    name = Keyword.get(opts, :name, GenDurable)
+    params = build_params(fsm_module, opts)
+
+    # Buffer only when there is a LIVE batcher with room. The `Process.whereis` guard also
+    # covers a stale `persistent_term` entry left by a prior engine (the entry outlives the
+    # instance) and a crashed batcher — both fall through to a durable insert.
+    with %{ref: ref, batcher: batcher, max_buffer: max_buffer} <-
+           :persistent_term.get({GenDurable, name, :insert_batcher}, nil),
+         pid when is_pid(pid) <- Process.whereis(batcher),
+         true <- :atomics.get(ref, 1) < max_buffer do
+      :atomics.add(ref, 1, 1)
+      GenDurable.InsertBatcher.enqueue(batcher, params)
+      :ok
+    else
+      # no batcher, dead batcher, or a saturated buffer — a plain durable insert
+      _ -> insert_now(repo(opts), params, opts)
+    end
+  end
+
+  # A synchronous, durable insert that returns `:ok` (no id), for the `insert_async`
+  # fallback paths — a buffered row and a fallback row are indistinguishable to the caller.
+  defp insert_now(repo, params, opts) do
+    case Queries.insert(repo, params) do
+      {:ok, _id} -> poke_local([params], opts)
+      {:error, :duplicate} -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Batch-enqueue instances in a single statement (dedup via the partial unique
   index). `entries` is a list of per-instance option keyword lists. Returns the
   list of inserted ids — duplicates are dropped and rows are inserted in

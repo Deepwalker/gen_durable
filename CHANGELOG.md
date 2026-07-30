@@ -6,6 +6,26 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.14
+
+### Added
+- **`insert_async/2` + an opt-in in-memory insert batcher (`:insert_batcher`).** The
+  fire-and-forget, **lossy** counterpart to the outcome group-commit flusher:
+  `GenDurable.insert_async/2` buffers a row's params in a per-instance
+  `GenDurable.InsertBatcher` and returns `:ok` immediately, and the batcher writes the
+  buffer as one `insert_all` on a size/time trigger (`max_batch` / `max_delay_ms`,
+  auto-growing under load), then pokes the affected queues out-of-band. There is **no id**
+  (assigned only at flush) and a row still buffered on an abrupt VM death is **lost** — for
+  throughput workloads where that is acceptable; `insert/2` stays durable/at-least-once.
+
+  Enabled per instance with `insert_batcher: [max_batch: 1000, max_delay_ms: 100,
+  max_buffer: 10_000]` (default `false`). **Backpressure:** the pending depth is a
+  lock-free `:atomics` counter; at `max_buffer`, `insert_async` falls back to a synchronous
+  durable `insert` rather than growing the buffer. It also falls back when no batcher is
+  configured (or a stale/dead one is routed), so it is always safe to call. On graceful
+  shutdown the batcher drains its buffer (a clean stop loses nothing). Correlation-key dedup
+  still applies at flush. See `GenDurable.InsertBatcher` and issue #2.
+
 ## 0.2.13
 
 ### Added

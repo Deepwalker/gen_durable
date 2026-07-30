@@ -783,6 +783,59 @@ defmodule GenDurable.EngineTest do
     end
   end
 
+  defp id_of(ck) do
+    case Repo.query!("SELECT id FROM gen_durable WHERE correlation_key = $1", [ck]) do
+      %{rows: [[id]]} -> id
+      %{rows: []} -> nil
+    end
+  end
+
+  test "insert_async: a configured batcher buffers, flushes, and the rows run" do
+    start_engine(insert_batcher: [max_batch: 100, max_delay_ms: 15])
+
+    for i <- 1..3,
+        do: :ok = GenDurable.insert_async(GenDurable.Test.Plain, correlation_key: "ba-#{i}")
+
+    # flushed within the delay window, then discovered + run to done
+    for i <- 1..3 do
+      id = eventually(fn -> if id = id_of("ba-#{i}"), do: {:ok, id}, else: :retry end)
+      assert %{status: "done"} = wait_status(id, "done")
+    end
+  end
+
+  test "insert_async: with no batcher configured it writes synchronously (durable fallback)" do
+    start_engine()
+
+    :ok = GenDurable.insert_async(GenDurable.Test.Plain, correlation_key: "sy-1")
+
+    # synchronous — the row exists immediately, no flush window to wait out
+    assert id_of("sy-1")
+  end
+
+  test "insert_async: a saturated buffer falls back to a synchronous durable write" do
+    # max_buffer 0 ⇒ every call is at the limit; the 60s delay means a *buffered* row
+    # would not appear — its immediate presence proves the synchronous fallback fired
+    start_engine(insert_batcher: [max_buffer: 0, max_delay_ms: 60_000])
+
+    :ok = GenDurable.insert_async(GenDurable.Test.Plain, correlation_key: "bp-1")
+
+    assert id_of("bp-1")
+  end
+
+  test "insert_async: the batcher drains its buffer on graceful shutdown" do
+    start_engine(insert_batcher: [max_batch: 1000, max_delay_ms: 60_000])
+
+    :ok = GenDurable.insert_async(GenDurable.Test.Plain, correlation_key: "dr-1")
+    Process.sleep(50)
+
+    # buffered, not flushed (huge triggers) — nothing written yet
+    refute id_of("dr-1")
+
+    # a graceful stop drains the buffer via terminate/2
+    :ok = stop_supervised(GenDurable)
+    assert id_of("dr-1")
+  end
+
   test "await: a fresh insert answers {:done, result} within the call (local push)" do
     # poll 60s: only poke discovers the row, only the executor's nudge (or the
     # 25ms watcher) can answer the await this fast

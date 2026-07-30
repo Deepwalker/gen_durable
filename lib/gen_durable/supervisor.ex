@@ -71,6 +71,13 @@ defmodule GenDurable.Supervisor do
       captures every key with that prefix — configuring a name that collides with
       identity-style keys (e.g. `order:` used for mutual exclusion) silently raises
       their limit and breaks the exclusion.
+    * `:insert_batcher` — opt-in **fire-and-forget** insert batching (default `false`),
+      e.g. `[max_batch: 1000, max_delay_ms: 100, max_buffer: 10_000]`. When set,
+      `GenDurable.insert_async/2` buffers rows in-memory and writes them as one
+      `insert_all` per trigger (see `GenDurable.InsertBatcher`). **Lossy**: a row still
+      buffered on an abrupt VM death is lost — for throughput workloads where that is
+      acceptable. `max_buffer` bounds the buffer; over it, `insert_async` falls back to a
+      synchronous durable write. Does not affect `insert/2` (always durable).
 
   `:prefetch`, `:min_demand`, and `:max_poll_interval` are the feeder
   aggressiveness knobs and apply to every queue; see `GenDurable.Scheduler` for
@@ -96,12 +103,14 @@ defmodule GenDurable.Supervisor do
     drain_timeout: 5_000,
     rate_limits: [],
     concurrency_limits: [],
-    flushers: [%{queues: :all}]
+    flushers: [%{queues: :all}],
+    insert_batcher: false
   ]
 
   @reaper_defaults [interval: 30_000]
   @gc_defaults [interval: 60_000, retention: 86_400_000, batch: 10_000]
   @await_defaults [tick: 25]
+  @insert_batcher_defaults [max_batch: 1000, max_delay_ms: 100, max_buffer: 10_000]
 
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, GenDurable))
@@ -202,6 +211,44 @@ defmodule GenDurable.Supervisor do
         )
       end
 
+    # Optional fire-and-forget insert batcher (see GenDurable.InsertBatcher). Off by
+    # default; when configured, publish its atomics depth counter + handle so
+    # `insert_async/2` can buffer / backpressure without a call into the process.
+    insert_batcher_children =
+      case component_opts(opts, :insert_batcher, @insert_batcher_defaults) do
+        false ->
+          # Clear any stale routing a prior engine of this name left behind — the entry
+          # outlives the instance, so a no-batcher restart must un-route `insert_async`.
+          :persistent_term.erase({GenDurable, name, :insert_batcher})
+          []
+
+        cfg ->
+          ref = :atomics.new(1, [])
+          batcher = Module.concat(name, InsertBatcher)
+
+          :persistent_term.put(
+            {GenDurable, name, :insert_batcher},
+            %{ref: ref, batcher: batcher, max_buffer: cfg[:max_buffer], repo: repo}
+          )
+
+          [
+            %{
+              id: GenDurable.InsertBatcher,
+              start:
+                {GenDurable.InsertBatcher, :start_link,
+                 [
+                   [
+                     name: batcher,
+                     config: config,
+                     ref: ref,
+                     max_batch: cfg[:max_batch],
+                     max_delay_ms: cfg[:max_delay_ms]
+                   ]
+                 ]}
+            }
+          ]
+      end
+
     schedulers =
       for {queue_name, concurrency} <- Keyword.fetch!(opts, :queues) do
         queue = to_string(queue_name)
@@ -260,7 +307,8 @@ defmodule GenDurable.Supervisor do
         limiter_children ++
         poke_children(name, poke, config) ++
         reaper_child(repo, name, reaper_cfg) ++
-        gc_child(repo, limiter, name, gc_cfg) ++ flusher_children ++ schedulers
+        gc_child(repo, limiter, name, gc_cfg) ++
+        flusher_children ++ insert_batcher_children ++ schedulers
 
     Supervisor.init(children, strategy: :one_for_one)
   end

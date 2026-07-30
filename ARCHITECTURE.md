@@ -20,11 +20,12 @@ death.
 
 | Module | Responsibility |
 |---|---|
-| `GenDurable` (`gen_durable.ex`) | Public API: `insert`/`insert_all`/`await`/`signal`/`child_spec`; builds insert params; fires pokes. |
+| `GenDurable` (`gen_durable.ex`) | Public API: `insert`/`insert_all`/`insert_async`/`await`/`signal`/`child_spec`; builds insert params; fires pokes. |
 | `Supervisor` (`supervisor.ex`) | Engine supervisor. Parses opts, builds the `config` (into `:persistent_term` `{GenDurable, name}`), seeds limiter policy, starts the per-node component tree. **Start here to see what runs.** |
 | `Scheduler` (`scheduler.ex`) | Per-queue feeder+executor loop. Claims into a small buffer, spawns ≤`concurrency` Tasks, heartbeats claimed rows, discovers work by poke/poll, drains on shutdown. |
 | `Executor` (`executor.ex`) | Runs one picked job: resolve FSM → load state → `step/2` (guarded) → build the outcome and commit it through the queue's `Flusher` (blocks until durable). With `inline_execution:`, loops a `:next` into the next step in the SAME task (keep-executing continue commit + out-of-band admit) instead of requeuing. |
 | `Flusher` (`flusher.ex`) | Group-commit coordinator. Worker Tasks block on it; it coalesces their outcomes into one batched `Queries.flush/1` transaction (triggers: `max_batch` ∨ `max_delay_ms`), then runs batched side effects (credit/notify/poke). One per `flushers:` spec, owning a queue set. |
+| `InsertBatcher` (`insert_batcher.ex`) | Opt-in **fire-and-forget** insert batcher (the lossy mirror of `Flusher`). `insert_async/2` buffers params (async) and returns immediately; coalesces into one `Queries.insert_all` per trigger, then pokes. Backpressure via an `:atomics` depth counter → synchronous durable fallback at `max_buffer`; drains on shutdown. Rows buffered at an abrupt crash are lost. One per instance under `insert_batcher:`. |
 | `Queries` (`queries.ex`) | **Every SQL statement, one function each.** The pick (`@claim_sql`), the batched outcome `flush/1`, heartbeat/reap/reclaim, GC + bucket reconcile, insert/signal. The single largest and most invariant-dense file. |
 | `Limiter` (`limiter.ex`) | Behaviour + dispatch for **out-of-band admission** of configured limits: `admit`/`credit`/`renew`/`sync_config`/`reconcile`. A limiter is a `{module, handle}`. |
 | `Limiter.Postgres` (`limiter/postgres.ex`) | Default backend: the sharded `gen_durable_buckets` admission math (`@admit_sql`), as standalone statements over the claimed batch. |
