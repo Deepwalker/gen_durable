@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+# Supply-chain note: every third-party action is pinned to a full commit SHA and
+# every service image to a content digest. Tags (@v4, :17) are mutable — whoever
+# controls the upstream repo or registry namespace can repoint one at malicious
+# code, which would then run here with this workflow's token. A SHA/digest cannot
+# be repointed. The `# vX.Y.Z` comments record what each pin was, and Dependabot
+# (.github/dependabot.yml) proposes the bumps so the pins stay fresh instead of
+# rotting. Hex deps are already integrity-checked by the hashes in mix.lock.
+
 jobs:
   build:
     name: Build and test
@@ -18,7 +26,7 @@ jobs:
     # limiter backend tests need Redis. Versions match .devcontainer.
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -31,7 +39,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
         ports:
           - 6379:6379
         options: >-
@@ -49,16 +57,20 @@ jobs:
       REDIS_URL: redis://localhost:6379
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        # Nothing here pushes; don't leave the token in .git/config where a
+        # compromised dependency or test could read it.
+        persist-credentials: false
     - name: Set up Elixir
-      # v1.16.0 could not map ubuntu-24 (the ubuntu-latest image); @v1 tracks the
-      # latest v1.x, which supports it. Toolchain matches .devcontainer.
-      uses: erlef/setup-beam@v1
+      # Toolchain matches .devcontainer. (The old v1.16.0 pin also could not map
+      # the ubuntu-24 runner image, which is what broke this workflow outright.)
+      uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
       with:
         elixir-version: '1.18'
         otp-version: '27'
     - name: Restore dependencies cache
-      uses: actions/cache@v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           deps

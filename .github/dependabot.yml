@@ -1,0 +1,19 @@
+version: 2
+
+# The workflow pins every action to a commit SHA (see .github/workflows/elixir.yml).
+# A pin that never moves is a stale pin, so Dependabot proposes the bumps: it
+# rewrites both the SHA and the trailing `# vX.Y.Z` comment, keeping the pin
+# intact while the review happens in a PR.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: mix
+    directory: "/"
+    schedule:
+      interval: weekly
