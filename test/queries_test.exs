@@ -9,7 +9,13 @@ defmodule GenDurable.QueriesTest do
   @live_scope ~w(runnable executing awaiting_signal awaiting_children)
 
   setup do
-    Repo.query!("TRUNCATE gen_durable, signals RESTART IDENTITY CASCADE")
+    # The bucket configs too: `pick/4` reads the configured gate names from them, so a gate
+    # seeded by an earlier test would make this one's concurrency_key count as configured.
+    Repo.query!(
+      "TRUNCATE gen_durable, signals, gen_durable_buckets, gen_durable_bucket_configs " <>
+        "RESTART IDENTITY CASCADE"
+    )
+
     :ok
   end
 
@@ -340,11 +346,6 @@ defmodule GenDurable.QueriesTest do
   end
 
   describe "concurrency gates (configured concurrency_key)" do
-    setup do
-      Repo.query!("TRUNCATE gen_durable_buckets, gen_durable_bucket_configs")
-      :ok
-    end
-
     defp seed_gate(name, limit, shards \\ 1),
       do:
         Queries.upsert_concurrency_configs(Repo, [%{name: name, capacity: limit, shards: shards}])
@@ -1160,11 +1161,6 @@ defmodule GenDurable.QueriesTest do
   end
 
   describe "rate limiting (spec §12)" do
-    setup do
-      Repo.query!("TRUNCATE gen_durable_buckets, gen_durable_bucket_configs")
-      :ok
-    end
-
     test "insert creates no bucket; the first pick mints it pre-debited and grants up to budget" do
       :ok = seed(0, 5)
       for _ <- 1..10, do: {:ok, _} = Queries.insert(Repo, params(%{rate_limit: "api"}))
