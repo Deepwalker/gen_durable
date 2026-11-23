@@ -6,6 +6,58 @@ All notable changes to `gen_durable` are documented here. The format follows
 ship as versioned migration increments — `GenDurable.Migration.up/1` applies only the ones an
 install is missing (before the first deployment they were edited into v1 in place).
 
+## 0.2.16
+
+Four concurrency bugs found by model checking the protocol (Quint models, TLC + Apalache — new
+`formal/`, `make formal`). Each is reproduced by a model instance, the fix is verified in the
+model, and a regression test pins it (`test/formal_findings_test.exs`). Details: ISSUES #31–#34.
+
+### Fixed
+- **Gate over-admission: the reconciler could free a finished slot, then its late credit freed
+  it again (PG limiter, ISSUES #31).** Since 0.2.9 the slot credit ran after the flush commit; a
+  `reconcile_concurrency` in that window recounted from the executing rows and returned the
+  slot, an admit took it, and the late credit (`LEAST` only stops it at capacity) returned it a
+  second time, so the gate ran over its cap. No crash or pause is needed; the inline re-key path
+  widened the window to an admit round-trip or a whole extra flush. **Fix:** the PG limiter
+  credits **inside the flush transaction** (new optional `Limiter.credit_in_txn?/1`;
+  `Queries.flush/3` takes a credit callback). Bucket locks are taken in `(key, shard)` order
+  first, so two flushes cannot deadlock on each other. The inline continue commit returns the old
+  slot itself instead of after the new key's admit.
+- **ABA in the ownership guard: a zombie of the same scheduler incarnation could commit over a
+  re-claim (ISSUES #32).** The guard compared `locked_by` with the scheduler incarnation id.
+  After a pause longer than `lease_ttl` (BEAM pause, VM suspend, partition), the reaper requeued
+  the row; if the same incarnation re-claimed it, the old task's outcome passed the guard. That
+  lost a transition and rewound the state, could insert duplicate children, and voided the
+  inline path's ownership proof. **Fix:** claims carry a per-claim fencing token
+  `<incarnation>#<pick seq>` (`Scheduler.claim_token/2`), and every outcome guard compares it.
+  The PG admit now admits (debits, stamps) only rows still held under the claim's token.
+  Heartbeat and shutdown release match the incarnation prefix. No schema change.
+- **Redis gate: a late `ZREM` could evict a newer holding of the same row (ISSUES #33).** Members
+  were row ids, so a row re-admitted while its previous claim's credit was in flight took no new
+  slot (`ZADD` of an existing member), and the late `ZREM` removed the new holding. **Fix:** the
+  member is the claim (`"<id>@<token>"`).
+- **Crash loops ignored `max_attempts` (ISSUES #34).** The cap was checked only when a step
+  returned `{:error, _}`. A step that killed its Task or node retried forever, and startup
+  `reclaim_orphans` did not even bump `attempt`. **Fix:** the executor fails a step whose
+  `attempt` has reached the cap **before** running it (`"max_attempts (N) exceeded"`), and
+  `reclaim_orphans` bumps `attempt` like the reaper. Jobs keep their default cap of 20; state
+  machines may now set `:max_attempts` too (uncapped by default, so a deliberate unbounded
+  `:retry` keeps working).
+
+### Changed
+- **Hot path:** the PG credit moves from a post-commit statement into the flush transaction.
+  The statement count is the same, but the bucket row locks are now held until the flush commits
+  (admit and reconcile skip them with `SKIP LOCKED`). The PG admit joins its batch to
+  `gen_durable` by primary key for the token fence, which costs one index probe per admitted
+  entry. Claim and outcome statement counts are unchanged (`test/perf_test.exs`).
+- `Limiter.entry` carries `:worker` (the claim token). Redis slots are `{key, "<id>@<token>"}`.
+
+### Added
+- `formal/`: Quint models (`gen_durable.qnt`, `retries.qnt`, `signals.qnt`, an Apalache
+  inductive proof in `gen_durable_proof.qnt`), the `run.sh` matrix with expected outcomes,
+  `make formal-up` / `make formal`, and agent instructions in `formal/AGENTS.md` (linked from a
+  new root `AGENTS.md` and from `CLAUDE.md`).
+
 ## 0.2.15
 
 ### Changed

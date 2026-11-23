@@ -48,9 +48,13 @@ defmodule GenDurable.Limiter do
     * `:rate` — `{rate_key, weight}` when the step is rate-limited, else `nil`.
     * `:conc` — the `conc_key` when the key is CONFIGURED (has a `conc` bucket config),
       else `nil`. Unconfigured keys are admitted in-band and never reach the Limiter.
+    * `:worker` — the claim's fencing token (`locked_by`). A backend that shares the
+      database (Postgres) admits only rows still held under it; any backend identifies the
+      slot per claim with it, so a late credit of an old claim cannot return a newer one.
   """
   @type entry :: %{
           id: term(),
+          worker: String.t(),
           rate: {rate_key(), pos_integer()} | nil,
           conc: conc_key() | nil
         }
@@ -97,6 +101,20 @@ defmodule GenDurable.Limiter do
   @callback credit(handle :: term(), slots :: [slot()]) :: :ok
 
   @doc """
+  Whether `credit/2` must run INSIDE the flush transaction that moves the rows out of
+  `executing` (optional; default `false` = credit after the commit).
+
+  A backend whose counter is anonymous and lives in the same database (Postgres) must say
+  `true`: a credit applied after the commit races `reconcile/1`, which recomputes the
+  counter from the executing rows — it frees the finished row's slot, an admit takes it, and
+  the late credit frees it a second time (over-admission; ISSUES #31). Crediting in the same
+  transaction makes "row left executing" and "slot returned" one atomic step. A backend whose
+  slots are identified per claim (Redis members) is safe to credit after the commit.
+  """
+  @callback credit_in_txn?(handle :: term()) :: boolean()
+  @optional_callbacks credit_in_txn?: 1
+
+  @doc """
   Extend the leases of slots still held by in-flight/buffered rows — called on the scheduler's
   heartbeat, alongside the row-lease renewal. A lease-native backend (Redis) bumps each held
   slot's expiry so a live holder is never pruned mid-step; a backend that counts holders from
@@ -126,6 +144,13 @@ defmodule GenDurable.Limiter do
   @spec credit(t(), [slot()]) :: :ok
   def credit(_limiter, []), do: :ok
   def credit({mod, handle}, slots), do: mod.credit(handle, slots)
+
+  @doc "See `c:credit_in_txn?/1`."
+  @spec credit_in_txn?(t()) :: boolean()
+  def credit_in_txn?({mod, handle}) do
+    Code.ensure_loaded?(mod) and function_exported?(mod, :credit_in_txn?, 1) and
+      mod.credit_in_txn?(handle)
+  end
 
   @doc "See `c:renew/2`."
   @spec renew(t(), [slot()]) :: :ok

@@ -67,7 +67,12 @@ defmodule GenDurable.FSM do
       nested `State` schema module is defined inside the FSM (as above) it is picked
       up by convention, so you rarely pass this. Omit both for plain-map state.
     * `:initial` — initial step for `GenDurable.insert/2` (default `"start"`).
-    * `:max_attempts` — job retry cap (default `20`). Job form only.
+    * `:max_attempts` — attempt cap. Job form: default `20`, and an `{:error, _}` on the
+      last attempt fails the job. Both forms: a step whose `attempt` has reached the cap is
+      failed BEFORE running (`{:stop, "max_attempts … exceeded"}`) — `attempt` also counts
+      runs that never returned (the Task or node died, the lease expired), so a poison pill
+      cannot crash-loop forever. FSM form: default `nil` (uncapped — an FSM may `:retry`
+      deliberately without bound); set it to bound crash loops.
     * `:inline_execution` — when `true`, a `:next` outcome runs the next step **inline
       in the same worker** instead of requeuing it through the picker, as long as the
       next step's rate/concurrency tokens can be secured out-of-band (denied ⇒ it
@@ -130,12 +135,14 @@ defmodule GenDurable.FSM do
       has_step ->
         quote do
           unquote(state_def(opts, mod))
+          unquote(max_attempts_def(Keyword.get(opts, :max_attempts)))
           unquote(unless_defined(mod, {:handle, 2}, fsm_handle()))
         end
 
       has_perform ->
         quote do
           unquote(state_def(opts, mod))
+          unquote(max_attempts_def(Keyword.get(opts, :max_attempts, 20)))
           unquote(job_step(mod, opts))
           unquote(unless_defined(mod, {:backoff, 1}, job_backoff()))
           unquote(unless_defined(mod, {:handle, 2}, job_handle(opts)))
@@ -164,6 +171,16 @@ defmodule GenDurable.FSM do
 
     quote do
       def __gd_state__, do: unquote(state)
+    end
+  end
+
+  # The attempt cap the EXECUTOR enforces before running a step (ISSUES #34): `attempt` also
+  # grows on the crash path (reaper / startup reclaim), where no `{:error, _}` return ever
+  # reaches `__retry__` — without this a step that kills its task or node retries forever.
+  # nil = uncapped (the FSM-form default: an FSM may `:retry` deliberately without bound).
+  defp max_attempts_def(max) do
+    quote do
+      def __gd_max_attempts__, do: unquote(max)
     end
   end
 

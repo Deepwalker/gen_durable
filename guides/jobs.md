@@ -35,7 +35,11 @@ struct if a [`State` schema](machines.md#state) is declared) and, in the `/2` fo
 ## Retries and backoff
 
 `{:error, _}` (or a raised exception) is retried until `:max_attempts` (default `20`), then
-the instance is `failed`. The delay between attempts is `backoff/1` — a capped exponential by
+the instance is `failed`. `attempt` also counts runs that never returned — the Task or its node
+died, or the step outlived its lease (the reaper and the startup reclaim bump it) — and a job
+whose `attempt` has reached `:max_attempts` is failed **before** running again
+(`"max_attempts (N) exceeded"`), so a step that crashes its process cannot retry forever.
+State machines can opt in with the same `:max_attempts` option (uncapped by default). The delay between attempts is `backoff/1` — a capped exponential by
 default (`min(1000 * 2^attempt, 300_000)` ms). Override either:
 
 ```elixir

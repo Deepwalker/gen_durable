@@ -235,7 +235,7 @@ defmodule GenDurable.Queries do
 
     entries =
       Enum.map(needs_admit, fn c ->
-        %{id: c.id, conc: if(c.gated, do: c.concurrency_key), rate: c.rate}
+        %{id: c.id, worker: worker, conc: if(c.gated, do: c.concurrency_key), rate: c.rate}
       end)
 
     %{admitted: admitted, denied: denied} = GenDurable.Limiter.admit(limiter, entries)
@@ -440,6 +440,13 @@ defmodule GenDurable.Queries do
   # Bucket-table locks stay FOR UPDATE: no FKs point at buckets, so there is
   # no KEY SHARE traffic to coexist with.
 
+  # `$2` is the scheduler INCARNATION id; claims carry per-pick tokens `worker#seq`
+  # (Scheduler.claim_token/2), so incarnation-wide statements match the `worker#` prefix
+  # (or an exact token, for callers that claim with a plain worker id). Extending/releasing
+  # any row this incarnation holds is correct whichever of its picks claimed it — only the
+  # OUTCOME guards need the exact per-claim token.
+  @held_by_worker "(locked_by = $2 OR left(locked_by, char_length($2) + 1) = $2 || '#')"
+
   def heartbeat(_repo, [], _worker, _ttl), do: :ok
 
   def heartbeat(repo, ids, worker, lease_ttl_ms) when is_list(ids) do
@@ -449,7 +456,7 @@ defmodule GenDurable.Queries do
       """
       WITH mine AS (
         SELECT id FROM gen_durable
-        WHERE id = ANY($1) AND locked_by = $2
+        WHERE id = ANY($1) AND #{@held_by_worker}
         ORDER BY id
         FOR NO KEY UPDATE SKIP LOCKED
       )
@@ -724,9 +731,14 @@ defmodule GenDurable.Queries do
     )
   """
 
-  def flush(_repo, []), do: %{committed: [], woken_queues: [], stale: []}
+  # `credit` (optional) — `fn slots -> :ok end`, called INSIDE the transaction with the gate
+  # slots of the committed entries, so a slot is returned atomically with its row leaving
+  # `executing` (see Limiter.credit_in_txn?/1; ISSUES #31). nil ⇒ the caller credits after.
+  def flush(repo, entries, credit \\ nil)
 
-  def flush(repo, entries) do
+  def flush(_repo, [], _credit), do: %{committed: [], woken_queues: [], stale: []}
+
+  def flush(repo, entries, credit) do
     # Lock in id order (deadlock discipline shared with the maintenance statements).
     entries = Enum.sort_by(entries, & &1.id)
     by_kind = Enum.group_by(entries, &Map.get(&1, :kind, :state))
@@ -744,6 +756,11 @@ defmodule GenDurable.Queries do
 
         flush_consume(repo, entries, committed, committed_ids)
         woken = flush_notify(repo, committed)
+
+        if credit do
+          slots = for e <- entries, MapSet.member?(committed_ids, e.id), e.slot, do: e.slot
+          if slots != [], do: credit.(slots)
+        end
 
         stale = for e <- entries, not MapSet.member?(committed_ids, e.id), do: e.id
 
@@ -1371,7 +1388,9 @@ defmodule GenDurable.Queries do
   # reclaim fires then, still far ahead of full lease expiry (the reaper's
   # floor). Rows claimed moments before the predecessor died are the remainder;
   # they wait for the reaper. Scans the (small) executing set via the partial
-  # lease index; runs once per scheduler boot.
+  # lease index; runs once per scheduler boot. Like the reaper it bumps `attempt`: a
+  # step whose node died mid-run used an attempt, and without the bump a step that kills
+  # its node would crash-loop forever below `max_attempts` (ISSUES #34).
   def reclaim_orphans(repo, queue, prefix, margin_ms) do
     %{num_rows: n} =
       q!(
@@ -1387,7 +1406,8 @@ defmodule GenDurable.Queries do
           FOR NO KEY UPDATE SKIP LOCKED
         )
         UPDATE gen_durable g
-        SET status = 'runnable', locked_by = null, lease_expires_at = null, updated_at = now()
+        SET status = 'runnable', locked_by = null, lease_expires_at = null,
+            attempt = attempt + 1, updated_at = now()
         FROM stale s
         WHERE g.id = s.id
         """,
@@ -1409,7 +1429,7 @@ defmodule GenDurable.Queries do
       """
       WITH mine AS (
         SELECT id FROM gen_durable
-        WHERE id = ANY($1) AND locked_by = $2 AND status = 'executing'
+        WHERE id = ANY($1) AND #{@held_by_worker} AND status = 'executing'
         ORDER BY id
         FOR NO KEY UPDATE SKIP LOCKED
       )

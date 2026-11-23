@@ -32,7 +32,8 @@ thirty-second calls at once; `limit: 10` never has more than 10 in flight.
   bouncing off the arbiter — an optimization over the index, which stays the correctness.
 - **Gates (configured)**: per-key slot counters with a database `CHECK` — over-admission
   is uncommittable. The pick debits slots in one batched pass; every outcome credits its
-  slot back. Counters are minted lazily, **pre-debited, by the first claim itself** — a
+  slot back in the same transaction that commits it (so the reconciler can never free a slot
+  twice). Counters are minted lazily, **pre-debited, by the first claim itself** — a
   cold gate (first use, or swept by GC after the key went idle) admits with zero lag.
   Crash paths under-credit (the safe direction: temporarily stricter than K)
   and the GC reconciler repairs the counters from the executing-rows truth each sweep.

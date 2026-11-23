@@ -3,7 +3,7 @@ defmodule GenDurable.Limiter.Redis do
   A `GenDurable.Limiter` backend on Redis — no Postgres locks, no bucket table.
 
     * **Concurrency** is a **lease-scored ZSET** per key (`gd:conc:<key>`): members are the
-      holders (the `gen_durable` row id), scores are lease-expiry timestamps. `admit` prunes
+      holding CLAIMS (`"<row id>@<claim token>"`), scores are lease-expiry timestamps. `admit` prunes
       expired members first (`ZREMRANGEBYSCORE … now`) then admits up to `cap - ZCARD`. A
       crashed holder's lease simply expires and is pruned on the next admit — **the slot
       self-heals with no Postgres reconcile**. The heartbeat bumps live holders' scores
@@ -131,7 +131,7 @@ defmodule GenDurable.Limiter.Redis do
         Enum.flat_map(entries, fn e ->
           {ck, ccap} = conc_args(e.conc, cfg)
           {rk, rate, burst, w} = rate_args(e.rate, cfg)
-          [to_string(e.id), ck, ccap, rk, rate, burst, w]
+          [member(e), ck, ccap, rk, rate, burst, w]
         end)
 
     {:ok, codes} = Redix.command(conn, ["EVAL", @admit_lua, "0" | argv])
@@ -140,7 +140,7 @@ defmodule GenDurable.Limiter.Redis do
     |> Enum.zip(codes)
     |> Enum.reduce(%{admitted: [], denied: []}, fn {e, code}, acc ->
       if code == "a" do
-        slot = if e.conc, do: {e.conc, e.id}, else: nil
+        slot = if e.conc, do: {e.conc, member(e)}, else: nil
         %{acc | admitted: [{e.id, slot} | acc.admitted]}
       else
         %{acc | denied: [e.id | acc.denied]}
@@ -186,6 +186,12 @@ defmodule GenDurable.Limiter.Redis do
     {rate, burst} = Map.get(cfg.rate, name(key), {0, 0})
     {key, to_string(rate), to_string(burst), to_string(weight)}
   end
+
+  # The ZSET member is the CLAIM (row id + fencing token), not the row: a row re-claimed and
+  # re-admitted while its previous claim's ZREM is still in flight would otherwise ZADD an
+  # existing member (taking no new slot) and the late ZREM would then evict the NEW holding —
+  # over-admission (ISSUES #33).
+  defp member(%{id: id, worker: worker}), do: "#{id}@#{worker}"
 
   defp name(key), do: key |> String.split(":", parts: 2) |> hd()
 end

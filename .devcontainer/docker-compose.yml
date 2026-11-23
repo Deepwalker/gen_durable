@@ -18,6 +18,17 @@ services:
       redis:
         condition: service_started
 
+  # Formal-methods toolchain (Quint + Apalache + TLC) for the protocol models in
+  # ./formal. Independent of the app/db — `make formal-up`, then `make formal`.
+  formal:
+    build:
+      context: .
+      dockerfile: formal.Dockerfile
+    command: sleep infinity
+    volumes:
+      - ..:/workspace:cached
+    profiles: ["formal"]
+
   # For the poke: {:redis, _} transport tests only — the engine itself never
   # requires Redis.
   redis:

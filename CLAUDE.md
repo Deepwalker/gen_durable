@@ -29,6 +29,14 @@ follow its "Going deeper" pointers to `guides/internals.md` (mechanics), `PERFOR
 model), and `ISSUES.md` (why each mechanism exists). Keep `ARCHITECTURE.md` current when the
 module set, tables, or topology change — it's a map, not a snapshot.
 
+## Formal models
+
+The concurrency protocol is modelled in Quint and checked with TLC + Apalache in
+[`formal/`](formal/) (`make formal-up`, then `make formal`). **Read
+[`formal/AGENTS.md`](formal/AGENTS.md) before changing the claim, ownership guard, admission or
+credit, the flush, inline run-ahead, reaper/reclaim/attempts, or signals.** Such a change must
+update the model and keep the `make formal` matrix green, in the same change.
+
 ## Running tests
 
 **Everything runs in the devcontainer** (Elixir 1.18 / OTP 27 + Postgres 17 + Redis 7,

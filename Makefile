@@ -1,7 +1,7 @@
 # gen_durable — dev shortcuts. Everything runs inside the devcontainer.
 DC := docker compose -p gen_durable -f .devcontainer/docker-compose.yml
 
-.PHONY: up test docs publish publish-docs
+.PHONY: up test docs publish publish-docs formal-up formal
 
 # Build the image and start the app + Postgres containers.
 up:
@@ -10,6 +10,15 @@ up:
 # Run the test suite (fetches deps first).
 test:
 	$(DC) exec -T app sh -lc "mix deps.get && mix test"
+
+# Formal models (./formal): build/start the Quint + Apalache + TLC container.
+formal-up:
+	$(DC) --profile formal up -d --build formal
+
+# Run the whole model-checking matrix (TLC exhaustive + Apalache); fails on any result that
+# differs from its expected outcome. `make formal ARGS=tlc` / `ARGS=apalache` for one backend.
+formal:
+	$(DC) --profile formal exec -T formal ./run.sh $(ARGS)
 
 # Generate HTML docs into ./doc.
 docs:

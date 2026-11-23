@@ -105,7 +105,8 @@ coexist and the public API resolves the right one.
   (`{:slot_swap, …}`) so the heartbeat renews the right one.
 - **Limiter (configured rate/concurrency).** The pick claims candidates lock-light, then
   `Limiter.admit/2` decides who runs (debiting tokens / taking slots) as a separate statement;
-  denied rows are released back to `runnable`. On outcome, `Limiter.credit/2` returns the slot;
+  denied rows are released back to `runnable`. On outcome, `Limiter.credit/2` returns the slot
+  (Postgres: inside the flush transaction; Redis: right after it);
   the heartbeat calls `Limiter.renew/2` (Redis bumps lease scores; PG no-ops); GC calls
   `Limiter.reconcile/1` (PG recomputes counters from the executing truth; Redis relies on lease
   expiry). K=1 for *unconfigured* keys is NOT the limiter — it's the arbiter index.
@@ -122,10 +123,16 @@ coexist and the public API resolves the right one.
 
 - **Durability / at-least-once** — the outcome commits before proceeding (the batched `Queries.flush/1`; the Task blocks until durable);
   a pre-commit crash re-runs the step.
-- **Ownership guard** — every outcome commits only while `locked_by = $worker AND status =
-  'executing'`; side effects ride the guarded UPDATE's `RETURNING` (`Queries`).
+- **Ownership guard** — every outcome commits only while `locked_by = $token AND status =
+  'executing'`; side effects ride the guarded UPDATE's `RETURNING` (`Queries`). `$token` is
+  per CLAIM (`<incarnation>#<pick seq>`, `Scheduler.claim_token/2`), so a zombie of the same
+  scheduler incarnation is fenced too; the PG admit is fenced by the same token.
 - **K=1 mutual exclusion (unconfigured keys)** — `gen_durable_concurrency_active` unique index.
-- **Configured limits** — out-of-band `GenDurable.Limiter` (`admit`/`credit`/`renew`/`reconcile`).
+- **Configured limits** — out-of-band `GenDurable.Limiter` (`admit`/`credit`/`renew`/`reconcile`);
+  a PG slot is credited inside the flush transaction that frees it (`credit_in_txn?/1`), a Redis
+  slot is a per-claim ZSET member.
+- **Bounded crash loops** — `attempt` counts every run (the reaper and startup reclaim bump it);
+  the executor fails a step at `__gd_max_attempts__` before running it.
 - **Leasing** — `Scheduler` heartbeat + `Reaper`; startup reclaim releases a dead predecessor's
   claims early.
 - **Self-heal** — PG `reconcile_concurrency` recomputes counters from executing rows; Redis
@@ -133,6 +140,10 @@ coexist and the public API resolves the right one.
   (zero-lag cold path).
 
 ## Going deeper
+
+- **`formal/`** — Quint models of the protocol, checked with TLC and Apalache (`make formal`);
+  **`formal/AGENTS.md`** says when and how to use them. Any change to claim / admit / flush /
+  credit / reap / reconcile / signals must keep that matrix green.
 
 - **`guides/internals.md`** — the actual DB mechanics: the pick, outcomes, locking, self-heal.
 - **`PERFORMANCE.md`** — the cost model, statement/round-trip counts, EXPLAIN plans, §6 known

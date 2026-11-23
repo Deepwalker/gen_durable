@@ -21,14 +21,16 @@ defmodule GenDurable.LimiterRedisTest do
     {:ok, handle: handle, conn: conn}
   end
 
-  defp entry(id, opts), do: %{id: id, conc: opts[:conc], rate: opts[:rate]}
+  defp entry(id, opts),
+    do: %{id: id, worker: opts[:worker] || "w#1", conc: opts[:conc], rate: opts[:rate]}
+
   defp ids(admitted), do: admitted |> Enum.map(&elem(&1, 0)) |> Enum.sort()
 
   test "concurrency admits up to cap; credit readmits", %{handle: h} do
     r = R.admit(h, [entry(1, conc: "api:x"), entry(2, conc: "api:x"), entry(3, conc: "api:x")])
     assert ids(r.admitted) == [1, 2]
     assert r.denied == [3]
-    assert Enum.all?(r.admitted, fn {id, slot} -> slot == {"api:x", id} end)
+    assert Enum.all?(r.admitted, fn {id, slot} -> slot == {"api:x", "#{id}@w#1"} end)
 
     # cap exhausted
     assert %{admitted: [], denied: [4]} = R.admit(h, [entry(4, conc: "api:x")])
@@ -96,8 +98,8 @@ defmodule GenDurable.LimiterRedisTest do
   test "gated AND rated: the gate slot is taken only when rate also passes", %{handle: h} do
     r =
       R.admit(h, [
-        %{id: 1, conc: "api:x", rate: {"email:x", 3}},
-        %{id: 2, conc: "api:x", rate: {"email:x", 3}}
+        entry(1, conc: "api:x", rate: {"email:x", 3}),
+        entry(2, conc: "api:x", rate: {"email:x", 3})
       ])
 
     # entry 1: gate ok + rate 3<=5 → admitted. entry 2: gate ok but rate 3+3>5 → denied,
@@ -106,6 +108,22 @@ defmodule GenDurable.LimiterRedisTest do
     assert r.denied == [2]
 
     # proof the gate slot was not consumed by the rate-denied entry: only 1 of cap 2 is used
-    assert %{admitted: [{3, {"api:x", 3}}]} = R.admit(h, [entry(3, conc: "api:x")])
+    assert %{admitted: [{3, {"api:x", "3@w#1"}}]} = R.admit(h, [entry(3, conc: "api:x")])
+  end
+
+  # ISSUES #33 (model: redis_shipped): the member is the CLAIM, not the row. A late ZREM of
+  # a previous claim of the same row must not evict the row's newer holding.
+  test "a late credit of an old claim does not free a newer claim of the same row", %{handle: h} do
+    %{admitted: [{1, old_slot}]} = R.admit(h, [entry(1, conc: "api:x", worker: "inc#1")])
+    # the row committed; before its credit lands it is re-claimed and re-admitted
+    %{admitted: [{1, new_slot}]} = R.admit(h, [entry(1, conc: "api:x", worker: "inc#2")])
+    assert old_slot != new_slot
+
+    :ok = R.credit(h, [old_slot])
+
+    # cap 2, the new claim still holds one: exactly one more fits
+    r = R.admit(h, [entry(2, conc: "api:x"), entry(3, conc: "api:x")])
+    assert ids(r.admitted) == [2]
+    assert r.denied == [3]
   end
 end

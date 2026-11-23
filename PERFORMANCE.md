@@ -440,8 +440,9 @@ steps) is capping something that did not need capping.
 
 Crash paths deliberately under-credit (a leaked slot means *stricter*-than-limit, never
 looser); the GC reconciler repairs the counters from the executing-rows truth each sweep,
-and the `CHECK (0 ≤ available ≤ cap)` makes both over-admission and double-credit
-uncommittable at the schema level. The CHECK is not decorative: the drain bench below
+and the `CHECK (0 ≤ available ≤ cap)` makes over-admission and a credit past capacity
+uncommittable at the schema level (a double credit *within* capacity is prevented by crediting
+inside the flush transaction — see ISSUES #31). The CHECK is not decorative: the drain bench below
 caught a real over-admission race through it (a locked bucket scan emitting a row twice
 under concurrent writes — fixed by deduplication in the pick, with the CHECK + retry as
 the remaining backstop).
