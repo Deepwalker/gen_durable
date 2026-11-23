@@ -930,8 +930,11 @@ also voids the "guarded commit proves ownership" premise behind inline's unguard
 claims with `locked_by = worker <> "#" <> pick_seq` (a per-incarnation counter bumped on every
 pick). That is unique per claim and still prefixed by the worker, so `reclaim_orphans` and an
 incarnation-prefix heartbeat are unaffected. Every ownership guard compares the job's token:
-flush, continue, children insert, `release_claims`, `release`. The PG admit joins its input to
-`gen_durable` on id + token + `executing`, so a lost claim neither debits nor stamps. Instance
+flush, continue, children insert, `release_claims`, `release`. The PG admit's
+shard stamp is fenced by the token, so it never lands on a row a new claimant owns. The
+admission math is deliberately not fenced: a first cut that joined it to `gen_durable` cost −20 %
+gate throughput (an O(batch²) plan, see PERFORMANCE.md §2c), and an unstamped debit for a lost
+claim is a safe-direction leak the reconciler heals. The model checks exactly this variant. Instance
 `fixed` (pauses) is exhaustive over 1.7M states with no violation. `fix_credit_inline_pauses`
 shows **fix A alone is not enough under pauses**: an unfenced zombie's commit credits inside the
 transaction and over-admits again. A and B ship together.

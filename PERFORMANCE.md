@@ -460,6 +460,29 @@ the remaining backstop).
 | gate, never throttling, 1 shard | 4 389 jobs/s | 0.46× |
 | gate, never throttling, 8 shards | 8 428 jobs/s | 0.88× |
 
+**Re-measured in 0.2.16** (`bench/gate_bench.exs`: 20k zero-length jobs, 8 pickers, batch 50,
+median of 5 rounds, 0.2.15 and 0.2.16 interleaved, 2+ runs each; the colima VM is noisy, so read
+ranges, not points). Current design: SKIP-LOCKED sharded grants, out-of-band admit, credit
+inside the flush transaction.
+
+| scenario | 0.2.15 | 0.2.16 |
+|---|---|---|
+| no key (baseline) | ~13–15k jobs/s | ~13–14k jobs/s |
+| gate, never throttling, 1 shard | 7.1–8.0k jobs/s | 7.2–8.0k jobs/s |
+| gate, never throttling, 8 shards | 12.0–13.5k jobs/s | 13.0–14.0k jobs/s |
+
+Pick p50 is ~3.5 ms on both; the admit statement is ~1.3–1.7 ms vs ~1.5 ms (EXPLAIN on a 1M-row
+table, `bench/explain_admit.exs`).
+
+> **A pitfall this measured: never join the admission batch to `gen_durable`.** The first cut
+> of the 0.2.16 token fence joined the admit's `input` to `gen_durable` (`id` + `locked_by` +
+> `executing`). The join itself was cheap (a hash join over `gen_durable_lease`, 0.06 ms), but
+> its row estimate collapsed to **1**, so every downstream CTE join (`winners`, `admitted`,
+> `c_debit`, `stamp`) became a nested loop over CTE scans, 50 × 50 rows each: +1.3 ms per admit
+> at batch 50, −20 % gate throughput, and O(batch²), so ~16 ms at batch 200. The fence now sits
+> only in the `stamp` UPDATE's own `WHERE`, where it costs nothing. When you add a predicate on
+> a correlated table to a CTE chain, EXPLAIN the whole statement, not just the new node.
+
 Cold gates cost nothing extra: the first claim mints the counters pre-debited in the
 same statement (a racing double-mint merges via ON CONFLICT, overdraft aborted by the
 CHECK and retried), so "no buckets yet" is indistinguishable from "buckets full".
@@ -739,6 +762,12 @@ postgres`, create a scratch database, apply the v1 DDL from
 signals), `ANALYZE`, and run `EXPLAIN (ANALYZE, BUFFERS)` on each statement from
 `lib/gen_durable/queries.ex`. Wrap mutating statements in `BEGIN; … ; ROLLBACK;` so the
 plan executes without changing the dataset. Run each twice and read the second (warm).
+
+Gate throughput A/B: `MIX_ENV=test mix run bench/gate_bench.exs` in the app container (env:
+`JOBS`, `PICKERS`, `BATCH`, `ROUNDS`, `SCENARIOS=base,g1,g8`; uses its own `gen_durable_bench`
+database). It touches only APIs that have the same shape across versions, so the same script
+runs on any checkout: interleave versions and compare ranges. Admit plan:
+`bench/explain_admit.exs` (1M rows, BEGIN/ROLLBACK).
 
 Re-verified after the 0.2.0 hardening on a fresh 1M-row seed (same recipe), warm plans:
 the common-path pick still rides `gen_durable_pick` with the rate CTEs **and the

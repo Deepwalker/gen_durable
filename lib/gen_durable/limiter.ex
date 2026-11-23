@@ -49,7 +49,7 @@ defmodule GenDurable.Limiter do
     * `:conc` — the `conc_key` when the key is CONFIGURED (has a `conc` bucket config),
       else `nil`. Unconfigured keys are admitted in-band and never reach the Limiter.
     * `:worker` — the claim's fencing token (`locked_by`). A backend that shares the
-      database (Postgres) admits only rows still held under it; any backend identifies the
+      database (Postgres) stamps only rows still held under it; any backend identifies the
       slot per claim with it, so a late credit of an old claim cannot return a newer one.
   """
   @type entry :: %{

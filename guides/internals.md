@@ -203,9 +203,9 @@ The concurrency handoff between steps:
 
 **Ordering is a correctness invariant.** The guarded continue commit runs **before**
 `Limiter.admit`: an orphaned chained task (lease expired, row reclaimed) fails the flush guard
-(`:stale`) and never admits. The PG admit is fenced on its own as well — it admits (debits,
-stamps) only rows still held under the claim's token — so a stamp can never land on a row a new
-claimant owns. The old slot is returned by the continue commit itself (the same transaction that
+(`:stale`) and never admits. The PG admit's `stamp` is fenced on its own as well
+(`locked_by = token AND executing`), so a stamp can never land on a row a new claimant owns;
+only the stamp is fenced: joining the admission math to `gen_durable` collapses the planner's row estimates into O(batch²) nested loops (PERFORMANCE.md §2c), and an unstamped debit for a lost claim is a leak in the safe direction that the reconciler heals. The old slot is returned by the continue commit itself (the same transaction that
 moves the row off the old key), not after the new key's admit: returning it later reopened the
 #31 window for the length of an admit round-trip, or of a whole extra flush on the denied branch. Denied admit
 (rate token unaffordable / configured slot full) requeues the row through the normal flush and the

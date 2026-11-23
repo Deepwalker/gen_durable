@@ -120,9 +120,12 @@ unguarded admit stamp.
 every pick. The token is unique per claim, because ABA needs a *later* pick, and still prefixed
 by the worker, so `reclaim_orphans`' prefix match and an incarnation-prefix heartbeat keep
 working. Every ownership guard compares the job's token instead of the worker: the flush, the
-continue entry, the children insert, `release_claims` and shutdown `release`. The PG admit joins
-its input to `gen_durable ON id AND locked_by = token AND status = 'executing'`, so an admission
-for a lost claim neither debits nor stamps. A `txid_current()` suffix written by the claim
+continue entry, the children insert, `release_claims` and shutdown `release`. The PG admit's
+shard `stamp` is fenced by the token too, so an admission for a lost claim never stamps a row
+a new claimant owns. The admission math itself is not fenced: joining it to `gen_durable`
+collapsed the planner's row estimates into O(batch²) nested loops (+1.3 ms per admit at batch
+50, measured). The model checks that the resulting unstamped debit is only a safe-direction
+leak. A `txid_current()` suffix written by the claim
 statement works equally well; the model only needs uniqueness per claim.
 
 TLC also shows that **fix A alone is not enough under pauses** (`fix_credit_inline_pauses`).

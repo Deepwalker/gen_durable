@@ -30,7 +30,7 @@ model, and a regression test pins it (`test/formal_findings_test.exs`). Details:
   lost a transition and rewound the state, could insert duplicate children, and voided the
   inline path's ownership proof. **Fix:** claims carry a per-claim fencing token
   `<incarnation>#<pick seq>` (`Scheduler.claim_token/2`), and every outcome guard compares it.
-  The PG admit now admits (debits, stamps) only rows still held under the claim's token.
+  The PG admit's shard stamp is fenced by the token (only the stamp: see Changed).
   Heartbeat and shutdown release match the incarnation prefix. No schema change.
 - **Redis gate: a late `ZREM` could evict a newer holding of the same row (ISSUES #33).** Members
   were row ids, so a row re-admitted while its previous claim's credit was in flight took no new
@@ -47,9 +47,15 @@ model, and a regression test pins it (`test/formal_findings_test.exs`). Details:
 ### Changed
 - **Hot path:** the PG credit moves from a post-commit statement into the flush transaction.
   The statement count is the same, but the bucket row locks are now held until the flush commits
-  (admit and reconcile skip them with `SKIP LOCKED`). The PG admit joins its batch to
-  `gen_durable` by primary key for the token fence, which costs one index probe per admitted
-  entry. Claim and outcome statement counts are unchanged (`test/perf_test.exs`).
+  (admit and reconcile skip them with `SKIP LOCKED`). Claim and outcome statement counts are
+  unchanged (`test/perf_test.exs`). **Measured A/B against 0.2.15** (`bench/gate_bench.exs`, 20k
+  zero-length gated jobs, 8 pickers, batch 50, interleaved runs): no regression. Gate on 8
+  shards: 13.0–14.0k vs 12.0–13.5k jobs/s; on 1 shard: 7.2–8.0k vs 7.1–8.0k; pick p50 is
+  unchanged. A first cut that fenced the whole admission (joining its input to `gen_durable`)
+  cost −20 % on 8 shards: the join collapsed the planner's row estimate to 1 and every
+  downstream CTE join became an O(batch²) nested loop (+1.3 ms per admit at batch 50). Only the
+  stamp is fenced now; an admit for a lost claim may debit unstamped, a safe-direction leak the
+  reconciler heals (model-checked).
 - `Limiter.entry` carries `:worker` (the claim token). Redis slots are `{key, "<id>@<token>"}`.
 
 ### Added

@@ -126,7 +126,7 @@ coexist and the public API resolves the right one.
 - **Ownership guard** — every outcome commits only while `locked_by = $token AND status =
   'executing'`; side effects ride the guarded UPDATE's `RETURNING` (`Queries`). `$token` is
   per CLAIM (`<incarnation>#<pick seq>`, `Scheduler.claim_token/2`), so a zombie of the same
-  scheduler incarnation is fenced too; the PG admit is fenced by the same token.
+  scheduler incarnation is fenced too; the PG admit's shard stamp is fenced by the same token.
 - **K=1 mutual exclusion (unconfigured keys)** — `gen_durable_concurrency_active` unique index.
 - **Configured limits** — out-of-band `GenDurable.Limiter` (`admit`/`credit`/`renew`/`reconcile`);
   a PG slot is credited inside the flush transaction that frees it (`credit_in_txn?/1`), a Redis

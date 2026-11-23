@@ -126,11 +126,15 @@ module gen_durable {
   def giveAvail(k: str): str -> int = if (isPg) creditOne(avail, k) else avail
   def giveMembers(k: str, m: Member): str -> Set[Member] =
     if (isPg or k == "") members else members.set(k, members.get(k).exclude(Set(m)))
-  // the PG admit stamps the drawn shard on the row (unguarded); Redis does not touch the row
-  def stamp(r: int): int -> Row = if (isPg) rows.set(r, { ...rows.get(r), shard: SReal }) else rows
-  // FENCED pg admit only admits rows still under the task's claim (input JOIN rows ON token);
-  // Redis cannot see Postgres ownership — a stale admission just parks a member that expires
-  def admitGuard(t: Task): bool = not(FENCED and isPg) or owns(t)
+  // The PG admit stamps the drawn shard on the row; Redis does not touch the row. Shipped:
+  // the stamp is unguarded. FENCED: the stamp UPDATE carries `locked_by = token AND
+  // executing`, so it lands only on the task's own claim. The admission math itself is NOT
+  // fenced (joining it to gen_durable collapses the planner's row estimates — PERFORMANCE.md):
+  // an admit for a claim that was taken back still debits, unstamped — a leak in the safe
+  // direction (the slot is held by nobody the reconciler counts; it heals it).
+  def stampFor(t: Task): int -> Row =
+    if (isPg and (not(FENCED) or owns(t))) rows.set(t.row, { ...rows.get(t.row), shard: SReal })
+    else rows
 
   // ---- actions -----------------------------------------------------------------------
 
@@ -169,8 +173,7 @@ module gen_durable {
   action admitOk(t: Task): bool = all {
     t.phase == PAdmit,
     freeSlots(t.key) > 0,
-    admitGuard(t),
-    rows' = stamp(t.row),
+    rows' = stampFor(t),
     tasks' = replace(t, { ...t, phase: PRun, slot: t.key }),
     avail' = takeAvail(t.key),
     members' = takeMembers(t.key, mOf(t)),
@@ -182,7 +185,7 @@ module gen_durable {
   // denied → release_claims (guarded) back to runnable, shard NULL
   action admitDeny(t: Task): bool = all {
     t.phase == PAdmit,
-    freeSlots(t.key) <= 0 or not(admitGuard(t)),
+    freeSlots(t.key) <= 0,
     rows' = if (owns(t)) rows.set(t.row, { ...rows.get(t.row), status: Runnable, owner: "", shard: SNone })
             else rows,
     tasks' = drop(t),
@@ -261,8 +264,7 @@ module gen_durable {
   action inlineAdmitOk(t: Task): bool = all {
     t.phase == PInlineAdmit,
     freeSlots(t.key) > 0,
-    admitGuard(t),
-    rows' = stamp(t.row),
+    rows' = stampFor(t),
     tasks' = replace(t, { ...t, slot: t.key, phase: PRun }),
     avail' = takeAvail(t.key),
     members' = takeMembers(t.key, mOf(t)),
@@ -275,7 +277,7 @@ module gen_durable {
   // already returned by the continue commit, so the requeue credits nothing.
   action inlineAdmitDeny(t: Task): bool = all {
     t.phase == PInlineAdmit,
-    freeSlots(t.key) <= 0 or not(admitGuard(t)),
+    freeSlots(t.key) <= 0,
     rows' = rows,
     tasks' = replace(t, { ...t, phase: PRequeue }),
     avail' = avail, members' = members,
