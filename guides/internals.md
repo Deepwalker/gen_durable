@@ -37,9 +37,14 @@ One row per instance (or job — a job is a one-step instance). Column groups:
 | bookkeeping | `inserted_at`, `updated_at` | `updated_at` doubles as the termination instant for GC retention |
 
 Ownership between statements is not a database lock: a step *owns* its row iff
-`locked_by = $worker AND status = 'executing'`, and every outcome statement carries that
-guard. A worker whose lease expired (row reclaimed, possibly re-claimed by someone else)
-commits nothing — the guard matches zero rows and the late outcome is dropped.
+`locked_by = $token AND status = 'executing'`, and every outcome statement carries that
+guard. `$token` is a **per-claim fencing token** — the scheduler claims under
+`<incarnation>#<pick seq>` (`Scheduler.claim_token/2`), not under its bare incarnation id. A
+worker whose lease expired (row reclaimed, possibly re-claimed by someone else — **including
+by its own scheduler incarnation**) commits nothing: the guard matches zero rows and the late
+outcome is dropped. (Before 0.2.16 the guard compared the incarnation id, so a zombie of the
+same incarnation passed it after a re-claim — ISSUES #32.) Incarnation-wide statements
+(heartbeat, shutdown release) match the `<incarnation>#` prefix instead.
 
 ### `signals` — the durable inbox
 
@@ -133,7 +138,7 @@ hands it to its queue's `GenDurable.Flusher`, and **blocks until it is durably w
 batching is orthogonal to durability). The flusher coalesces every outcome waiting on it into
 **one transaction** (`Queries.flush/1`): a single guarded `UPDATE gen_durable … FROM unnest(...)`
 applies every row's transition (the kind encoded per row via `set_*` flags), locking in `id`
-order. A row whose guard (`locked_by = $worker AND status = 'executing'`) fails is absent from
+order. A row whose guard (`locked_by = $token AND status = 'executing'`) fails is absent from
 `RETURNING`, commits nothing, and is reported `:stale` (the reclaiming claimant redoes the step).
 
 | Outcome | Row flip | Riders |
@@ -158,10 +163,17 @@ The **riders** run as their own batched statements over the rows that committed:
   (each gated on its parent's ownership, `ORDER BY correlation_key` for the arbiter discipline),
   then parks each parent with the count that actually landed (post-dedup).
 
-Side effects run **once, batched**, after the flush: `Limiter.credit/2` for every freed gate slot
-(the `{key, shard}` each job held; a stale outcome frees none; a crash between commit and credit
-leaks in the safe direction, healed by the reconciler), `notify_local` for settled instances, and
-deduped queue pokes (a woken parent's queue, a fan-out's cross-queue children).
+**Gate credit rides the flush transaction (Postgres limiter).** Every freed gate slot (the
+`{key, shard}` each committed job held; a stale outcome frees none) is credited by
+`Limiter.credit/2` **inside** the flush transaction, after the row updates — so "the row left
+`executing`" and "its slot came back" commit atomically (`Limiter.credit_in_txn?/1`). A credit
+run after the commit raced the reconciler: it recounted from the executing rows, freed the slot,
+an admit took it, and the late credit freed it again — over-admission (ISSUES #31). The Redis
+limiter, whose slots are per-claim ZSET members, still credits after the commit (a late
+credit there can only remove its own claim's member).
+
+The other side effects run **once, batched**, after the flush: `notify_local` for settled
+instances, and deduped queue pokes (a woken parent's queue, a fan-out's cross-queue children).
 
 **Triggers & config.** A flusher flushes at `max_batch` (100) buffered outcomes ∨ `max_delay_ms`
 (100 ms) after the first. Under load the batch **auto-grows** — waiters pile up while a flush runs
@@ -185,14 +197,17 @@ The concurrency handoff between steps:
 | Next `concurrency_key` | continue entry sets | Admission (out-of-band, AFTER the commit) |
 |---|---|---|
 | `:keep` (default) | nothing — same key/shard/slot held | none (still holding the slot) |
-| `nil` (release) | `concurrency_key` = NULL, `concurrency_shard` = NULL | none; the old slot is credited |
-| configured new key | key = new, shard = **provisional 0** (out of the K=1 index) | `Limiter.admit` debits the bucket, **stamps the real shard**, draws the slot; old credited |
+| `nil` (release) | `concurrency_key` = NULL, `concurrency_shard` = NULL; **the old slot is credited by this commit** | none |
+| configured new key | key = new, shard = **provisional 0** (out of the K=1 index); **the old slot is credited by this commit** | `Limiter.admit` debits the bucket, **stamps the real shard**, draws the slot |
 | unconfigured new key | **not inlined** | the row requeues (a NULL-shard continue that stays `executing` could collide on `gen_durable_concurrency_active` and abort the whole batch); the picker serializes the key |
 
 **Ordering is a correctness invariant.** The guarded continue commit runs **before**
-`Limiter.admit`, because the PG limiter's admit `stamp`s `concurrency_shard` by id **unguarded** by
-`locked_by`. An orphaned chained task (lease expired, row reclaimed) fails the flush guard
-(`:stale`) and never admits — so its stamp never lands on a row a new claimant owns. Denied admit
+`Limiter.admit`: an orphaned chained task (lease expired, row reclaimed) fails the flush guard
+(`:stale`) and never admits. The PG admit is fenced on its own as well — it admits (debits,
+stamps) only rows still held under the claim's token — so a stamp can never land on a row a new
+claimant owns. The old slot is returned by the continue commit itself (the same transaction that
+moves the row off the old key), not after the new key's admit: returning it later reopened the
+#31 window for the length of an admit round-trip, or of a whole extra flush on the denied branch. Denied admit
 (rate token unaffordable / configured slot full) requeues the row through the normal flush and the
 picker admits it — inline never over-runs a limit. A slot that changed mid-chain is reported to the
 scheduler (`{:slot_swap, id, slot}`) so the heartbeat's `Limiter.renew` bumps the **current** slot.
@@ -238,8 +253,11 @@ not-yet-parked row without waiting.
   choice: with a single *unsharded* counter, blocking `FOR UPDATE` beat `SKIP LOCKED`, which
   spin-retried with no alternative work. Sharding removes the one hot row, so skipping wins —
   size `shards ≥ contending nodes`, or an under-sharded hot key degrades back to that spin.)
-  The out-of-band credit (`Limiter.credit/2`) and the reconciler still take plain `FOR UPDATE`
-  on the specific shard they address, in sorted order.
+  The credit (`Limiter.credit/2`, inside the flush transaction) and the reconciler take plain
+  `FOR UPDATE` on the shards they address, in sorted `(key, shard)` order — a flush only ever
+  waits on another flush (admit and reconcile skip). Rows are locked before buckets in a flush;
+  admit locks buckets (never waiting) before stamping only rows held under its own token, which
+  no flush can hold — so no wait cycle forms.
 - **Racing inserts meet at unique indexes, in sorted order.** Ordered insertion turns
   "deadlock on each other's uncommitted index entries" into "one clean unique violation",
   which the caller resolves (pick retry) or ignores (`ON CONFLICT DO NOTHING`).
@@ -255,7 +273,7 @@ telemetry):
 | Constraint | Race it settles |
 |---|---|
 | `gen_durable_concurrency_active` (unique) | two picks claiming one K = 1 key |
-| `gen_durable_buckets` CHECK | residual gate over-admission; double credit (gates mint with `ON CONFLICT`, so only they trip the CHECK) |
+| `gen_durable_buckets` CHECK | residual gate over-admission; a credit past capacity (gates mint with `ON CONFLICT`, so only they trip the CHECK). It cannot see a double credit *within* capacity — that is prevented by crediting in the flush transaction |
 | `gen_durable_buckets` PK | two picks minting the same cold rate key (rate mints without `ON CONFLICT`, so only it trips the PK) |
 | `gen_durable_correlation` (unique) | duplicate business identity across concurrent inserts |
 

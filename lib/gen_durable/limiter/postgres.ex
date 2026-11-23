@@ -52,17 +52,33 @@ defmodule GenDurable.Limiter.Postgres do
   @impl true
   def renew(_handle, _slots), do: :ok
 
+  # Runs inside the flush transaction (credit_in_txn?/1), after its row updates. The shards
+  # are locked in sorted (key, shard) order first: two flush transactions crediting
+  # overlapping shards would otherwise deadlock in plan order. Admit takes these locks with
+  # SKIP LOCKED (never waits), the reconciler too — so a flush only ever waits on another flush.
   @credit_sql """
   WITH d AS (
     SELECT key, shard, count(*) AS cnt
     FROM unnest($1::text[], $2::int[]) AS t(key, shard)
     GROUP BY key, shard
+  ),
+  lk AS MATERIALIZED (
+    SELECT b.key, b.shard
+    FROM gen_durable_buckets b
+    JOIN d ON b.kind = 'conc' AND b.key = d.key AND b.shard = d.shard
+    ORDER BY b.key, b.shard
+    FOR UPDATE OF b
   )
   UPDATE gen_durable_buckets b
   SET available = LEAST(b.capacity, b.available + d.cnt)
-  FROM d
+  FROM d JOIN lk ON lk.key = d.key AND lk.shard = d.shard
   WHERE b.kind = 'conc' AND b.key = d.key AND b.shard = d.shard
   """
+
+  # The counter is anonymous and lives in this database: a credit after the flush commit
+  # races reconcile (ISSUES #31) — credit inside the flush transaction instead.
+  @impl true
+  def credit_in_txn?(_handle), do: true
 
   @impl true
   def credit(_handle, []), do: :ok
@@ -82,14 +98,20 @@ defmodule GenDurable.Limiter.Postgres do
   # left undebited, exactly as the fused pick's `c_writeback FROM claimed` did.
   @admit_sql """
   WITH input AS (
-    SELECT id, conc_key, rkey, weight, ord
-    FROM unnest($1::bigint[], $2::text[], $3::text[], $4::float8[])
-         WITH ORDINALITY AS t(id, conc_key, rkey, weight, ord)
+    SELECT id, worker, conc_key, rkey, weight, ord
+    FROM unnest($1::bigint[], $5::text[], $2::text[], $3::text[], $4::float8[])
+         WITH ORDINALITY AS t(id, worker, conc_key, rkey, weight, ord)
+  ),
+  -- Fencing (ISSUES #32): only rows still held under the claim's token are admitted —
+  -- a claim the reaper took back (and maybe someone re-claimed) neither debits nor stamps.
+  owned AS (
+    SELECT i.* FROM input i
+    JOIN gen_durable g ON g.id = i.id AND g.locked_by = i.worker AND g.status = 'executing'
   ),
   winners AS (
     SELECT id, conc_key, ord,
            row_number() OVER (PARTITION BY conc_key ORDER BY ord) AS rn
-    FROM input WHERE conc_key IS NOT NULL
+    FROM owned WHERE conc_key IS NOT NULL
   ),
   c_keys AS (SELECT DISTINCT conc_key AS key FROM winners),
   c_cold AS (
@@ -127,7 +149,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   elig AS (
     SELECT i.id, i.rkey, i.weight, i.ord
-    FROM input i
+    FROM owned i
     WHERE i.rkey IS NOT NULL
       AND (i.conc_key IS NULL OR i.id IN (SELECT id FROM c_admit))
   ),
@@ -172,7 +194,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   admitted AS (
     SELECT i.id, ca.shard AS c_shard
-    FROM input i
+    FROM owned i
     LEFT JOIN c_admit ca ON ca.id = i.id
     LEFT JOIN granted g ON g.id = i.id
     WHERE (i.conc_key IS NULL OR ca.id IS NOT NULL)
@@ -180,7 +202,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   c_debit AS (
     SELECT i.conc_key AS key, a.c_shard AS shard, count(*) AS cnt
-    FROM admitted a JOIN input i ON i.id = a.id
+    FROM admitted a JOIN owned i ON i.id = a.id
     WHERE a.c_shard IS NOT NULL
     GROUP BY 1, 2
   ),
@@ -201,7 +223,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   consumed AS (
     SELECT i.rkey AS key, max(g.cw) AS consumed
-    FROM admitted a JOIN input i ON i.id = a.id JOIN granted g ON g.id = a.id
+    FROM admitted a JOIN owned i ON i.id = a.id JOIN granted g ON g.id = a.id
     WHERE i.rkey IS NOT NULL
     GROUP BY i.rkey
   ),
@@ -232,8 +254,9 @@ defmodule GenDurable.Limiter.Postgres do
   stamp AS (
     UPDATE gen_durable g
     SET concurrency_shard = a.c_shard
-    FROM admitted a
+    FROM admitted a JOIN owned o ON o.id = a.id
     WHERE g.id = a.id AND a.c_shard IS NOT NULL
+      AND g.locked_by = o.worker AND g.status = 'executing'
   )
   SELECT i.id,
          (SELECT a.c_shard FROM admitted a WHERE a.id = i.id) AS c_shard,
@@ -246,6 +269,7 @@ defmodule GenDurable.Limiter.Postgres do
 
   defp admit(%{repo: repo} = handle, entries, attempts) do
     ids = Enum.map(entries, & &1.id)
+    workers = Enum.map(entries, & &1.worker)
     conc = Enum.map(entries, & &1.conc)
 
     rkey =
@@ -262,7 +286,7 @@ defmodule GenDurable.Limiter.Postgres do
         _ -> 1.0
       end)
 
-    %{rows: rows} = repo.query!(@admit_sql, [ids, conc, rkey, weight])
+    %{rows: rows} = repo.query!(@admit_sql, [ids, conc, rkey, weight, workers])
     by_id = Map.new(entries, &{&1.id, &1})
 
     Enum.reduce(rows, %{admitted: [], denied: []}, fn [id, c_shard, ok], acc ->

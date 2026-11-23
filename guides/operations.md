@@ -43,18 +43,21 @@ the same name fails with `:already_started`.
 
 Every claimed row holds a **lease** (`lease_expires_at`), extended by a heartbeat while the step
 runs. If a worker dies mid-step, the lease expires and the **reaper** returns the row to
-`runnable` with `attempt += 1` — the step re-runs from scratch. This is the at-least-once safety
+`runnable` with `attempt += 1` — the step re-runs from scratch (until `:max_attempts`: a step at
+its cap is failed before it runs again, so a crash loop is bounded). This is the at-least-once safety
 floor: a crashed step (no outcome) is retried whether or not your code asked for it, so step
 effects must tolerate running again.
 
-Outcomes are **ownership-guarded**: a step that outlives its lease (e.g. its scheduler crashed,
-so nothing extended the lease, and the row was reclaimed while it ran) gets its late outcome
-dropped rather than committed over the new claimant's work. The drop is observable as
+Outcomes are **ownership-guarded** by a per-claim token: a step that outlives its lease (e.g. its
+scheduler crashed, or the whole VM paused, so nothing extended the lease, and the row was
+reclaimed while it ran) gets its late outcome dropped rather than committed over the new
+claimant's work — even when the new claimant is the same scheduler incarnation. The drop is observable as
 `[:gen_durable, :outcome, :stale]`; the current claimant redoes the step.
 
 A restarted scheduler also **reclaims its dead predecessor's claims at startup**
 (`[:gen_durable, :scheduler, :reclaimed]`): rows claimed by an earlier incarnation of the same
-instance+queue on the same VM go straight back to `runnable` instead of waiting out the lease.
+instance+queue on the same VM go straight back to `runnable` instead of waiting out the lease,
+counting as an attempt (`attempt += 1`, like the reaper).
 
 ## Garbage collection
 

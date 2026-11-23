@@ -154,6 +154,8 @@ defmodule GenDurable.Scheduler do
       flusher: opts.flusher,
       buffer: [],
       in_flight: %{},
+      # Per-pick counter: the claim token is `worker <> "#" <> pick_seq` (see refill/1).
+      pick_seq: 0,
       # A pending debounced poke-fill (nil = none armed); coalesces a poke stream — see :poke.
       poke_timer: nil
     }
@@ -347,13 +349,19 @@ defmodule GenDurable.Scheduler do
 
     if demand > 0 and (demand >= state.min_demand or idle?(state)) do
       config = state.config
+      # A per-CLAIM fencing token, not the incarnation id: every ownership guard compares
+      # `locked_by` to the job's token, so a zombie task of THIS incarnation whose row was
+      # reaped and re-claimed by a later pick can no longer pass the guard (ABA — ISSUES #32).
+      # The `#` keeps the incarnation a strict prefix (heartbeat/release/startup reclaim).
+      seq = state.pick_seq + 1
+      state = %{state | pick_seq: seq}
 
       jobs =
         Queries.pick(
           config.repo,
           state.queue,
           demand,
-          state.worker,
+          claim_token(state.worker, seq),
           config.lease_ttl_ms,
           config.limiter,
           MapSet.to_list(config.concurrency_limit_names)
@@ -431,6 +439,12 @@ defmodule GenDurable.Scheduler do
   # A queue is idle when nothing is running and nothing is buffered — the only
   # state a poke needs to act on. Busy queues self-serve (completion-refill fills
   # slots as tasks finish; the poll is the floor for anything a poke can't see).
+  @doc false
+  # The fencing token a pick claims under — unique per claim within an incarnation, and
+  # `worker <> "#"`-prefixed so incarnation-wide statements (heartbeat, shutdown release) can
+  # still match every row this incarnation holds.
+  def claim_token(worker, seq), do: worker <> "#" <> Integer.to_string(seq)
+
   defp idle?(state), do: map_size(state.in_flight) == 0 and state.buffer == []
 
   defp flush_pokes do

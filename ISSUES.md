@@ -865,6 +865,123 @@ understates the old guard by ~20× — the first cut of this measurement made ex
 mistake), then `EXPLAIN (ANALYZE, BUFFERS)` the claim at batch 1 and 100 across executing counts,
 `VACUUM ANALYZE` between readings.
 
+## Formal verification (Quint models, TLC + Apalache — `formal/`)
+
+The protocol is modelled in Quint (`formal/gen_durable.qnt`, `formal/signals.qnt`): claim →
+out-of-band admit → group-commit flush → credit, reaper, reconciler, inline run-ahead with
+re-keying, both limiter backends. TLC explores every reachable state for a scope; Apalache
+checks bounded traces and an inductive invariant. `make formal` runs the matrix with expected
+outcomes (`formal/run.sh`); `formal/README.md` maps every model action to its code. Each entry
+below is reproduced by a named model instance, and each fix is model-checked before it touches
+code.
+
+All four were found as `OPEN` (reproduced by the model, fix verified in the model) and are
+**fixed in 0.2.16**, each pinned by a regression test in `test/formal_findings_test.exs`. The
+model keeps both versions: the `*shipped*` instances must still reproduce each bug, and the
+`fixed*` instances, which model the current code, must stay green (`formal/AGENTS.md`).
+
+### 31. PG gate: reconciler × post-commit credit = double credit → cap exceeded — FIXED (0.2.16)
+
+**The finding** (instance `shipped`, TLC, 10 transitions, cap 1, **no crashes or pauses**).
+Since 0.2.9 the gate credit is out-of-band: the Flusher runs `Limiter.credit/2` **after** the
+flush transaction commits. `reconcile_concurrency` recomputes `available = cap − held` from the
+executing rows. If it runs between the commit and the credit, it frees the finished row's slot,
+and then the late credit frees it again. `LEAST(capacity, available + n)` (added exactly for
+"credit racing a reconcile") only covers the counter-already-full case. If an admit takes the
+freed unit in between, the late credit re-opens it and a further admit runs over the cap:
+
+```
+flush:next   avail=0   r1 committed; credit pending
+reconcile    avail=1   no executing holder → available = cap
+admitOk      avail=0   r2 takes the slot
+credit       avail=1   r1's late credit: LEAST(1, 0+1)
+admitOk      avail=0   r1's next step admitted → 2 running under cap 1
+```
+
+The inline path widens the window. On a re-key, the continue commit moves the row off the old
+key, but the old slot is credited only after the new key's admit round-trip, or, on the denied
+branch, after a whole extra flush (up to `max_delay_ms`). This is a regression introduced by
+0.2.9: the fused `credit_gate` rider was atomic with the row leaving `executing`.
+
+**Fix A (0.2.16; model-verified; tests: "#31 …" in `formal_findings_test.exs`).** Credit inside the flush transaction for the PG backend: an optional
+`Limiter.credit_in_txn/2` called by `Queries.flush` within its transaction for the committed
+entries' slots, taking bucket locks in `(key, shard)` order through a locking CTE (concurrent
+flushers otherwise deadlock on each other's buckets). The continue entry credits the old slot in
+the same transaction, and the job's `slot` is cleared so the denied branch does not credit twice.
+Redis keeps the post-commit credit, which fix C makes safe. Instances `fix_credit`
+(fix A alone, crash-only) and `fixed_inline` are exhaustive with no violation. Apalache proves
+the inductive invariant `available(k) + |stamped executing rows of k| ≤ cap`
+(`gen_durable_proof.qnt`), so the fixed protocol keeps the gate for traces of **any length**. The
+mutation instance, the same invariant without fix A, fails induction exactly at `reconcile`.
+
+### 32. ABA in the ownership guard: a same-incarnation zombie commits a stale outcome — FIXED (0.2.16)
+
+**The finding** (instance `shipped_pauses`, TLC, 6 transitions). Every guard compares
+`locked_by` to the worker id, and the worker id is the **scheduler incarnation**
+(`claim_prefix <> unique_integer`), not the claim. Suppose a task's lease expires while the
+incarnation survives: a BEAM pause, VM suspend, or partition longer than `lease_ttl`. The reaper
+requeues the row, the same incarnation re-claims it, and the old task's outcome passes the
+guard. Consequences in the model: a stale commit, and, with an intermediate claim elsewhere, an
+outcome for a step the row has already left (a lost transition and rewound state). The same hole
+lets a zombie `:schedule_childs` insert duplicate children and overwrite `children_pending`. It
+also voids the "guarded commit proves ownership" premise behind inline's unguarded admit stamp.
+
+**Fix B (0.2.16; model-verified; tests: "#32 …").** A per-claim fencing token, with no schema change. The scheduler
+claims with `locked_by = worker <> "#" <> pick_seq` (a per-incarnation counter bumped on every
+pick). That is unique per claim and still prefixed by the worker, so `reclaim_orphans` and an
+incarnation-prefix heartbeat are unaffected. Every ownership guard compares the job's token:
+flush, continue, children insert, `release_claims`, `release`. The PG admit joins its input to
+`gen_durable` on id + token + `executing`, so a lost claim neither debits nor stamps. Instance
+`fixed` (pauses) is exhaustive over 1.7M states with no violation. `fix_credit_inline_pauses`
+shows **fix A alone is not enough under pauses**: an unfenced zombie's commit credits inside the
+transaction and over-admits again. A and B ship together.
+
+**Not covered by any fix, by design:** a zombie's *user code* keeps running under pauses. Leases
+can fence commits and accounting, not side effects (`GateCap` is checked crash-only for that
+reason). This is the at-least-once contract, not a defect.
+
+### 33. Redis gate: member = row id, so a late `ZREM` evicts a newer holding — FIXED (0.2.16)
+
+**The finding** (instance `redis_shipped`, TLC, 11 transitions, cap 2, no pauses). The Redis
+semaphore member is the row id. Suppose a row commits, its post-commit `ZREM` is still pending,
+and the row is re-claimed and admitted. The admit's `ZADD` of an existing member takes no new
+slot, and the late `ZREM` then removes the **new** holding: three steps run under cap 2. This is
+the Redis analogue of #31, with the same root: a credit that is not bound to the admission it
+returns.
+
+**Fix C (0.2.16; model-verified; test in `limiter_redis_test.exs`).** The member is the claim token (fix B), and `credit`/`renew`
+address exactly that member. Instances `redis_fixed` (6.9M states), `redis_fixed_inline` and
+`redis_fixed_pauses` are exhaustive with no violation.
+
+### 34. Crash loops ignore `max_attempts`; node-down reclaim doesn't bump `attempt` — FIXED (0.2.16)
+
+**The finding** (`formal/retries.qnt`, instance `retries_shipped`). `max_attempts` is checked
+only on the `{:error, _}` return path. A run that never returns — a bare `exit` (kept on the
+crash path by #10), a killed Task, an OOM/NIF node death, a step outliving its lease — goes
+through the reaper (`attempt + 1`, `eligible_at` unchanged: immediate re-pick, no backoff) or,
+after a node death, through `reclaim_orphans`, which does **not** bump `attempt` at all. Nothing
+on either path compares `attempt` to the cap, so a poison pill never reaches `failed`. One that
+kills its node keeps rotating through the cluster and takes nodes down. TLC shows the step run a
+4th time under cap 3 (two error retries, then a node-down reclaim).
+
+**Fix D (0.2.16; model-verified; tests: "#34 …").** D1: the executor fails a row whose `attempt` is at or above the cap
+before running user code (`{:stop, "max_attempts (N) exceeded …"}`; jobs default to 20; FSMs opt
+in with `:max_attempts`, uncapped by default, so a deliberate unbounded `:retry` keeps working). D2: `reclaim_orphans` bumps `attempt`. D1 alone still loops
+(`retries_cap_only`); D1+D2 holds over the full graph (`retries_fixed`). Also recommended (not
+modelled): the reaper applies `backoff(attempt)` to `eligible_at`.
+
+### Model-checked sound
+
+- **Inline run-ahead**: apart from #31 the slot hand-off is correct. `shipped_inline_norec` (the
+  reconciler off) is exhaustive over 2.1M states.
+- **Signals / `:await`** (`formal/signals.qnt`): no lost wakeup (park + recheck vs delivery,
+  with the `presented` exclusion and expiry); a signal is consumed only by an outcome that saw
+  it; none disappears except through the documented terminal-outcome drop. The mutation instance
+  without the recheck **does** lose a wakeup, so the property is not vacuous.
+- **Safe-direction leaks**: a crash between commit and credit, an admit failure after a debit,
+  shutdown `release` of buffered gated rows, the reaper keeping `concurrency_shard`. All are in
+  the model and none violates a property; reconcile / lease expiry heal them.
+
 ## Verified sound (checked deliberately)
 
 Single-statement outcomes with data-modifying CTEs instead of transactions;

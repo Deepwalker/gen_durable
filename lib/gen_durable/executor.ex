@@ -61,7 +61,7 @@ defmodule GenDurable.Executor do
     ctx = build_ctx(job, state_module)
 
     started = System.monotonic_time()
-    {outcome, consumed} = invoke(module, state_module, ctx)
+    {outcome, consumed} = run_or_exhaust(module, state_module, ctx)
     warn_unknown_rate_limit(config, job, outcome)
 
     :telemetry.execute(
@@ -173,10 +173,11 @@ defmodule GenDurable.Executor do
       base_entry(job)
       | status: "executing",
         keep_lock: true,
-        # The row KEEPS its concurrency slot across the inline step (it stays executing) — so the
-        # flush must NOT credit it. Slot lifecycle on an inline chain is handled explicitly in
-        # `finish_inline` (credit the old slot only on a key change). base_entry set slot: job.slot.
-        slot: nil,
+        # On a key change the OLD slot is returned by THIS commit — the same transaction that
+        # moves the row off the old key (in-txn for Postgres): returning it later, after the new
+        # key's admit, left a window where reconcile freed it first and the late credit freed it
+        # again (ISSUES #31). On `:keep` the row keeps its slot across the step: credit nothing.
+        slot: if(plan.credit_old, do: job.slot),
         lease_ttl_ms: lease_ttl_ms,
         set_step: true,
         step: step,
@@ -205,15 +206,14 @@ defmodule GenDurable.Executor do
     case admit_inline(config, job, plan, opts) do
       :denied ->
         emit_yield(job, outcome, :throttled)
+
+        # The continue commit already returned the old slot on a key change — requeue without it.
+        job = if plan.credit_old, do: %{job | slot: nil}, else: job
         apply_outcome(config, config.repo, job, outcome, consumed)
         :done
 
       {:admitted, new_slot} ->
-        # Return the old concurrency slot iff the key actually changed (a `:keep` chain holds
-        # the same slot across steps — crediting it would double-count).
-        if plan.credit_old and not is_nil(job.slot),
-          do: GenDurable.Limiter.credit(config.limiter, [job.slot])
-
+        # (The old slot, on a key change, was already returned by the continue commit.)
         # Keep the scheduler's in-flight slot current so its heartbeat renews the RIGHT slot
         # (a lease-native backend prunes an unrenewed one). Only when it changed.
         if new_slot != job.slot, do: send(sched, {:slot_swap, job.id, new_slot})
@@ -232,7 +232,7 @@ defmodule GenDurable.Executor do
     if is_nil(rate) and is_nil(plan.admit_conc) do
       {:admitted, resolve_slot(plan, job, nil)}
     else
-      entry = %{id: job.id, conc: plan.admit_conc, rate: rate}
+      entry = %{id: job.id, worker: job.worker, conc: plan.admit_conc, rate: rate}
       %{admitted: admitted, denied: denied} = GenDurable.Limiter.admit(config.limiter, [entry])
 
       if denied == [] do
@@ -382,6 +382,28 @@ defmodule GenDurable.Executor do
   # terminal state. Returns the serialized outcome plus the signal ids to
   # consume on a progressing outcome (the awaited snapshot the step received;
   # none on the handle path, since the step failed).
+  # `attempt` counts every run of this step, including runs that never returned (the reaper
+  # and startup reclaim bump it). A step already at its cap is failed WITHOUT running user
+  # code — the only place a crash loop can be bounded, since a crashing step never reaches
+  # `handle/2`/`__retry__` (ISSUES #34).
+  defp run_or_exhaust(module, state_module, ctx) do
+    max = max_attempts(module)
+
+    if max && ctx.attempt >= max do
+      reason =
+        "max_attempts (#{max}) exceeded: attempt #{ctx.attempt} of step #{inspect(ctx.step)}"
+
+      {serialize({:stop, reason}, state_module), []}
+    else
+      invoke(module, state_module, ctx)
+    end
+  end
+
+  # Modules compiled before 0.2.16 have no __gd_max_attempts__/0 — treat as uncapped.
+  defp max_attempts(module) do
+    if function_exported?(module, :__gd_max_attempts__, 0), do: module.__gd_max_attempts__()
+  end
+
   defp invoke(module, state_module, ctx) do
     outcome =
       module.step(ctx.step, ctx)

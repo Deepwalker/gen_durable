@@ -83,7 +83,9 @@ defmodule GenDurable.Flusher do
   """
   @spec commit_sync(map(), [entry()]) :: MapSet.t()
   def commit_sync(config, entries) do
-    %{committed: committed, woken_queues: woken} = Queries.flush(config.repo, entries)
+    %{committed: committed, woken_queues: woken} =
+      Queries.flush(config.repo, entries, in_txn_credit(config))
+
     committed = MapSet.new(committed)
     side_effects(config, entries, committed, woken)
     committed
@@ -132,7 +134,9 @@ defmodule GenDurable.Flusher do
     entries = Enum.map(pairs, fn {e, _from} -> e end)
 
     try do
-      %{committed: committed, woken_queues: woken} = Queries.flush(state.config.repo, entries)
+      %{committed: committed, woken_queues: woken} =
+        Queries.flush(state.config.repo, entries, in_txn_credit(state.config))
+
       committed = MapSet.new(committed)
 
       for {e, from} <- pairs do
@@ -154,6 +158,13 @@ defmodule GenDurable.Flusher do
     %{state | buffer: [], count: 0, timer: nil}
   end
 
+  # The credit callback for Queries.flush/3 when the limiter returns slots inside the flush
+  # transaction (Postgres — ISSUES #31), else nil (credited after the commit, below).
+  defp in_txn_credit(config) do
+    if Limiter.credit_in_txn?(config.limiter),
+      do: fn slots -> Limiter.credit(config.limiter, slots) end
+  end
+
   # Every side effect that used to run per-Task after `complete_*`, now batched and
   # resolved in one place: credit all freed concurrency slots in a single limiter
   # call, nudge local awaiters of settled instances, poke queues whose parent-join
@@ -161,8 +172,11 @@ defmodule GenDurable.Flusher do
   defp side_effects(config, entries, committed, woken_queues) do
     committed_entries = Enum.filter(entries, &MapSet.member?(committed, &1.id))
 
-    slots = for e <- committed_entries, not is_nil(e.slot), do: e.slot
-    Limiter.credit(config.limiter, slots)
+    # A backend crediting in the flush transaction already returned these (in_txn_credit/1).
+    unless Limiter.credit_in_txn?(config.limiter) do
+      slots = for e <- committed_entries, not is_nil(e.slot), do: e.slot
+      Limiter.credit(config.limiter, slots)
+    end
 
     for e <- committed_entries, e.notify, do: Await.notify_local(config.name, e.id)
 
