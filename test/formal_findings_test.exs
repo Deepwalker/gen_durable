@@ -188,26 +188,33 @@ defmodule GenDurable.FormalFindingsTest do
       assert row(a).status == "runnable" and row(b).status == "runnable"
     end
 
-    test "an admission for a claim that was taken back neither debits nor stamps" do
+    test "an admission for a claim that was taken back never stamps the new claimant's row" do
       :ok = Queries.upsert_concurrency_configs(Repo, [%{name: "api", capacity: 1, shards: 1}])
       {:ok, id} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
 
-      # claim, lose it to the reaper, someone else re-claims (gated rows: provisional shard)
+      # claimed by inc#1, lost to the reaper, re-claimed by inc#2; a sentinel shard marks
+      # the new claimant's own stamp so an overwrite would be visible
       Repo.query!(
-        "UPDATE gen_durable SET status = 'executing', locked_by = 'inc#2', concurrency_shard = 0 WHERE id = $1",
+        "UPDATE gen_durable SET status = 'executing', locked_by = 'inc#2', concurrency_shard = 7 WHERE id = $1",
         [id]
       )
 
-      %{admitted: [], denied: [^id]} =
-        Limiter.admit(pg(), [%{id: id, worker: "inc#1", conc: "api", rate: nil}])
+      # the old claim's admit: the admission math is not fenced (see @admit_sql), the stamp is
+      _ = Limiter.admit(pg(), [%{id: id, worker: "inc#1", conc: "api", rate: nil}])
 
-      %{rows: [[n]]} =
-        Repo.query!(
-          "SELECT count(*) FROM gen_durable_buckets WHERE kind = 'conc' AND key = 'api'"
-        )
+      %{rows: [[shard, owner]]} =
+        Repo.query!("SELECT concurrency_shard, locked_by FROM gen_durable WHERE id = $1", [id])
 
-      assert n == 0
-      assert row(id).locked_by == "inc#2"
+      assert {shard, owner} == {7, "inc#2"}
+
+      # the unstamped debit is a leak in the safe direction: the gate is shut until the
+      # reconciler returns it (here by sweeping the now-idle bucket: cold ⇒ full)
+      assert available("api") == 0
+      {:ok, _} = Queries.insert(Repo, params(%{concurrency_key: "api"}))
+      assert pick("w#9", @ttl, ["api"]) == []
+
+      Queries.reconcile_concurrency(Repo)
+      assert [_] = pick("w#10", @ttl, ["api"])
     end
   end
 

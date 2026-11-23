@@ -102,16 +102,10 @@ defmodule GenDurable.Limiter.Postgres do
     FROM unnest($1::bigint[], $5::text[], $2::text[], $3::text[], $4::float8[])
          WITH ORDINALITY AS t(id, worker, conc_key, rkey, weight, ord)
   ),
-  -- Fencing (ISSUES #32): only rows still held under the claim's token are admitted —
-  -- a claim the reaper took back (and maybe someone re-claimed) neither debits nor stamps.
-  owned AS (
-    SELECT i.* FROM input i
-    JOIN gen_durable g ON g.id = i.id AND g.locked_by = i.worker AND g.status = 'executing'
-  ),
   winners AS (
     SELECT id, conc_key, ord,
            row_number() OVER (PARTITION BY conc_key ORDER BY ord) AS rn
-    FROM owned WHERE conc_key IS NOT NULL
+    FROM input WHERE conc_key IS NOT NULL
   ),
   c_keys AS (SELECT DISTINCT conc_key AS key FROM winners),
   c_cold AS (
@@ -149,7 +143,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   elig AS (
     SELECT i.id, i.rkey, i.weight, i.ord
-    FROM owned i
+    FROM input i
     WHERE i.rkey IS NOT NULL
       AND (i.conc_key IS NULL OR i.id IN (SELECT id FROM c_admit))
   ),
@@ -193,8 +187,8 @@ defmodule GenDurable.Limiter.Postgres do
     WHERE w.cw <= a.total
   ),
   admitted AS (
-    SELECT i.id, ca.shard AS c_shard
-    FROM owned i
+    SELECT i.id, i.worker, ca.shard AS c_shard
+    FROM input i
     LEFT JOIN c_admit ca ON ca.id = i.id
     LEFT JOIN granted g ON g.id = i.id
     WHERE (i.conc_key IS NULL OR ca.id IS NOT NULL)
@@ -202,7 +196,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   c_debit AS (
     SELECT i.conc_key AS key, a.c_shard AS shard, count(*) AS cnt
-    FROM admitted a JOIN owned i ON i.id = a.id
+    FROM admitted a JOIN input i ON i.id = a.id
     WHERE a.c_shard IS NOT NULL
     GROUP BY 1, 2
   ),
@@ -223,7 +217,7 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   consumed AS (
     SELECT i.rkey AS key, max(g.cw) AS consumed
-    FROM admitted a JOIN owned i ON i.id = a.id JOIN granted g ON g.id = a.id
+    FROM admitted a JOIN input i ON i.id = a.id JOIN granted g ON g.id = a.id
     WHERE i.rkey IS NOT NULL
     GROUP BY i.rkey
   ),
@@ -251,12 +245,18 @@ defmodule GenDurable.Limiter.Postgres do
   ),
   -- Stamp the drawn shard onto the (already-executing) admitted rows, so `reconcile`
   -- can attribute each holder to its shard. PG-backend-only: the row is in this same DB.
+  -- Fenced by the claim token (ISSUES #32): a claim the reaper took back — maybe re-claimed
+  -- by someone else since — is never stamped. Only the stamp is fenced, not the admission
+  -- math: joining `input` to gen_durable there collapses the planner's row estimate to 1 and
+  -- turns every downstream CTE join into an O(batch²) nested loop (+1.3 ms at batch 50,
+  -- measured). An admit for a lost claim therefore still debits, unstamped — a leak in the
+  -- safe direction (nobody the reconciler counts holds it; it heals it). Model-checked.
   stamp AS (
     UPDATE gen_durable g
     SET concurrency_shard = a.c_shard
-    FROM admitted a JOIN owned o ON o.id = a.id
+    FROM admitted a
     WHERE g.id = a.id AND a.c_shard IS NOT NULL
-      AND g.locked_by = o.worker AND g.status = 'executing'
+      AND g.locked_by = a.worker AND g.status = 'executing'
   )
   SELECT i.id,
          (SELECT a.c_shard FROM admitted a WHERE a.id = i.id) AS c_shard,
